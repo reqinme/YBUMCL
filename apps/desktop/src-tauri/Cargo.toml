@@ -1,0 +1,46 @@
+[package]
+name = "ybumcl-desktop"
+version = "0.2.2"
+description = "延边大学我的世界启动器 / Yanbian University Minecraft Launcher"
+authors = ["YBUMCL"]
+edition = "2024"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ybumcl_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+# 产物固定为 YBUMCL.exe（便携分发时文件名必须稳定且为 ASCII）
+name = "YBUMCL"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# 由 `tauri build` 自动开：把前端资源打包进 exe，运行时不再找 devUrl。
+custom-protocol = ["tauri/custom-protocol"]
+
+[target.'cfg(windows)'.dependencies]
+# 只用到 CreateMutexW / FindWindowW / ShowWindow 这几个，别引整个 windows crate。
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_SystemInformation",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+] }
+
+[dependencies]
+launcher-core = { path = "../../../crates/launcher-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-dialog = "2"

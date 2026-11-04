@@ -1,0 +1,20 @@
+[package]
+name = "launcher-core"
+version = "0.1.0"
+edition = "2021"
+description = "Official vanilla Minecraft installation and Windows launch planning"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+md5 = "0.7"
+regex = "1"
+# 开 gzip/brotli：资源站（尤其 Modrinth/CurseForge）返回的 JSON 能小到四分之一，
+# 下载 CDN 上的压缩响应也省带宽。PCL 的 HttpClient 同样开了 AutomaticDecompression。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls", "gzip", "brotli", "deflate"] }
+sha1 = "0.10"
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }

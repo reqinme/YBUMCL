@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/launcher-core", "apps/desktop/src-tauri"]
+resolver = "2"
+
+# 面向便携单 exe 的体积优化：小体积优先，其次才是极限速度
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
