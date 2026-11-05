@@ -7,7 +7,8 @@
     confirmLabel?: string;
     cancelLabel?: string;
     oncancel: () => void;
-    onconfirm: () => void;
+    /// 传鼠标事件：调用方据此判断有没有按住 Shift（永久删除）。
+    onconfirm: (event: MouseEvent) => void;
   }
 
   let {
@@ -42,7 +43,7 @@
       <p>{message}</p>
       <div class="actions">
         <button class="btn ghost" onclick={oncancel}>{cancelLabel}</button>
-        <button class="btn danger" onclick={onconfirm}>{confirmLabel}</button>
+        <button class="btn danger" onclick={(event) => onconfirm(event)}>{confirmLabel}</button>
       </div>
     </div>
   </div>

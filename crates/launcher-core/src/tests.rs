@@ -72,6 +72,60 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn log4j_flag_is_always_added_and_direct_memory_is_dropped() {
+    let f = Fixture::new();
+    let mut v = f.value();
+    v["arguments"]["jvm"] = json!([
+        "-XX:MaxDirectMemorySize=256M",
+        "-Djava.library.path=${natives_directory}",
+        "-cp",
+        "${classpath}"
+    ]);
+    f.metadata(v);
+    let plan = f.plan().unwrap();
+    assert!(plan
+        .args
+        .iter()
+        .any(|arg| arg == "-Dlog4j2.formatMsgNoLookups=true"));
+    assert!(plan
+        .args
+        .iter()
+        .all(|arg| arg != "-XX:MaxDirectMemorySize=256M"));
+}
+#[test]
+fn encoding_flags_follow_the_selected_java() {
+    let f = Fixture::new();
+    let mut v = f.value();
+    v["javaVersion"] = json!({"majorVersion": 8});
+    f.metadata(v);
+    let eight = prepare(f.request(), |_| Ok(8)).unwrap();
+    assert!(!eight
+        .args
+        .iter()
+        .any(|arg| arg.starts_with("-Dstdout.encoding=")));
+    assert!(!eight
+        .args
+        .iter()
+        .any(|arg| arg.starts_with("-Dfile.encoding=")));
+
+    let seventeen = prepare(f.request(), |_| Ok(17)).unwrap();
+    assert!(seventeen
+        .args
+        .iter()
+        .any(|arg| arg == "-Dstdout.encoding=UTF-8"));
+    assert!(!seventeen
+        .args
+        .iter()
+        .any(|arg| arg.starts_with("-Dfile.encoding=")));
+
+    let twenty_one = prepare(f.request(), |_| Ok(21)).unwrap();
+    assert!(twenty_one
+        .args
+        .iter()
+        .any(|arg| arg == "-Dfile.encoding=COMPAT"));
+}
+
 #[cfg(windows)]
 #[test]
 fn java_launch_paths_strip_only_verbatim_prefix() {
@@ -948,7 +1002,9 @@ fn legacy_forge_caps_the_java_version() {
     };
     let old = forge("1.7.10", "10.13.4.1614");
     assert!(old.range.contains(7));
-    assert!(!old.range.contains(8));
+    // 1.7.10 的 Forge 版本也能跑在 Java 8 上（安装器自己常写 javaVersion 8）。
+    assert!(old.range.contains(8));
+    assert!(!old.range.contains(11));
     let twelve = forge("1.12.2", "14.23.5.2860");
     assert!(twelve.range.contains(8));
     assert!(!twelve.range.contains(11));
@@ -1595,4 +1651,55 @@ fn speed_limit_only_slows_when_it_is_set() {
         took >= std::time::Duration::from_millis(150),
         "限速后应当阻塞，实际只等了 {took:?}"
     );
+}
+
+#[test]
+fn unchanged_instance_reinstall_is_a_no_op() {
+    let f = Fixture::new();
+    let name = "Pack Test";
+    f.version(
+        name,
+        json!({
+            "id": name,
+            "_ybmcl": {"gameVersion": "test", "loaders": []},
+            "mainClass": "net.minecraft.client.main.Main",
+            "libraries": [],
+            "assetIndex": {"id": "test"},
+            "downloads": {"client": {"url": "https://piston-data.mojang.com/v1/objects/fixture/client.jar"}},
+        }),
+    );
+    f.file(&format!("versions/{name}/mods/keep.jar"), b"keep");
+    let request = crate::instance::InstanceRequest {
+        game_dir: f.root.to_string_lossy().into(),
+        game_version: "test".into(),
+        instance_name: Some(name.into()),
+        loaders: Vec::new(),
+        java_path: None,
+        strategy: Default::default(),
+        threads: None,
+        overwrite: true,
+    };
+    let summary = crate::instance::install_instance(
+        request,
+        crate::download::CancellationToken::default(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(summary.version_id, name);
+    // 配置没变就别重装：实例里的东西原样留着，也不该产生备份。
+    assert_eq!(
+        fs::read(f.root.join(format!("versions/{name}/mods/keep.jar"))).unwrap(),
+        b"keep"
+    );
+    assert!(!f.root.join("versions/install-backups").is_dir() || fs::read_dir(f.root.join("versions/install-backups")).unwrap().next().is_none());
+}
+
+#[test]
+fn modlauncher_entry_points_are_allowed() {
+    // Forge 1.13–1.17 用 modlauncher Launcher 起步，1.16.5 就是它。
+    assert!(supported_main("cpw.mods.modlauncher.Launcher"));
+    assert!(supported_main("net.neoforged.modlauncher.Launcher"));
+    assert!(supported_main("cpw.mods.bootstraplauncher.BootstrapLauncher"));
+    assert!(supported_main("net.minecraft.launchwrapper.Launch"));
+    assert!(!supported_main("com.example.Evil"));
 }

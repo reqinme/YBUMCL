@@ -59,8 +59,6 @@ type Job = {
 };
 
 let nextId = 1;
-let running = 0;
-let limit = $state(3);
 
 /// 最后一次点的是「暂停」还是「取消」。下载任务面板离下载页很远（它只拿到后端命令），
 /// 不记下来，页面的 catch 就只能把暂停也当成取消，弹「半成品已清理」。
@@ -117,14 +115,14 @@ function finishBatchTick() {
   }, 900);
 }
 
+/// PCL 的做法：任务之间不设总数，点一个跑一个。
 function pump() {
-  while (running < limit && queue.length > 0) {
+  while (queue.length > 0) {
     const job = queue.shift();
     if (!job) break;
     const task = find(job.id);
     if (!task) continue;
     task.status = "running";
-    running += 1;
     // 延后一拍再跑：调用方需要先拿到 task.id 才能把进度事件对上号。
     void Promise.resolve()
       .then(() => job.run())
@@ -156,7 +154,6 @@ function pump() {
         }
       })
       .finally(() => {
-        running -= 1;
         if (task.status !== "paused") {
           task.finishedAt = Date.now();
           batch.done += 1;
@@ -181,13 +178,6 @@ function showNotice(text: string) {
   noticeTimer = setTimeout(() => {
     notice.text = "";
   }, 3200);
-}
-
-/** 设置同时进行的任务数（设置页调用），范围 1–8。 */
-export function setTaskLimit(value: number) {
-  const next = Math.round(Number(value));
-  limit = Number.isFinite(next) ? Math.min(8, Math.max(1, next)) : 3;
-  pump();
 }
 
 /** 提交一个后台任务；`run` 返回的字符串会作为结果提示，也可以带出产出路径。 */

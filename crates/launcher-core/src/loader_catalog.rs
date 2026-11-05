@@ -618,6 +618,32 @@ pub fn prefer_recommended(entries: &mut Vec<LoaderEntry>, recommended: &str) -> 
     true
 }
 
+/// 1.13 以前的 Forge 安装包没有发布到 maven 上（`maven.minecraftforge.net`、
+/// `files.minecraftforge.net`、BMCL 的 maven 镜像都 404），只有 BMCL 的构建下载接口有。
+/// 拿 BMCL 清单里该版本的 `build` 号换一个直链。
+pub fn forge_legacy_installer(
+    game: &str,
+    version: &str,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    if !crate::modloader::forge_pre_113(game) {
+        return None;
+    }
+    let url = format!("{BMCL_FORGE}/{game}");
+    let bytes = fetch_catalog_bytes(&url, cancel).ok()?;
+    let value = parse_json(&bytes)?;
+    for item in value.as_array()? {
+        if item["version"].as_str() != Some(version) {
+            continue;
+        }
+        let build = item["build"].as_u64()?;
+        return Some(format!(
+            "https://bmclapi2.bangbang93.com/forge/download/{build}"
+        ));
+    }
+    None
+}
+
 type CatalogCache = HashMap<(String, u8), Vec<LoaderEntry>>;
 
 /// 带缓存地拉一份清单；同一进程里同一 (加载器, MC 版本) 只拉一次。

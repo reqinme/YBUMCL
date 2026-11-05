@@ -68,6 +68,54 @@ pub fn instance_target(request: &InstanceRequest) -> Option<PathBuf> {
     )
 }
 
+
+/// 实例已经按同一套「原版版本 + 加载器版本」装好时，返回现成的 summary。
+fn same_instance(
+    root: &Path,
+    game: &str,
+    name: &str,
+    parts: &[LoaderPart],
+    progress: &impl Fn(InstallProgress),
+) -> Option<InstallSummary> {
+    let version = merge::read_version(root, name).ok()?;
+    let recorded = version.get("_ybmcl")?;
+    if recorded.get("gameVersion").and_then(|value| value.as_str())? != game {
+        return None;
+    }
+    let loaders = recorded.get("loaders")?.as_array()?;
+    let expected: Vec<(&str, &str)> = parts
+        .iter()
+        .map(|part| (part.kind.key(), part.version.as_str()))
+        .collect();
+    if loaders.len() != expected.len() {
+        return None;
+    }
+    for (slot, (kind, version)) in loaders.iter().zip(expected) {
+        if slot.get("loader").and_then(|value| value.as_str())? != kind {
+            return None;
+        }
+        if slot.get("version").and_then(|value| value.as_str()).unwrap_or("") != version {
+            return None;
+        }
+    }
+    progress(InstallProgress {
+        version_id: name.to_owned(),
+        stage: "complete".into(),
+        path: String::new(),
+        completed_files: 0,
+        total_files: 0,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+    });
+    Some(InstallSummary {
+        version_id: name.to_owned(),
+        path: crate::download::tidy_path(&root.join("versions").join(name)),
+        downloaded_files: 0,
+        skipped_files: 0,
+        downloaded_bytes: 0,
+    })
+}
+
 pub fn install_instance(
     request: InstanceRequest,
     cancel: CancellationToken,
@@ -98,6 +146,13 @@ pub fn install_instance(
         return Err(DownloadError::Invalid(format!(
             "版本 {name} 已存在，请换一个名字"
         )));
+    }
+    // 加载器、版本、实例名都没变时，重装一遍只会把几百个库和 processors 再跑一次；
+    // 这种「点了修改但什么都没改」的请求直接复用现有实例（要修文件请用「补全文件」）。
+    if exists {
+        if let Some(summary) = same_instance(&root, &game, &name, &parts, &progress) {
+            return Ok(summary);
+        }
     }
     let backup = if exists {
         merge::backup_instance(&root, &name)?
@@ -354,6 +409,20 @@ fn build_instance(
         .collect();
     let merged_parts = merge::merge_order(&rest);
     merge::write_instance(root, &base, &merged_parts, name)?;
+    // 合并后的实例 json 才是最终库清单。Forge 1.16.5 这类新版安装器只把库下到
+    // 暂存目录、发布时漏掉（启动会报 Cannot find launch target fmlclient），
+    // 这里按实例 json 再补一次；缓存命中时只做校验，几乎不花时间。
+    let filled = download::install_profile_libraries(
+        &request.game_dir,
+        name,
+        strategy,
+        threads.map(|n| n as usize),
+        cancel.clone(),
+        |step| progress(step),
+    )?;
+    summary.downloaded_files += filled.downloaded_files;
+    summary.skipped_files += filled.skipped_files;
+    summary.downloaded_bytes += filled.downloaded_bytes;
     // 4. 中间产物清理：加载器 profile 目录、以及这次才装出来且无人引用的原版目录。
     for part in &merged_parts {
         if part.version_id != name && part.version_id != game {

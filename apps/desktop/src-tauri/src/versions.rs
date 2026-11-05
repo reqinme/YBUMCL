@@ -524,7 +524,7 @@ pub fn migrate_legacy(data_dir: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-fn append_log(data_dir: &Path, line: &str) {
+pub(crate) fn append_log(data_dir: &Path, line: &str) {
     use std::io::Write;
     let dir = data_dir.join("logs");
     let _ = fs::create_dir_all(&dir);

@@ -593,3 +593,118 @@ fn urlencode(value: &str) -> String {
     }
     out
 }
+
+/// 批量按 sha1 反查文件（导出整合包用）。
+/// 返回 `(sha1, 第一个下载地址)`，认不出来的 hash 不会出现在结果里。
+pub fn files_by_sha1(hashes: &[String]) -> Result<Vec<(String, String)>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let body = serde_json::json!({ "hashes": hashes, "algorithm": "sha1" });
+    let mut out = Vec::new();
+    for chunk in hashes.chunks(1000) {
+        let chunk_body = serde_json::json!({ "hashes": chunk, "algorithm": "sha1" });
+        let _ = &body;
+        let response = client()?
+            .post("https://api.modrinth.com/v2/version_files")
+            .header("content-type", "application/json")
+            .body(chunk_body.to_string())
+            .send()
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 请求失败：{error}")))?;
+        if !response.status().is_success() {
+            return Err(CoreError::InvalidInput(format!(
+                "Modrinth 返回 {}",
+                response.status()
+            )));
+        }
+        let text = response
+            .text()
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 响应读取失败：{error}")))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 响应解析失败：{error}")))?;
+        if let Some(map) = value.as_object() {
+            for (sha1, version) in map {
+                // 只有返回文件的 sha1 跟我们要的对得上才用，别认错文件。
+                let matches = version["files"][0]["hashes"]["sha1"]
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(sha1));
+                if !matches {
+                    continue;
+                }
+                if let Some(url) = version["files"][0]["url"].as_str() {
+                    out.push((sha1.clone(), url.to_owned()));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 按 sha1 批量反查文件，返回足以判断「有没有新版本」的字段。
+pub struct MrFileHit {
+    pub sha1: String,
+    pub project_id: String,
+    pub version_id: String,
+    pub version_number: String,
+    pub file_name: String,
+    pub file_url: String,
+    pub game_versions: Vec<String>,
+    pub loaders: Vec<String>,
+}
+
+/// 批量按 sha1 反查（比 files_by_sha1 多带 project_id / version_id）。
+pub fn lookup_sha1(hashes: &[String]) -> Result<Vec<MrFileHit>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for chunk in hashes.chunks(1000) {
+        let body = serde_json::json!({ "hashes": chunk, "algorithm": "sha1" });
+        let response = client()?
+            .post("https://api.modrinth.com/v2/version_files")
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 请求失败：{error}")))?;
+        if !response.status().is_success() {
+            return Err(CoreError::InvalidInput(format!(
+                "Modrinth 返回 {}",
+                response.status()
+            )));
+        }
+        let text = response
+            .text()
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 响应读取失败：{error}")))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 响应解析失败：{error}")))?;
+        let Some(map) = value.as_object() else {
+            continue;
+        };
+        for (sha1, version) in map {
+            let matches = version["files"][0]["hashes"]["sha1"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(sha1));
+            if !matches {
+                continue;
+            }
+            let Some(project) = version["project_id"].as_str() else {
+                continue;
+            };
+            out.push(MrFileHit {
+                sha1: sha1.clone(),
+                project_id: project.to_owned(),
+                version_id: text_of(version, "id"),
+                version_number: text_of(version, "version_number"),
+                file_name: text_of(&version["files"][0], "filename"),
+                file_url: text_of(&version["files"][0], "url"),
+                game_versions: str_list(&version["game_versions"]),
+                loaders: str_list(&version["loaders"]),
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn text_of(value: &Value, key: &str) -> String {
+    value[key].as_str().unwrap_or_default().to_owned()
+}

@@ -132,6 +132,14 @@ pub fn required_java_for(game: &str, loader: ModLoader, version: &str) -> u32 {
         .min
 }
 
+/// 1.13 以前的 Forge 安装包不在 maven 上，要走 BMCL 的构建下载接口。
+pub fn forge_pre_113(game: &str) -> bool {
+    let mut parts = game.split('.');
+    let major: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let minor: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    major == 1 && minor < 13
+}
+
 fn base(loader: ModLoader) -> &'static str {
     match loader {
         ModLoader::Forge => FORGE,
@@ -838,6 +846,38 @@ fn embedded_profile_version(install: &Value) -> Option<Value> {
         .cloned()
 }
 
+/// 新版安装器的 `install_profile.json` 里有一份带 classifier 的库清单
+/// （Forge 1.16.5 的 `net.minecraftforge:forge:<ver>:universal` 就是这种）。
+/// `version.json` 里的无 classifier 条目是 FML 加载器本体（安装器会从自己
+/// 包里解出这个 jar），classifier 那份是 Forge 的 mod 侧代码，两者都要，
+/// 所以这里只做「补齐」，绝不替换——把加载器换成 universal 会导致
+/// modlauncher 报 `Cannot find launch target fmlclient`。
+fn add_installer_classifier_libraries(mut version: Value, install: &Value) -> Value {
+    let Some(install_libs) = install["libraries"].as_array() else {
+        return version;
+    };
+    let Some(version_libs) = version["libraries"].as_array_mut() else {
+        return version;
+    };
+    for library in install_libs {
+        let Some(name) = library["name"].as_str() else {
+            continue;
+        };
+        let parts: Vec<&str> = name.split(':').collect();
+        // 只关心带 classifier 的加载器库：net.minecraftforge:forge / net.neoforged:*。
+        if parts.len() < 4 || parts[0] != "net.minecraftforge" && parts[0] != "net.neoforged" {
+            continue;
+        }
+        let present = version_libs
+            .iter()
+            .any(|entry| entry["name"].as_str() == Some(name));
+        if !present {
+            version_libs.push(library.clone());
+        }
+    }
+    version
+}
+
 fn inspect_installer(path: &Path, r: &ModLoaderInstallRequest) -> Result<Profile> {
     let mut zip = zip::ZipArchive::new(File::open(path).map_err(|e| io_error(path, e))?)
         .map_err(|e| invalid(e.to_string()))?;
@@ -881,6 +921,7 @@ fn inspect_installer(path: &Path, r: &ModLoaderInstallRequest) -> Result<Profile
         safe_relative(name)?;
         json(&zip_bytes(&mut zip, name)?)?
     };
+    let version = add_installer_classifier_libraries(version, &install);
     let id = version["id"]
         .as_str()
         .ok_or_else(|| invalid("Missing installed version id"))?
@@ -1430,6 +1471,45 @@ fn run_processors(
     Ok(())
 }
 
+/// 列出 `versions/` 下现有哪些目录名（用安装器前后的差集找它写出的新版本）。
+fn version_dirs(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = fs::read_dir(root.join("versions")) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// 安装器跑完后新增的、名字里带 forge、且里面有同名 json 的版本目录。
+fn installer_written_json(stage: &Path, before: &[String]) -> Option<PathBuf> {
+    let entries = fs::read_dir(stage.join("versions")).ok()?;
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_str()?.to_string();
+            if !name.to_ascii_lowercase().contains("forge")
+                || before.iter().any(|old| old.eq_ignore_ascii_case(&name))
+            {
+                return None;
+            }
+            let json = path.join(format!("{name}.json"));
+            json.is_file().then_some(json)
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
 /// 老安装器只认 `--installClient`；NeoForge 1.20.1 那条线没有，只能看 help 输出判断。
 fn installer_supports_client_cli(java: &Path, jar: &Path) -> bool {
     // 输出重定向到文件而不是管道：安装器偶尔会派生子进程，管道读端会一直等下去。
@@ -1513,8 +1593,9 @@ fn prefetch_installer_libraries(
     for _pass in 0..3 {
         let pending = std::mem::take(&mut missing);
         let next = AtomicU64::new(0);
-        // bmclapi 对高并发比较敏感，8 路常出现长时间挂起；4 路已经够快。
-        let workers = pending.len().clamp(1, 4);
+        // 第一轮多数文件走同一个镜像，8 路能明显缩短总时长；
+        // 如果有文件没下来（可能是镜像抖动），后面几轮退回 4 路，避免一直挂着。
+        let workers = pending.len().clamp(1, if _pass == 0 { 8 } else { 4 });
         thread::scope(|scope| {
             for _ in 0..workers {
                 scope.spawn(|| loop {
@@ -1535,10 +1616,14 @@ fn prefetch_installer_libraries(
                     // bmclapi 的 maven 镜像最快（一个 jar 不到 1 s）；
                     // maven.neoforged.net 在这边完全连不上，排在最后只浪费时间。
                     let bmcl = format!("https://bmclapi2.bangbang93.com/maven/{}", library.path);
-                    for candidate in std::iter::once(bmcl)
-                        .chain(std::iter::once(source))
-                        .chain(std::iter::once(library.url.clone()))
-                    {
+                    // 镜像地址可能和改写后的 source 重复，去重后再试，少一轮白等的 10 秒。
+                    let mut candidates = vec![bmcl];
+                    for candidate in [source, library.url.clone()] {
+                        if !candidates.contains(&candidate) {
+                            candidates.push(candidate);
+                        }
+                    }
+                    for candidate in candidates {
                         match fetch_once(http, &candidate, 64 * 1024 * 1024, cancel, &mut |_| {}) {
                             Ok(bytes) if hash_bytes(&bytes) == library.sha1 => {
                                 fetched = Some(bytes);
@@ -1578,17 +1663,28 @@ fn prefetch_installer_libraries(
             return Ok(());
         }
     }
+    // 预取只是加速：Forge 安装器会把加载器自己那份库从安装器包里解出来，
+    // 上游 maven 本来就不提供某些条目（1.16.5 的 forge-<ver>.jar 就是 404），
+    // 所以拉不到不能当成失败，交给安装器自己解包。
     let names: Vec<&str> = missing
         .iter()
         .take(3)
         .map(|item| item.path.as_str())
         .collect();
-    Err(invalid(format!(
-        "安装器依赖拉不下来（{} 这 {} 个库镜像和官方都超时）：{}",
-        names.join(" / "),
-        missing.len(),
-        "可以检查网络后重试"
-    )))
+    emit(InstallProgress {
+        version_id: String::new(),
+        stage: "modloader-install".into(),
+        path: format!(
+            "安装器依赖没预取到（{} 等 {} 个），交给安装器自己解包",
+            names.join(" / "),
+            missing.len()
+        ),
+        completed_files: total,
+        total_files: total,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+    });
+    Ok(())
 }
 
 fn collect(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -1656,6 +1752,18 @@ fn replaceable(relative: &Path) -> bool {
     }
 }
 
+/// Windows 上 `error 32`（另一个进程正在使用）与 `error 5`（拒绝访问）通常都是
+/// 「这个文件被正在运行的游戏占着」，直接抛原文没法看，换成能照做的提示。
+fn occupied(path: &Path, error: std::io::Error) -> crate::CoreError {
+    match error.raw_os_error() {
+        Some(32) | Some(5) => crate::CoreError::InvalidInput(format!(
+            "{} 正被别的程序占用（多半是还在运行的 Minecraft），关掉游戏再试一次。",
+            path.display()
+        )),
+        _ => io_error(path, error).into(),
+    }
+}
+
 fn publish(
     stage: &Path,
     root: &Path,
@@ -1692,8 +1800,13 @@ fn publish(
         fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
         no_links(&target)?;
         if replaceable(relative) && target.is_file() {
-            // 安装器产物：先删再链，拿到的一定是这次安装写的那份。
-            fs::remove_file(&target).map_err(|e| io_error(&target, e))?;
+            // 内容一样就别动它：PCL 也是「校验通过就当已有」，
+            // 这样正在运行的 Minecraft 占着的 jar 不会被删（Windows 会报 error 32）。
+            if hash_file(&target, cancel)? == hash_file(&source, cancel)? {
+                continue;
+            }
+            // 安装器产物：内容变了才先删再链，拿到的一定是这次安装写的那份。
+            fs::remove_file(&target).map_err(|e| occupied(&target, e))?;
         }
         // Atomic complete-file publication without clobber (unlike POSIX rename).
         match fs::hard_link(&source, &target) {
@@ -1704,7 +1817,7 @@ fn publish(
                     return Err(invalid("Artifact changed during publication"));
                 }
             }
-            Err(e) => return Err(io_error(&target, e).into()),
+            Err(e) => return Err(occupied(&target, e).into()),
         }
     }
     Ok(added)
@@ -1802,14 +1915,29 @@ fn install_forge_family(
     cancel: &CancellationToken,
     progress: &(impl Fn(InstallProgress) + Sync),
 ) -> Result<InstallSummary> {
-    let url = installer_url(r)?;
+    // 1.13 以前的 Forge 安装包不在 maven 上，先问 BMCL 的构建下载接口；
+    // 那边给的是裸 jar，没有 `.sha1` 可对，跳过校验。
+    let legacy = match r.loader {
+        ModLoader::Forge => {
+            crate::loader_catalog::forge_legacy_installer(&r.game_version, &r.loader_version, cancel)
+        }
+        _ => None,
+    };
+    let url = match &legacy {
+        Some(url) => url.clone(),
+        None => installer_url(r)?,
+    };
     let stage = Stage::new(root)?;
     let http = client()?;
     event(progress, &r.game_version, "modloader-installer", "");
-    let expected = match fetch(&http, &format!("{url}.sha1"), 1024, cancel) {
-        Ok(body) => Some(checksum(&body)?),
-        Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
-        Err(_) => None,
+    let expected = if legacy.is_some() {
+        None
+    } else {
+        match fetch(&http, &format!("{url}.sha1"), 1024, cancel) {
+            Ok(body) => Some(checksum(&body)?),
+            Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+            Err(_) => None,
+        }
     };
     // 安装器 jar 走下载层：有镜像路由时按设置里的策略竞速/优先，没镜像就只走官方。
     let bytes = crate::download::fetch_file_bytes(&url, cancel)?;
@@ -1823,7 +1951,7 @@ fn install_forge_family(
     let installer_bytes = bytes.len() as u64;
     let jar = stage.0.join("installer.jar");
     write_new(&jar, &bytes)?;
-    let profile = inspect_installer(&jar, r)?;
+    let mut profile = inspect_installer(&jar, r)?;
     event(progress, &profile.id, "modloader-prepare", "");
     let mut summary = crate::download::install_version_with_cache(
         InstallRequest {
@@ -1911,7 +2039,92 @@ fn install_forge_family(
                 cancel,
                 progress,
             )?;
+            // 1.16.x 的安装器在跑完处理器后会把 `fmlcore`/`fmlloader` 这些库写进
+            // 自己的版本 json（jar 里那份是没有的），以生成出来的这份为准，
+            // 否则启动时 modlauncher 找不到 fmlclient 目标。
+            if let Ok(bytes) = fs::read(&path) {
+                if let Ok(value) = json(&bytes) {
+                    let complete = value["libraries"]
+                        .as_array()
+                        .is_some_and(|libraries| !libraries.is_empty());
+                    if complete {
+                        profile.version = add_installer_classifier_libraries(value, &profile.install);
+                        let serialized = serde_json::to_vec_pretty(&profile.version)
+                            .map_err(|e| invalid(e.to_string()))?;
+                        write_new(&path, &serialized)?;
+                    }
+                }
+            }
         }
+    } else if !forge_pre_113(&r.game_version) {
+        // 1.13+ 的 Forge 安装器虽然还是老格式（install_profile 没有 `spec`），
+        // jar 里那份 version.json 却不带 `fmlcore`/`fmlloader`——那些库是
+        // `--installClient` 跑出来时才写进版本 json 的，不跑就会在启动时报
+        // `Cannot find launch target fmlclient`。
+        event(
+            progress,
+            &profile.id,
+            "modloader-install",
+            "Running Forge client installer",
+        );
+        write_new(
+            &stage.0.join("launcher_profiles.json"),
+            b"{\"profiles\":{}}",
+        )?;
+        let version_dirs_before = version_dirs(&stage.0);
+        let mut preload = profile.libraries.clone();
+        preload.extend(installer_libraries(&profile.version));
+        prefetch_installer_libraries(
+            &http,
+            &stage.0,
+            &preload,
+            r.strategy.allows_mirror(),
+            cancel,
+            progress,
+        )?;
+        run_installer(
+            java,
+            &jar,
+            &stage.0,
+            &stage.0,
+            &[
+                "--installClient".into(),
+                java_path(&stage.0).to_string_lossy().into(),
+            ],
+            None,
+            cancel,
+            |line| event(progress, &profile.id, "modloader-install", line),
+        )?;
+        // 安装器写的是它自己 id 的目录（`forge-1.16.5-36.2.34`），不会写我们的
+        // 实例名，所以要按 PCL 的办法找出新增的那个目录。
+        let generated_path =
+            installer_written_json(&stage.0, &version_dirs_before).unwrap_or_else(|| path.clone());
+        let generated = fs::read(&generated_path).map_err(|e| io_error(&generated_path, e))?;
+        let value = json(&generated)?;
+        profile.version = add_installer_classifier_libraries(value, &profile.install);
+        let serialized =
+            serde_json::to_vec_pretty(&profile.version).map_err(|e| invalid(e.to_string()))?;
+        // 安装器可能已经在这个路径上写了自己那份 json（update 会保留 fml 库），
+        // 直接覆盖，不能再用 write_new。
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| io_error(&path, e))?;
+        }
+        write_new(&path, &serialized)?;
+        // 安装器自己下载的库不一定齐，按刚写好的 json 再补齐一遍
+        // （PCL 的「下载游戏支持库文件（副加载器）」）。
+        crate::download::install_profile_libraries(
+            &stage.0.to_string_lossy(),
+            &profile.id,
+            r.strategy,
+            r.threads.map(|n| n as usize),
+            cancel.clone(),
+            |mut p| {
+                if p.stage == "complete" {
+                    p.stage = "modloader-prepare".into();
+                }
+                progress(p);
+            },
+        )?;
     } else {
         event(
             progress,
@@ -1925,15 +2138,16 @@ fn install_forge_family(
         let serialized =
             serde_json::to_vec_pretty(&profile.version).map_err(|e| invalid(e.to_string()))?;
         write_new(&path, &serialized)?;
-        crate::download::install_version_with_cache(
-            InstallRequest {
-                game_dir: stage.0.to_string_lossy().into(),
-                version_id: profile.id.clone(),
-                fabric_loader: None,
-                quilt_loader: None,
-                strategy: r.strategy,
-                threads: r.threads,
-            },
+        // 老安装器（1.12.2 及更早）写出的是带 `inheritsFrom` 的增量 profile，
+        // 它的 id（如 `1.12.2-forge-14.23.5.2864`）不是官方版本号：走
+        // `install_version_with_cache` 会拿它去 Mojang 清单里查，必然失败。
+        // 原版底稿上面已按 `r.game_version` 装好，这里只按这份 profile 补库。
+        let _ = root;
+        crate::download::install_profile_libraries(
+            &stage.0.to_string_lossy(),
+            &profile.id,
+            r.strategy,
+            r.threads.map(|n| n as usize),
             cancel.clone(),
             |mut p| {
                 if p.stage == "complete" {
@@ -1941,7 +2155,6 @@ fn install_forge_family(
                 }
                 progress(p);
             },
-            root,
         )?;
     }
     event(progress, &profile.id, "modloader-verify", "");
@@ -2697,6 +2910,57 @@ fn write_profile_loader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_forge_is_everything_before_one_thirteen() {
+        assert!(forge_pre_113("1.7.10"));
+        assert!(forge_pre_113("1.12.2"));
+        assert!(forge_pre_113("1.12"));
+        assert!(!forge_pre_113("1.13"));
+        assert!(!forge_pre_113("26.3"));
+    }
+    #[test]
+    fn installer_classifier_libraries_are_added_next_to_the_plain_entry() {
+        // 1.16.5-36.2.34 的 version.json 写的是不带 classifier 的 forge jar：那是
+        // FML 加载器本体，安装器会从自己包里解出来；install_profile 里带 :universal
+        // 的是 Forge 的 mod 侧代码。两者都要，缺了加载器就找不到 fmlclient。
+        let version = serde_json::json!({"libraries": [
+            {"name": "net.minecraftforge:forge:1.16.5-36.2.34", "downloads": {"artifact": {
+                "path": "net/minecraftforge/forge/1.16.5-36.2.34/forge-1.16.5-36.2.34.jar",
+                "sha1": "b05f056824252928b59c746f8a28fe2cf36db6c0",
+                "size": 212608
+            }}},
+            {"name": "com.example:keep:1.0", "downloads": {"artifact": {"path": "keep.jar"}}}
+        ]});
+        let install = serde_json::json!({"libraries": [
+            {"name": "net.minecraftforge:forge:1.16.5-36.2.34:universal", "downloads": {"artifact": {
+                "path": "net/minecraftforge/forge/1.16.5-36.2.34/forge-1.16.5-36.2.34-universal.jar",
+                "sha1": "24aa8afad1764e4ff18eea3071cbb54461943523",
+                "size": 2773337
+            }}}
+        ]});
+        let merged = add_installer_classifier_libraries(version, &install);
+        let libs = merged["libraries"].as_array().unwrap();
+        assert_eq!(libs.len(), 3);
+        // 原来的无 classifier 条目必须留着（FML 加载器本体）。
+        assert_eq!(
+            libs[0]["name"].as_str(),
+            Some("net.minecraftforge:forge:1.16.5-36.2.34")
+        );
+        assert_eq!(libs[1]["name"].as_str(), Some("com.example:keep:1.0"));
+        // 带 classifier 的 universal 追加在后面。
+        assert_eq!(
+            libs[2]["name"].as_str(),
+            Some("net.minecraftforge:forge:1.16.5-36.2.34:universal")
+        );
+        assert_eq!(
+            libs[2]["downloads"]["artifact"]["size"].as_u64(),
+            Some(2773337)
+        );
+        // 幂等：再补一次不会重复。
+        let again = add_installer_classifier_libraries(merged, &install);
+        assert_eq!(again["libraries"].as_array().unwrap().len(), 3);
+    }
+
     #[test]
     fn installer_libraries_read_the_installed_version_json() {
         // NeoForge 的 bootstraplauncher 只出现在 version.json 里，不在 install_profile 里；

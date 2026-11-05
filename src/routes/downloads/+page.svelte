@@ -11,7 +11,6 @@
     pauseTask,
     requeueTask,
     resumeTask,
-    setTaskLimit,
     setTaskLive,
     setTaskOutput,
     setTaskResume,
@@ -23,13 +22,11 @@
     type TaskResult
   } from "$lib/tasks.svelte";
   import { showError } from "$lib/dialogs.svelte";
+  import { supportsLoader, type LoaderKind } from "$lib/loader-ranges";
   import Dropdown from "$lib/components/Dropdown.svelte";
   import { SIDES, TAGS, type SideFilter, type TagOption } from "$lib/content-tags";
-  import TaskRing from "$lib/components/TaskRing.svelte";
   import ProjectIcon from "$lib/components/ProjectIcon.svelte";
-  import TasksPanel from "$lib/components/TasksPanel.svelte";
   import { badgeOf, foolAnchor, foolOf } from "$lib/version-types";
-  import { downloadsNav } from "$lib/downloads-nav.svelte";
   import { currentVersion } from "$lib/current-version.svelte";
   import { downloadsState, saveDownloadsState, type CatFilters, type DownloadsState } from "$lib/downloads-state.svelte";
   import {
@@ -47,6 +44,7 @@
     type LeftFilters
   } from "$lib/mod-files";
   import { goto } from "$app/navigation";
+  import { page } from "$app/state";
   import {
     api,
     onInstallProgress,
@@ -186,7 +184,10 @@
   let dates = $state<Partial<Record<Loader, Record<string, string>>>>({});
   /// 清单按 (加载器, 游戏版本) 缓存，切换回来不用重查。
   const probes = new Map<string, Choice[]>();
-  let probing = $state(false);
+  /// 拉取失败（超时/断网）：那一行显示「未拉取到」，按钮跟着置灰。
+  let failed = $state<Partial<Record<Loader, boolean>>>({});
+  /// 清单回来是空的：这个版本确实没有，连 chip 一起摘掉。
+  let missing = $state<Partial<Record<Loader, boolean>>>({});
   let active = $state<Loader | null>(null);
   let instName = $state("");
   let nameTouched = $state(false);
@@ -239,10 +240,12 @@
     })
   );
 
-  const chosen = $derived(LOADER_ORDER.filter((item) => picked[item]));
+  const chosen = $derived(LOADER_ORDER.filter((item) => picked[item] !== undefined));
+  /// 已选的加载器里还有没拿到版本的（正在拉取或拉取失败）：不能开始安装。
+  const waiting = $derived(chosen.some((kind) => failed[kind] || !(entries[kind]?.length)));
   /// 某个已选加载器在当前筛选段里没有任何版本（右侧会显示「无」）。
   const missingBuild = $derived(
-    LOADER_ORDER.filter((kind) => picked[kind] && visible(kind).length === 0)
+    LOADER_ORDER.filter((kind) => picked[kind] !== undefined && visible(kind).length === 0)
   );
   const isModloader = $derived(
     chosen.some(
@@ -280,7 +283,10 @@
 
   /// 与核心层 merge::instance_name 一致的默认名。
   const defaultName = $derived(
-    [selected?.id ?? "", ...chosen.map((kind) => tagOf(kind, picked[kind] ?? ""))]
+    [
+      selected?.id ?? "",
+      ...chosen.filter((kind) => picked[kind]).map((kind) => tagOf(kind, picked[kind] ?? ""))
+    ]
       .filter(Boolean)
       .join("-")
   );
@@ -358,12 +364,18 @@
         }
       }
     }
+    // 加载器阶段是「一个个文件/一步补丁」在跑，带上完成数，别只写一句「安装中」。
+    const stageBase = STAGE_TEXT[event.stage] ?? event.stage;
+    const stageCount =
+      event.totalFiles > 0 && event.stage !== "complete"
+        ? ` ${event.completedFiles}/${event.totalFiles}`
+        : "";
     return {
       percent,
       stage:
         (pausedRun || stopState.mode === "pause") && event.stage === "cancelled"
           ? "已暂停"
-          : (STAGE_TEXT[event.stage] ?? event.stage),
+          : `${stageBase}${stageCount}`,
       detail: parts.join(" · "),
       path: event.path ?? ""
     };
@@ -373,8 +385,7 @@
     loading = true;
     try {
       settings = await api.loadSettings().catch(() => null);
-      if (settings) setTaskLimit(settings.concurrentTasks);
-      const [cached, dir] = await Promise.all([
+          const [cached, dir] = await Promise.all([
         cachedManifest(strategy, force),
         api.defaultGameDir()
       ]);
@@ -440,7 +451,6 @@
 
   /// 拉某个加载器在当前游戏版本下的构建列表。
   async function fetchEntries(kind: Loader, game: string): Promise<Choice[]> {
-    try {
       if (kind === "fabric" || kind === "legacyfabric" || kind === "quilt") {
         const list: FabricLoaderVersion[] =
           kind === "fabric"
@@ -486,41 +496,71 @@
         beta: !item.stable,
         recommended: false
       }));
-    } catch {
-      return [];
-    }
   }
 
-  /// 选中游戏版本后，并发查所有加载器：清单为空的加载器直接不显示。
+  /// 选中游戏版本后，按静态范围并发查所有加载器；范围里没有的连请求都不发。
   async function probeLoaders() {
     const game = selected?.id;
     if (!game) return;
-    probing = true;
+    failed = {};
+    missing = {};
     entries = {};
-    try {
-      await Promise.all(
-        LOADER_ORDER.map(async (kind) => {
-          const key = `${kind}:${game}`;
-          let list = probes.get(key);
-          if (!list) {
+    await Promise.all(
+      LOADER_ORDER.filter((kind) => supportsLoader(kind as LoaderKind, game)).map(async (kind) => {
+        const key = `${kind}:${game}`;
+        let list = probes.get(key);
+        if (!list) {
+          try {
             list = await fetchEntries(kind, game);
-            probes.set(key, list);
+          } catch {
+            if (selected?.id === game) failed = { ...failed, [kind]: true };
+            return;
           }
-          entries = { ...entries, [kind]: list };
-          void loadDates(kind, game, list);
-        })
-      );
-    } finally {
-      probing = false;
-    }
+          if (selected?.id !== game) return;
+          probes.set(key, list);
+        }
+        if (list.length === 0) {
+          missing = { ...missing, [kind]: true };
+          const rest = { ...picked };
+          delete rest[kind];
+          picked = rest;
+          return;
+        }
+        entries = { ...entries, [kind]: list };
+        void loadDates(kind, game, list);
+      })
+    );
   }
 
-  /// 某个加载器在当前版本下能不能用：清单没回来之前先不显示（免得点了一直转圈）。
-  function usable(kind: Loader): boolean {
-    const list = entries[kind];
-    if (!list || list.length === 0) return false;
-    if (kind === "liteloader") return legacyLite(selected?.id);
-    return true;
+  /// 只重拉这一个加载器。
+  function retry(kind: Loader) {
+    const game = selected?.id;
+    if (!game) return;
+    failed = { ...failed, [kind]: false };
+    probes.delete(`${kind}:${game}`);
+    void (async () => {
+      try {
+        const list = await fetchEntries(kind, game);
+        if (selected?.id !== game) return;
+        probes.set(`${kind}:${game}`, list);
+        if (list.length === 0) {
+          missing = { ...missing, [kind]: true };
+          const rest = { ...picked };
+          delete rest[kind];
+          picked = rest;
+          return;
+        }
+        entries = { ...entries, [kind]: list };
+        void loadDates(kind, game, list);
+      } catch {
+        if (selected?.id === game) failed = { ...failed, [kind]: true };
+      }
+    })();
+  }
+
+  /// 这个版本有没有这个加载器：先按静态范围摆出来，清单为空再摘掉。
+  function supports(kind: Loader): boolean {
+    return supportsLoader(kind as LoaderKind, selected?.id ?? "") && !missing[kind];
   }
 
   function groupsOf(kind: Loader): { stable: Choice[]; beta: Choice[] } {
@@ -592,18 +632,17 @@
     return `${item.version}（${words.join("·")}）`;
   }
 
-  async function toggleLoader(kind: Loader) {
+  function toggleLoader(kind: Loader) {
     if (busy) return;
     active = kind;
-    if (picked[kind]) {
+    if (picked[kind] !== undefined) {
       const rest = { ...picked };
       delete rest[kind];
       picked = rest;
       void refreshJavaPlan();
       return;
     }
-    if (!usable(kind)) return;
-    if ((entries[kind]?.length ?? 0) === 0) return;
+    if (!supports(kind)) return;
     const next = { ...picked };
     // 主加载器单选：选了新的就把其它主加载器顶掉，OptiFine 保留。
     if (PRIMARY.includes(kind)) {
@@ -611,9 +650,8 @@
       void next[PATCH];
     }
     typeFilter[kind] = "all";
-    const version = defaultChoice(kind);
-    if (!version) return;
-    next[kind] = version;
+    // 清单还没回来也先选中，行里显示「正在拉取中…」。
+    next[kind] = entries[kind]?.length ? defaultChoice(kind) : "";
     picked = next;
     nameTouched = false;
     void refreshJavaPlan();
@@ -683,6 +721,20 @@
     }
   }
 
+  /// 加载器清单回来得比点击晚的时候，`picked` 里是空串；等清单到了补上默认版本，
+  /// 否则安装请求会带着空版本号被后端拒掉。
+  $effect(() => {
+    const next = { ...picked };
+    let changed = false;
+    for (const kind of chosen) {
+      if (!next[kind] && entries[kind]?.length) {
+        next[kind] = defaultChoice(kind);
+        changed = true;
+      }
+    }
+    if (changed) picked = next;
+  });
+
   $effect(() => {
     if (chosen.includes("cleanroom")) void loadCleanroomMods();
   });
@@ -705,6 +757,10 @@
     if (!selected) return;
     const name = instName.trim() || defaultName;
     if (!name) throw new Error("请填实例名");
+    if (chosen.some((kind) => !picked[kind])) {
+      showError("加载器还没选好", "等一下让版本清单加载完，再点安装。");
+      return;
+    }
     const pausedTask = pausedNames[name];
     if (pausedTask) {
       continueTask(pausedTask);
@@ -754,7 +810,7 @@
         javaPath: plan.javaPath,
         strategy,
         threads
-      });
+      }, taskId);
       // 刚装完，版本页的扫描缓存已经不准了。
       forgetScan(gameDir);
       setTaskOutput(taskId, { path: summary.path, kind: "dir" });
@@ -768,7 +824,7 @@
       }
     } catch (e) {
       const message = describeError(e);
-      // 暂停 / 取消可能是在「下载任务」面板里点的，那边只留一个标记。
+      // 暂停 / 取消是在「下载任务」页里点的，那边只留一个标记。
       const stop = stopping ?? takeStop();
       stopping = null;
       if (message === "安装已取消") {
@@ -822,7 +878,7 @@
     stopping = mode;
     pausedRun = mode === "pause";
     try {
-      await api.cancelInstall(mode);
+      await api.cancelInstall(installTaskId ?? packTaskId, mode);
       // 取消是「这一轮作废」：面板上不留进度，进度只在任务列表里查。
       // 暂停要保留，好让「重试」接着下。
       if (mode === "cancel") {
@@ -2140,7 +2196,7 @@
                 javaPath: null,
                 strategy,
                 iconUrl: mrProject?.iconUrl ?? null
-              })
+              }, packTaskId ?? undefined)
             : await api.installModpack({
                 gameDir: dir,
                 url: version.fileUrl,
@@ -2151,7 +2207,7 @@
                 strategy,
                 threads,
                 iconUrl: mrProject?.iconUrl ?? null
-              });
+              }, packTaskId ?? undefined);
           await rememberPack(summary.versionId, version.versionNumber);
           await loadManifest(true);
           return reportPack(summary);
@@ -2842,7 +2898,7 @@
     if (pending) void switchCategory(pending);
   }
 
-  /// Esc：先收「下载任务」这一层，再关右侧详情；都没有就交给别的处理（不做全局返回）。
+  /// Esc：先关右侧详情；都没有就交给别的处理（不做全局返回）。
   function onEscape(event: KeyboardEvent) {
     if (event.key !== "Escape") return;
     if (favDialog) {
@@ -2865,12 +2921,6 @@
     }
     if (tagOpen) {
       tagOpen = false;
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-    if (downloadsNav.tasksOpen) {
-      downloadsNav.tasksOpen = false;
       event.preventDefault();
       event.stopPropagation();
       return;
@@ -2941,6 +2991,52 @@
 
     finishRestore();
     stateRestored = true;
+    // 实例页的模组「详情 / 下载 Mod」带着搜索词过来：落到模组分类直接搜，然后把参数抹掉。
+    const preset = page.url.searchParams.get("mod");
+    if (preset !== null) {
+      cat = "mods";
+      // 实例页带过来的上下文：游戏版本 / 加载器只用来收窄筛选，搜索词永远是显示名。
+      const presetGame = page.url.searchParams.get("mc") ?? "";
+      const presetLoader = page.url.searchParams.get("loader") ?? "";
+      mrFilters.mods = {
+        ...defaultFilters("mods"),
+        query: preset,
+        game: presetGame,
+        loader: presetLoader
+      };
+      applyFiltersFor("mods");
+      await mrSearch();
+      // 认领到项目时直接把详情打开（PCL 的 ResourceDetail）；认不到就停在搜索结果。
+      const presetProject = page.url.searchParams.get("project") ?? "";
+      const [source, projectId] = presetProject.split(":");
+      if (projectId) {
+        const hit = mrProjects.find(
+          (item) =>
+            item.id === projectId &&
+            (source === "curseforge" ? isCurseForge(item) : !isCurseForge(item))
+        );
+        if (hit) {
+          void mrOpen(hit);
+        } else {
+          // 列表里没搜到（名字不完全一致 / 被筛选挡掉）也把详情开出来，版本列表按 id 直接拉。
+          void mrOpen({
+            id: projectId,
+            slug: "",
+            title: preset,
+            description: "",
+            iconUrl: null,
+            downloads: 0,
+            author: "",
+            categories: [],
+            projectType: "mod",
+            loaders: [],
+            gameVersions: [],
+            chineseTitle: null
+          } satisfies MrProject);
+        }
+      }
+      void goto("/downloads", { replaceState: true, keepFocus: true, noScroll: true });
+    }
     try {
       await loadManifest();
       // 用的是上次存下来的清单：先把列表摆出来，再悄悄换一份新的。
@@ -3010,11 +3106,6 @@
 </script>
 
 <div class="page">
-  {#if downloadsNav.tasksOpen}
-    <div class="tasks-overlay">
-      <TasksPanel onback={() => (downloadsNav.tasksOpen = false)} />
-    </div>
-  {/if}
   <header class="head">
     <BackButton />
 <h1>下载</h1>
@@ -3022,7 +3113,6 @@
       <span class="dim">清单缓存于 {Math.round(manifestAgeMs / 60_000)} 分钟前</span>
     {/if}
     <div class="spacer"></div>
-    <TaskRing />
     {#if cat === "packs"}
       <button class="btn" onclick={importPack} disabled={!gameDir || mrBusy}>导入整合包</button>
     {/if}
@@ -3096,10 +3186,10 @@
               原版
             </button>
             {#each LOADER_ORDER as item (item)}
-              {#if usable(item)}
+              {#if supports(item)}
                 <button
                   class="chip"
-                  class:on={!!picked[item]}
+                  class:on={picked[item] !== undefined}
                   onclick={() => toggleLoader(item)}
                   disabled={busy}
                   title={PRIMARY.includes(item) ? "主加载器同时只能选一个" : undefined}
@@ -3109,11 +3199,7 @@
               {/if}
             {/each}
           </div>
-          {#if probing}
-            <p class="hint">正在读取这个版本可用的加载器…</p>
-          {:else if chosen.length === 0}
-            <p class="hint">只装原版。这个版本没有的加载器不会显示出来。</p>
-          {/if}
+
         </div>
 
         <label class="field">
@@ -3135,6 +3221,14 @@
           {@const current = options.find((item) => item.version === picked[kind]) ?? options[0]}
           <div class="loader-row">
             <span class="label">{LOADER_NAME[kind]}</span>
+            {#if failed[kind]}
+              <span class="loader-state">未拉取到</span>
+              <button class="btn ghost loader-retry" onclick={() => retry(kind)} disabled={busy}>
+                重试
+              </button>
+            {:else if !(entries[kind]?.length)}
+              <span class="loader-state">正在拉取中…</span>
+            {:else}
             <div class="picker-row">
               <div class="seg" role="group" aria-label="{LOADER_NAME[kind]} 版本类型">
                 {#each [
@@ -3196,6 +3290,7 @@
                 {/if}
               </div>
             </div>
+            {/if}
           </div>
         {/each}
 
@@ -3239,7 +3334,7 @@
           <button
             class="btn primary"
             onclick={install}
-            disabled={busy || !selected || nameTaken || missingBuild.length > 0}
+            disabled={busy || waiting || !selected || nameTaken || missingBuild.length > 0}
           >
             {busy ? "安装中…" : "安装"}
           </button>
@@ -3585,8 +3680,6 @@
           <p class="dim small">
             共 {mrTotal} 个结果 · 每页 {mrPageSize} 条 · 第 {mrPage} / {mrPageCount} 页
           </p>
-        {:else if !mrBusy && mrLoaded}
-          <p class="empty-result">没有搜索结果</p>
         {/if}
         {#if listHint}
           <p class="dim small">{listHint}</p>
@@ -3789,7 +3882,6 @@
             <section class="group-card">
               <button class="group-head" onclick={() => (leftCollapsed = !leftCollapsed)}>
                 <span class="group-title">{leftTitle}</span>
-                <span class="group-count">{leftFiles.length}</span>
                 <svg class="group-arrow" class:open={!leftCollapsed} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
                   <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
                 </svg>
@@ -3806,7 +3898,6 @@
             <section class="group-card">
               <button class="group-head" onclick={() => toggleGroup(picked.title)}>
                 <span class="group-title">{picked.title}</span>
-                <span class="group-count">{picked.files.length}</span>
                 <svg class="group-arrow" class:open={fileExpanded.has(picked.title)} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
                   <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
                 </svg>
@@ -3821,7 +3912,6 @@
             <section class="group-card">
               <button class="group-head" onclick={() => toggleGroup(group.title)}>
                 <span class="group-title">{group.title}</span>
-                <span class="group-count">{group.files.length}</span>
                 <svg class="group-arrow" class:open={fileExpanded.has(group.title)} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
                   <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
                 </svg>
@@ -4058,17 +4148,6 @@
 </div>
 
 <style>
-  .tasks-overlay {
-    position: absolute;
-    inset: 0;
-    z-index: 20;
-    padding: 22px;
-    border-radius: inherit;
-    background: color-mix(in srgb, var(--yb-panel, #1c2220) 92%, transparent);
-    backdrop-filter: blur(18px);
-    display: flex;
-    flex-direction: column;
-  }
   .page {
     position: relative;
     display: flex;
@@ -4772,6 +4851,19 @@
     display: grid;
     gap: 8px;
   }
+  .loader-state {
+    font-size: 13px;
+    color: var(--text-dim);
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(8, 10, 14, 0.35);
+  }
+  .loader-retry {
+    justify-self: start;
+    padding: 6px 12px;
+    font-size: 12px;
+  }
   .picker-row {
     display: flex;
     gap: 8px;
@@ -5148,11 +5240,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .group-count {
-    font-size: 11px;
-    font-weight: 400;
-    color: var(--text-dim);
   }
   .group-arrow {
     color: var(--text-dim);

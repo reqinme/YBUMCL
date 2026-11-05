@@ -10,6 +10,7 @@
   import { showError } from "$lib/dialogs.svelte";
   import { api, type CategorySnapshot, type GameFolder, type Settings, type VersionView } from "$lib/api";
   import { startVersion } from "$lib/launch";
+  import { loaderLabels } from "$lib/loader-ranges";
   import {
     addFolder,
     blockedByTask,
@@ -75,37 +76,17 @@
     channel === "all" ? versions : versions.filter((version) => version.channel === channel)
   );
 
-  const channelOptions = $derived(
-    CHANNELS.map((item) => ({
-      value: item.value,
-      label:
-        item.value === "all"
-          ? item.label
-          : `${item.label} ${
-              versions.filter((version) => version.channel === item.value).length || ""
-            }`.trim()
-    }))
-  );
 
   const gameOptions = $derived.by(() => {
-    const seen = new Map<string, number>();
-    for (const version of byChannel) {
-      const key = version.gameVersion ?? version.id;
-      seen.set(key, (seen.get(key) ?? 0) + 1);
-    }
-    const options = [{ value: "all", label: "全部版本" }];
-    for (const [key, count] of seen) options.push({ value: key, label: `${key} ${count}` });
-    return options;
+    const seen = new Set<string>();
+    for (const version of byChannel) seen.add(version.gameVersion ?? version.id);
+    return [{ value: "all", label: "全部版本" }, ...[...seen].map((key) => ({ value: key, label: key }))];
   });
 
   const loaderOptions = $derived.by(() => {
-    const seen = new Map<string, number>();
-    for (const version of byChannel) {
-      for (const loader of version.loaders) seen.set(loader, (seen.get(loader) ?? 0) + 1);
-    }
-    const options = [{ value: "all", label: "全部加载器" }];
-    for (const [key, count] of seen) options.push({ value: key, label: `${key} ${count}` });
-    return options;
+    const seen = new Set<string>();
+    for (const version of byChannel) for (const loader of version.loaders) seen.add(loader);
+    return [{ value: "all", label: "全部加载器" }, ...[...seen].map((key) => ({ value: key, label: key }))];
   });
 
   const categoryOptions = $derived.by(() => {
@@ -472,11 +453,15 @@
 <div class="view">
   <header class="head">
     <BackButton />
-    <h1>版本 <span class="count">{versions.length}</span></h1>
+    <h1>版本</h1>
     <span class="spacer"></span>
     <button class="btn" onclick={refresh} disabled={foldersLoading || loading}>刷新</button>
     <button class="btn primary" onclick={() => goto("/downloads")}>下载版本</button>
   </header>
+
+  {#if !foldersLoading}
+    <p class="dim">共 {versions.length} 个版本</p>
+  {/if}
 
 {#if foldersLoading}
   <p class="dim">正在读取文件夹…</p>
@@ -558,7 +543,7 @@
         <Dropdown
           label="版本"
           bind:value={channel}
-          options={channelOptions}
+          options={CHANNELS}
           onchange={() => {
             gamePick = "all";
             saveFilters();
@@ -610,7 +595,11 @@
                     {#if version.gameVersion && version.gameVersion !== version.id}
                       <span class="kind">{version.gameVersion}</span>
                     {/if}
-                    <span class="loaders">{version.loaders.join(" + ") || "原版"}</span>
+                    <span class="loader-group">
+                      {#each loaderLabels(version.loadersDetail) as label}
+                        <span class="loaders">{label}</span>
+                      {/each}
+                    </span>
                   </p>
                 </div>
                 <button
@@ -735,11 +724,6 @@
     margin: 0;
     font-size: 24px;
     font-weight: 650;
-  }
-  .count {
-    font-size: 13px;
-    color: var(--text-dim);
-    margin-left: 6px;
   }
   .spacer {
     flex: 1;
@@ -1020,10 +1004,10 @@
   .meta {
     display: flex;
     align-items: center;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 4px 6px;
     margin: 0;
     min-width: 0;
-    overflow: hidden;
   }
   .kind {
     flex: none;
@@ -1033,13 +1017,22 @@
     border-radius: 999px;
     padding: 0 7px;
   }
+  .loader-group {
+    margin-left: auto;
+    display: inline-flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 4px;
+    min-width: 0;
+  }
   .loaders {
-    margin: 0 0 0 auto;
     font-size: 11.5px;
     color: var(--text-dim);
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    line-height: 16px;
   }
   dl {
     display: grid;

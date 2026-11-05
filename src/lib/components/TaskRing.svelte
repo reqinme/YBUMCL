@@ -1,7 +1,5 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { page } from "$app/stores";
-  import { downloadsNav } from "$lib/downloads-nav.svelte";
   import { activeCount, overallProgress } from "$lib/tasks.svelte";
 
   /// 圆环画在一个 36×36 的 svg 里，半径 15、线宽 2。
@@ -18,10 +16,13 @@
   const offset = $derived(CIRC * (1 - percent / 100));
 </script>
 
-<button class="ring" class:on={show} title="下载任务" onclick={() => {
-    downloadsNav.tasksOpen = true;
-    if ($page.url.pathname !== "/downloads") void goto("/downloads");
-  }} aria-label="下载任务">
+<button
+  class="ring"
+  class:on={show}
+  title="下载任务"
+  onclick={() => void goto("/tasks")}
+  aria-label="下载任务"
+>
   <svg class="dial" viewBox={`0 0 ${SIZE} ${SIZE}`} width={SIZE} height={SIZE} aria-hidden="true">
     <circle class="track" cx={SIZE / 2} cy={SIZE / 2} r={RADIUS} />
     <circle

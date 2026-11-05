@@ -2127,6 +2127,7 @@ dependencies = [
 name = "launcher-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "image",
  "md5",
@@ -2135,7 +2136,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "thiserror 2.0.21",
+ "windows-sys 0.59.0",
  "zip",
 ]
 
@@ -5401,7 +5404,7 @@ checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "ybumcl-desktop"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "launcher-core",
  "serde",

@@ -68,7 +68,7 @@ fn publish(app: &AppHandle, runtime: &GameRuntime, line: LogLine) {
 // ------------------------------------------------------------ 版本（即实例）
 
 /// 前端列表项：版本本体 + 该版本合并后的启动配置。
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionView {
     pub id: String,
@@ -149,24 +149,97 @@ fn instance_loader_choices(
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
-    json.get("_ybmcl")
-        .and_then(|value| value.get("loaders"))
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let loader = item.get("loader").and_then(|v| v.as_str())?.to_owned();
-                    let version = item
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_owned();
-                    Some(launcher_core::instance::LoaderChoice { loader, version })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    // 真相只有一个：实例 json 里实际挂了哪些加载器库。
+    // 不信 `_ybmcl` 的记录，也不从实例 id 里的字样去猜。
+    loaders_from_libraries(&json)
+}
+
+fn loaders_from_libraries(json: &serde_json::Value) -> Vec<launcher_core::instance::LoaderChoice> {
+    let mut out: Vec<launcher_core::instance::LoaderChoice> = Vec::new();
+    let Some(libraries) = json.get("libraries").and_then(|value| value.as_array()) else {
+        return out;
+    };
+    for library in libraries {
+        let Some(name) = library.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let parts: Vec<&str> = name.split(':').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let group = parts[0];
+        let artifact = parts[1];
+        let loader = match (group, artifact) {
+            ("net.minecraftforge", "forge") | ("net.minecraftforge", "fmlloader") => "forge",
+            ("net.neoforged", "neoforge") | ("net.neoforged", "fmlloader") => "neoforge",
+            ("net.fabricmc", "fabric-loader") => "fabric",
+            ("org.quiltmc", "quilt-loader") => "quilt",
+            ("com.mumfrey", "liteloader") => "liteloader",
+            ("com.cleanroommc", "cleanroom") => "cleanroom",
+            (_, "optifine") | (_, "OptiFine") => "optifine",
+            // NeoForge 20.2+ 把 FML 拆到了 net.neoforged.fancymodloader，
+            // 主组 net.neoforged 下还挂着 bus/coremods/accesstransformers 这些，靠它认。
+            ("net.neoforged", _) | ("net.neoforged.fancymodloader", _) => "neoforge",
+            _ => continue,
+        };
+        if out.iter().any(|item| item.loader == loader) {
+            continue;
+        }
+        let raw = parts[2];
+        let mut version = if loader == "forge" || loader == "neoforge" {
+            // 老版本 Forge 的坐标是 `<游戏版本>-<Forge 版本>`，1.7.10 还多带一段
+            // 游戏版本尾巴（`1.7.10-10.13.4.1614-1.7.10`）；现代 Forge 直接就是
+            // 版本号（`47.4.28`）。统一取中间那段，别把游戏版本当加载器版本。
+            if raw.starts_with("1.") {
+                raw.split('-')
+                    .nth(1)
+                    .filter(|part| !part.is_empty())
+                    .unwrap_or(raw)
+                    .to_owned()
+            } else {
+                raw.to_owned()
+            }
+        } else {
+            raw.to_owned()
+        };
+        // fancymodloader 那几项带的是 FML 自己的版本，不是 NeoForge 的版本号，
+        // 先留空，等参数里的 --fml.neoForgeVersion 补上。
+        if loader == "neoforge" && artifact != "neoforge" && artifact != "fmlloader" {
+            version.clear();
+        }
+        // NeoForge 的正式版本号在启动参数里（--fml.neoForgeVersion 21.1.265），
+        // libraries 里只有 FML 自己的版本（4.0.45），优先用参数里的那个。
+        if loader == "neoforge" {
+            if let Some(found) = argument_value(json, "--fml.neoForgeVersion") {
+                version = found;
+            }
+        }
+        out.push(launcher_core::instance::LoaderChoice {
+            loader: loader.to_owned(),
+            version,
+        });
+    }
+    out
+}
+
+/// 从 `arguments.game` 里取 `--flag value` 形式的参数值。
+fn argument_value(json: &serde_json::Value, flag: &str) -> Option<String> {
+    let game = json
+        .get("arguments")
+        .and_then(|value| value.get("game"))
+        .and_then(|value| value.as_array())?;
+    let mut previous: Option<&str> = None;
+    for entry in game {
+        let Some(text) = entry.as_str() else {
+            previous = None;
+            continue;
+        };
+        if previous == Some(flag) {
+            return Some(text.to_owned());
+        }
+        previous = Some(text);
+    }
+    None
 }
 
 fn versions_root(game_dir: &Path) -> PathBuf {
@@ -194,6 +267,40 @@ pub async fn list_versions(
         .map(|session| session.child.is_some())
         .unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
+        let _ = running;
+        versions_cached(&game_dir, &data_dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 版本列表：先看磁盘缓存（PCL 的 `InstanceCache` 那套），键对不上才算。
+fn versions_cached(game_dir: &Path, data_dir: &Path) -> Result<Vec<VersionView>, String> {
+    let key = crate::instance_cache::key(game_dir);
+    if let Some(views) = crate::instance_cache::read::<Vec<VersionView>>(data_dir, &key) {
+        return Ok(views);
+    }
+    let views = collect_views(game_dir, data_dir)?;
+    crate::instance_cache::write(data_dir, &key, &views);
+    Ok(views)
+}
+
+/// 启动时预热：把概述算好写进缓存，之后打开版本页 / 实例页就不用等。
+pub fn warm_instance_cache(game_dir: &Path, data_dir: &Path) {
+    let key = crate::instance_cache::key(game_dir);
+    if crate::instance_cache::read::<Vec<VersionView>>(data_dir, &key).is_some() {
+        return;
+    }
+    if let Ok(views) = collect_views(game_dir, data_dir) {
+        crate::instance_cache::write(data_dir, &key, &views);
+    }
+}
+
+/// 真正扫一遍所有实例，拼出列表页 / 实例页概述要的那份数据。
+fn collect_views(game_dir: &Path, data_dir: &Path) -> Result<Vec<VersionView>, String> {
+    {
+        let game_dir = game_dir.to_path_buf();
+        let data_dir = data_dir.to_path_buf();
         let scanned = match launcher_core::scan_versions(&game_dir) {
             Ok(scanned) => scanned,
             // 首次运行还没建游戏目录，这是「还没装版本」，不是错误。
@@ -265,12 +372,8 @@ pub async fn list_versions(
                 server_entry: settings.server_entry.clone(),
             });
         }
-        // 正在运行的版本排到最前面，方便一眼看到。
-        let _ = running;
         Ok(out)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    }
 }
 
 #[tauri::command]
@@ -749,6 +852,9 @@ fn launch_request(
     } else {
         pick_java(id, None, game_dir)?
     };
+    // 设置里存的路径可能混着 `/`（历史数据），跟探测出来的 `\` 路径对不上，
+    // 后面按路径找 Java 大版本时就会找不到、跳过区间校验。
+    let mut java_path = java_path.replace('/', "\\");
     match version.login_require {
         1 => {
             return Err(
@@ -767,15 +873,31 @@ fn launch_request(
     if !version.ignore_java_warning {
         let major = launcher_core::detect_java()
             .into_iter()
-            .find(|java| java.path.eq_ignore_ascii_case(&java_path))
+            .find(|java| java.path.replace('/', "\\").eq_ignore_ascii_case(&java_path))
             .map(|java| java.major);
         if let Some(major) = major {
             let requirement = java_requirement(game_dir, id);
             if !requirement.accepts(major) {
-                return Err(format!(
-                    "这个实例要 {}，现在选的是 Java {major}。换一套 Java，或者在「高级启动选项」里勾上「忽略 Java 兼容性警告」。",
-                    requirement.describe()
-                ));
+                // PCL 的做法是「挑一个满足区间的」而不是拦住不给玩：
+                // 这里换掉 java_path，并把换用记进启动器日志，界面照常启动。
+                match pick_java_for(requirement.clone()) {
+                    Ok(selected) => {
+                        crate::versions::append_log(
+                            paths.data_dir(),
+                            &format!(
+                                "[java] 实例 {id} 要 {}，原先的 Java {major} 不满足，已自动改用 {selected}",
+                                requirement.describe()
+                            ),
+                        );
+                        java_path = selected;
+                    }
+                    Err(_) => {
+                        return Err(format!(
+                            "这个实例要 {}，现在选的是 Java {major}，也没找到别的能用的 Java。换一套 Java，或者在「高级启动选项」里勾上「忽略 Java 兼容性警告」。",
+                            requirement.describe()
+                        ))
+                    }
+                }
             }
         }
     }
@@ -826,6 +948,7 @@ fn launch_request(
         game_args,
         classpath_head: split_args(&version.classpath_head),
         skip_file_check: version.skip_file_check,
+        allow_java_upgrade: true,
         log4j_debug: version.debug_log4j,
     })
 }
@@ -1450,7 +1573,18 @@ fn java_requirement(
     version_id: &str,
 ) -> launcher_core::java::JavaRequirement {
     launcher_core::java::requirement_for_dir(game_dir, version_id).unwrap_or_else(|| {
-        launcher_core::java::requirement_with(version_id, None, &LoaderPresence::default())
+        // 认不出这份 json 时退一步：拿实例认出来的基础版本算区间。
+        // 实例名常常不是版本号（`Reverie Foundry`），直接把它当版本号会得到
+        // 「任意 Java 都行」，于是全局默认的 Java 17 被放行、启动时才被
+        // 核心以 `requires Java 21 or newer` 拦住。
+        let base = crate::version_meta::describe_all(game_dir, &[version_id.to_owned()])
+            .get(version_id)
+            .and_then(|meta| meta.game_version.clone());
+        launcher_core::java::requirement_with(
+            base.as_deref().unwrap_or(version_id),
+            None,
+            &LoaderPresence::default(),
+        )
     })
 }
 
@@ -1477,8 +1611,9 @@ fn pick_java_for(requirement: launcher_core::java::JavaRequirement) -> Result<St
         .iter()
         .filter(|java| requirement.accepts(java.major))
         .collect();
-    matching.sort_by_key(|java| java.major);
-    match matching.first() {
+    // PCL 的 JavaSorter：8/17/21 权重更高，同权重再挑大版本。
+    matching.sort_by_key(|java| (launcher_core::java_weight(java.major), java.major));
+    match matching.last() {
         Some(java) => Ok(java.path.clone()),
         None => {
             let majors: Vec<u32> = found.iter().map(|java| java.major).collect();
@@ -1510,8 +1645,46 @@ fn repair_before_launch(
     version_id: &str,
     strategy: launcher_core::download::DownloadStrategy,
 ) -> Result<(), String> {
+    // 增量 profile（Forge/Fabric/NeoForge 等）自己没有 assetIndex，资源和客户端
+    // jar 都在它继承的基础版本里：先补基础版本，再按实例 json 补库。
+    let base_version = crate::version_meta::describe_all(
+        std::path::Path::new(game_dir),
+        std::slice::from_ref(&version_id.to_owned()),
+    )
+    .remove(version_id)
+    .and_then(|meta| meta.game_version);
+    let Some(base_version) = base_version else {
+        return Err("认不出这个实例的基础游戏版本，补齐缺失文件做不到".into());
+    };
+    if base_version == version_id {
+        let emitter = app.clone();
+        return launcher_core::download::install_profile_assets(
+            game_dir,
+            version_id,
+            strategy,
+            None,
+            CancellationToken::default(),
+            move |progress: InstallProgress| {
+                let _ = emitter.emit("install-progress", &progress);
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| format!("补齐缺失文件失败：{error}"));
+    }
     let emitter = app.clone();
     launcher_core::download::install_profile_assets(
+        game_dir,
+        &base_version,
+        strategy,
+        None,
+        CancellationToken::default(),
+        move |progress: InstallProgress| {
+            let _ = emitter.emit("install-progress", &progress);
+        },
+    )
+    .map_err(|error| format!("补齐基础版本失败：{error}"))?;
+    let emitter = app.clone();
+    launcher_core::download::install_profile_libraries(
         game_dir,
         version_id,
         strategy,
@@ -1768,9 +1941,37 @@ pub fn game_snapshot(runtime: State<'_, GameRuntime>) -> Result<GameSnapshot, St
 
 // ---------------------------------------------------------------- 下载安装
 
-/// 同一时刻只允许一个安装任务在跑；取消就是把 token 置位。
+/// 正在跑的安装任务，按前端任务卡的 id 登记。
+///
+/// PCL 的任务之间完全并行，这里也按任务 id 各管各的 token：同一个 id 重复进来才报错，
+/// 不同实例、不同任务可以同时装。取消按 id 找对应的 token。
 #[derive(Clone, Default)]
-pub struct InstallRuntime(pub Arc<Mutex<Option<CancellationToken>>>);
+pub struct InstallRuntime(pub Arc<Mutex<std::collections::HashMap<u64, CancellationToken>>>);
+
+/// 匿名安装号：从 1<<63 起，跟前端任务卡的 id 不会撞。
+fn next_anonymous_install() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1 << 63);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl InstallRuntime {
+    fn begin(&self, install_id: u64) -> Result<CancellationToken, String> {
+        let mut running = self.0.lock().map_err(|e| e.to_string())?;
+        if running.contains_key(&install_id) {
+            return Err("这个任务已经在装了".into());
+        }
+        let token = CancellationToken::default();
+        running.insert(install_id, token.clone());
+        Ok(token)
+    }
+
+    fn end(&self, install_id: u64) {
+        if let Ok(mut running) = self.0.lock() {
+            running.remove(&install_id);
+        }
+    }
+}
 
 fn parse_loader(raw: &str) -> Result<ModLoader, String> {
     match raw {
@@ -2052,6 +2253,7 @@ pub async fn ftb_versions(
 pub async fn install_ftb_modpack(
     app: AppHandle,
     runtime: State<'_, InstallRuntime>,
+    install_id: Option<u64>,
     game_dir: String,
     project: String,
     version: String,
@@ -2061,14 +2263,9 @@ pub async fn install_ftb_modpack(
     icon_url: Option<String>,
 ) -> Result<launcher_core::modpack::ModpackSummary, String> {
     let strategy = strategy_of(strategy.as_deref());
-    let token = CancellationToken::default();
-    {
-        let mut slot = runtime.0.lock().map_err(|e| e.to_string())?;
-        if slot.is_some() {
-            return Err("已有安装任务在进行中".into());
-        }
-        *slot = Some(token.clone());
-    }
+    // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
+    let install_id = install_id.unwrap_or_else(next_anonymous_install);
+    let token = runtime.begin(install_id)?;
     let runtime_inner = runtime.inner().clone();
     let staging = PathBuf::from(&game_dir).join(".ybmcl").join("modpack");
     let pack_dir = game_dir.clone();
@@ -2119,9 +2316,7 @@ pub async fn install_ftb_modpack(
     .await
     .map_err(|error| error.to_string())?;
 
-    if let Ok(mut slot) = runtime_inner.0.lock() {
-        *slot = None;
-    }
+    runtime_inner.end(install_id);
     match &result {
         Ok(_) => crate::sweep::clear_paused(&staging),
         Err(_) if probe.is_paused() => crate::sweep::mark_paused(&staging),
@@ -2645,16 +2840,12 @@ pub async fn download_package(
 pub async fn install_game_version(
     app: AppHandle,
     runtime: State<'_, InstallRuntime>,
+    install_id: Option<u64>,
     request: InstallRequest,
 ) -> Result<InstallSummary, String> {
-    let token = CancellationToken::default();
-    {
-        let mut slot = runtime.0.lock().map_err(|e| e.to_string())?;
-        if slot.is_some() {
-            return Err("已有安装任务在进行中".into());
-        }
-        *slot = Some(token.clone());
-    }
+    // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
+    let install_id = install_id.unwrap_or_else(next_anonymous_install);
+    let token = runtime.begin(install_id)?;
     let runtime_inner = runtime.inner().clone();
     // 装完要登记产出（任务卡的「打开文件夹 / 移除并删除文件」），得先留一份游戏目录。
     let version_dir = request.game_dir.clone();
@@ -2669,9 +2860,7 @@ pub async fn install_game_version(
     .await
     .map_err(|e| e.to_string())?;
 
-    if let Ok(mut slot) = runtime_inner.0.lock() {
-        *slot = None;
-    }
+    runtime_inner.end(install_id);
     let mut result = result;
     if let Ok(summary) = &mut result {
         if summary.path.is_empty() && !summary.version_id.is_empty() {
@@ -2698,16 +2887,12 @@ pub async fn install_game_version(
 pub async fn install_game_modloader(
     app: AppHandle,
     runtime: State<'_, InstallRuntime>,
+    install_id: Option<u64>,
     mut request: ModLoaderInstallRequest,
 ) -> Result<InstallSummary, String> {
-    let token = CancellationToken::default();
-    {
-        let mut slot = runtime.0.lock().map_err(|e| e.to_string())?;
-        if slot.is_some() {
-            return Err("已有安装任务在进行中".into());
-        }
-        *slot = Some(token.clone());
-    }
+    // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
+    let install_id = install_id.unwrap_or_else(next_anonymous_install);
+    let token = runtime.begin(install_id)?;
     let runtime_inner = runtime.inner().clone();
     // request 要搬进后台线程，装完登记产出还得知道游戏目录在哪。
     let loader_dir = request.game_dir.clone();
@@ -2735,9 +2920,7 @@ pub async fn install_game_modloader(
     .await
     .map_err(|e| e.to_string())?;
 
-    if let Ok(mut slot) = runtime_inner.0.lock() {
-        *slot = None;
-    }
+    runtime_inner.end(install_id);
     let mut result = result;
     if let Ok(summary) = &mut result {
         // 加载器外壳的产出就是 `versions/<外壳名>`：装完能直接打开、也能移除。
@@ -2757,16 +2940,12 @@ pub async fn install_game_modloader(
 pub async fn install_game_instance(
     app: AppHandle,
     runtime: State<'_, InstallRuntime>,
+    install_id: Option<u64>,
     request: InstanceRequest,
 ) -> Result<InstallSummary, String> {
-    let token = CancellationToken::default();
-    {
-        let mut slot = runtime.0.lock().map_err(|e| e.to_string())?;
-        if slot.is_some() {
-            return Err("已有安装任务在进行中".into());
-        }
-        *slot = Some(token.clone());
-    }
+    // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
+    let install_id = install_id.unwrap_or_else(next_anonymous_install);
+    let token = runtime.begin(install_id)?;
     let runtime_inner = runtime.inner().clone();
     // 暂停时半成品就是这个目录；装成功或用户取消都要把登记撤掉。
     let instance_path = launcher_core::instance::instance_target(&request);
@@ -2782,9 +2961,7 @@ pub async fn install_game_instance(
     .await
     .map_err(|e| e.to_string())?;
 
-    if let Ok(mut slot) = runtime_inner.0.lock() {
-        *slot = None;
-    }
+    runtime_inner.end(install_id);
     if let Some(path) = &instance_path {
         match &result {
             Ok(_) => crate::sweep::clear_paused(path),
@@ -2821,16 +2998,12 @@ fn write_pack(game_dir: &str, summary: &launcher_core::modpack::ModpackSummary) 
 pub async fn install_modpack(
     app: AppHandle,
     runtime: State<'_, InstallRuntime>,
+    install_id: Option<u64>,
     request: launcher_core::modpack::ModpackRequest,
 ) -> Result<launcher_core::modpack::ModpackSummary, String> {
-    let token = CancellationToken::default();
-    {
-        let mut slot = runtime.0.lock().map_err(|e| e.to_string())?;
-        if slot.is_some() {
-            return Err("已有安装任务在进行中".into());
-        }
-        *slot = Some(token.clone());
-    }
+    // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
+    let install_id = install_id.unwrap_or_else(next_anonymous_install);
+    let token = runtime.begin(install_id)?;
     let runtime_inner = runtime.inner().clone();
     let staging = PathBuf::from(&request.game_dir)
         .join(".ybmcl")
@@ -2862,9 +3035,7 @@ pub async fn install_modpack(
     .await
     .map_err(|e| e.to_string())?;
 
-    if let Ok(mut slot) = runtime_inner.0.lock() {
-        *slot = None;
-    }
+    runtime_inner.end(install_id);
     match &result {
         Ok(summary) => {
             remember_output(summary.path.clone());
@@ -2887,10 +3058,14 @@ pub fn instance_name_taken(game_dir: String, name: String) -> Result<bool, Strin
 #[tauri::command]
 pub fn cancel_install(
     runtime: State<'_, InstallRuntime>,
+    install_id: Option<u64>,
     mode: Option<String>,
 ) -> Result<bool, String> {
-    let slot = runtime.0.lock().map_err(|e| e.to_string())?;
-    match slot.as_ref() {
+    let Some(install_id) = install_id else {
+        return Ok(false);
+    };
+    let running = runtime.0.lock().map_err(|e| e.to_string())?;
+    match running.get(&install_id) {
         Some(token) => {
             if mode.as_deref() == Some("pause") {
                 token.pause();
@@ -2962,10 +3137,93 @@ pub async fn remove_mod(
     game_dir: String,
     game_directory: Option<String>,
     file_name: String,
+    permanent: bool,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let runtime = runtime_of(game_dir, game_directory)?;
-        launcher_core::delete_mod(&runtime, &file_name).map_err(|e| e.to_string())
+        launcher_core::delete_mod(&runtime, &file_name, permanent).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 认领模组对应的项目（先 Modrinth sha1，再 CurseForge 指纹），结果落缓存。
+/// 认领不到返回 `None`，前端退回「只按显示名搜索」。
+#[tauri::command]
+pub async fn mod_project(
+    paths: State<'_, Paths>,
+    game_dir: String,
+    game_directory: Option<String>,
+    file_name: String,
+) -> Result<Option<launcher_core::mod_updates::ModProject>, String> {
+    let data_dir = paths.data_dir().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        if let Some(key) = crate::mod_projects::key(&runtime, &file_name) {
+            if let Some(cached) = crate::mod_projects::get(&data_dir, &key) {
+                return Ok(cached.map(|item| launcher_core::mod_updates::ModProject {
+                    source: item.source,
+                    project_id: item.project_id,
+                }));
+            }
+            let found = launcher_core::mod_updates::identify(&runtime, &file_name)
+                .map_err(|e| e.to_string())?;
+            crate::mod_projects::put(
+                &data_dir,
+                &key,
+                found.as_ref().map(|item| crate::mod_projects::CachedProject {
+                    source: item.source.clone(),
+                    project_id: item.project_id.clone(),
+                }),
+            );
+            return Ok(found);
+        }
+        launcher_core::mod_updates::identify(&runtime, &file_name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Mod 内嵌图标的 data URL；jar 里没有图标就是 `None`。
+#[tauri::command]
+pub async fn mod_icon(
+    game_dir: String,
+    game_directory: Option<String>,
+    file_name: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::mods::mod_icon(&runtime, &file_name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn check_mod_updates(
+    game_dir: String,
+    game_directory: Option<String>,
+    game_version: String,
+    loader: String,
+) -> Result<Vec<launcher_core::mod_updates::ModUpdate>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::mod_updates::check(&runtime, &game_version, &loader)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn apply_mod_update(
+    game_dir: String,
+    game_directory: Option<String>,
+    update: launcher_core::mod_updates::ModUpdate,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::mod_updates::apply(&runtime, &update).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3507,4 +3765,296 @@ pub async fn export_instance_zip(
 
     let _ = written;
     Ok(Some(out))
+}
+
+// ---- 整合包导出（规则/识别/索引，逻辑照 PCL 的「整合包制作」）----
+
+fn export_game_dir(paths: &Paths) -> PathBuf {
+    crate::game_folders::current(paths)
+}
+
+fn export_dependencies(paths: &Paths, id: &str) -> Vec<(String, String)> {
+    let game_dir = export_game_dir(paths);
+    let mut deps = Vec::new();
+    if let Some(meta) = crate::version_meta::describe_all(&game_dir, &[id.to_owned()]).remove(id) {
+        if let Some(game) = meta.game_version {
+            if !game.is_empty() {
+                deps.push(("minecraft".to_owned(), game));
+            }
+        }
+    }
+    for choice in instance_loader_choices(&game_dir.to_string_lossy(), id) {
+        let key = match choice.loader.to_ascii_lowercase().as_str() {
+            "fabric" => "fabric-loader",
+            "quilt" => "quilt-loader",
+            "forge" => "forge",
+            "neoforge" => "neoforge",
+            _ => continue,
+        };
+        deps.push((key.to_owned(), choice.version));
+    }
+    deps
+}
+
+/// 导出页的选项表；可见性和动态子项按实例目录探过。
+#[tauri::command]
+pub fn export_pack_layout(
+    paths: State<'_, Paths>,
+    id: String,
+) -> Result<Vec<launcher_core::export::OptionView>, String> {
+    let root = instance_root_of(&paths, &id)?;
+    let meta = crate::version_meta::describe_all(&export_game_dir(&paths), &[id.clone()]);
+    let loaders = meta
+        .get(&id)
+        .map(|item| item.loaders.clone())
+        .unwrap_or_default();
+    let modable = loaders.iter().any(|name| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "原版" | "minecraft" | "optifine"
+        )
+    });
+    let has_optifine = loaders
+        .iter()
+        .any(|name| name.to_ascii_lowercase().contains("optifine"));
+    Ok(launcher_core::export::layout(&root, modable, has_optifine))
+}
+
+const EXPORT_TEMP_DIR: &str = ".ybmcl-export";
+
+/// 第一阶段：按规则把文件挑进临时目录，算出待识别的哈希。
+#[tauri::command]
+pub async fn export_pack_begin(
+    app: tauri::AppHandle,
+    paths: State<'_, Paths>,
+    id: String,
+    rules: Vec<String>,
+    task_id: Option<u32>,
+) -> Result<u64, String> {
+    let root = instance_root_of(&paths, &id)?;
+    let temp = export_game_dir(&paths).join(EXPORT_TEMP_DIR);
+    std::fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
+    let emitter = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit = |done: u64, total: u64| {
+            if let Some(task) = task_id {
+                let _ = emitter.emit(
+                    "download-progress",
+                    serde_json::json!({ "id": task, "received": done, "total": total }),
+                );
+            }
+        };
+        launcher_core::export::begin(&root, &rules, &temp, emit).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 第二阶段：联网识别（Modrinth + CurseForge）。返回 `(认出来的文件数, 待识别文件数)`。
+#[tauri::command]
+pub async fn export_pack_identify(token: u64, modrinth_only: bool) -> Result<(usize, usize), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::export::identify(token, modrinth_only).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 第三阶段：写索引、删掉已识别的文件、打包。`target` 为空就用游戏目录下的 `downloads/`。
+#[tauri::command]
+pub async fn export_pack_finish(
+    app: tauri::AppHandle,
+    paths: State<'_, Paths>,
+    id: String,
+    token: u64,
+    name: String,
+    version: String,
+    include_launcher: bool,
+    task_id: Option<u32>,
+    target: Option<String>,
+) -> Result<Option<String>, String> {
+    let game_dir = export_game_dir(&paths);
+    let dependencies = export_dependencies(&paths, &id);
+    let settings = crate::versions::load_instance(&game_dir, &id);
+    let summary = settings.description.clone();
+    let stem = if name.trim().is_empty() {
+        id.clone()
+    } else {
+        name.trim().to_owned()
+    };
+    let suffix = if include_launcher { "zip" } else { "mrpack" };
+    let file_name = format!("{stem}.{suffix}");
+    let out = match target {
+        Some(path) if !path.trim().is_empty() => PathBuf::from(path),
+        _ => {
+            let downloads = game_dir.join("downloads");
+            std::fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
+            downloads.join(file_name)
+        }
+    };
+    let launcher = if include_launcher {
+        std::env::current_exe().ok()
+    } else {
+        None
+    };
+    let emitter = app.clone();
+    let opener = app.clone();
+    let out_for_zip = out.clone();
+    let written = tauri::async_runtime::spawn_blocking(move || {
+        let emit = |done: u64, total: u64| {
+            if let Some(task) = task_id {
+                let _ = emitter.emit(
+                    "download-progress",
+                    serde_json::json!({ "id": task, "received": done, "total": total }),
+                );
+            }
+        };
+        launcher_core::export::finish(
+            token,
+            &out_for_zip,
+            &name,
+            &version,
+            &summary,
+            &dependencies,
+            include_launcher,
+            launcher.as_deref(),
+            emit,
+        )
+        .map(|_| out_for_zip.to_string_lossy().into_owned())
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    // PCL 导出完会直接打开所在文件夹。
+    use tauri_plugin_opener::OpenerExt;
+    if let Some(parent) = Path::new(&written).parent() {
+        let _ = opener
+            .opener()
+            .open_path(parent.to_string_lossy().into_owned(), None::<&str>);
+    }
+    Ok(Some(written))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportConfigView {
+    pub config_path: String,
+    pub name: String,
+    pub version: String,
+    pub include_launcher: bool,
+    pub pack_resources: bool,
+    pub modrinth_only: bool,
+    pub pack_path: Option<String>,
+    pub rules: Vec<String>,
+    pub extra_files: Vec<String>,
+}
+
+/// 读一份 PCL 格式的导出配置；取消返回 `None`。
+#[tauri::command]
+pub async fn export_pack_load_config(
+    app: tauri::AppHandle,
+) -> Result<Option<ExportConfigView>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .add_filter("整合包导出配置", &["txt"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|error| error.to_string())?;
+    let text = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let config = launcher_core::export::parse_config(&text).map_err(|error| error.to_string())?;
+    Ok(Some(ExportConfigView {
+        config_path: path.to_string_lossy().into_owned(),
+        name: config.name,
+        version: config.version,
+        include_launcher: config.include_launcher,
+        pack_resources: config.pack_resources,
+        modrinth_only: config.modrinth_only,
+        pack_path: config.pack_path,
+        rules: config.rules,
+        extra_files: config.extra_files,
+    }))
+}
+
+/// 把当前勾选写成 PCL 格式的导出配置；取消返回 `None`。
+#[tauri::command]
+pub async fn export_pack_save_config(
+    app: tauri::AppHandle,
+    paths: State<'_, Paths>,
+    name: String,
+    version: String,
+    include_launcher: bool,
+    pack_resources: bool,
+    modrinth_only: bool,
+    pack_path: Option<String>,
+    rules: Vec<String>,
+    extra_files: Vec<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let downloads = export_game_dir(&paths).join("downloads");
+    std::fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .set_file_name("export_config.txt")
+        .set_directory(downloads.to_string_lossy().into_owned())
+        .add_filter("整合包导出配置", &["txt"])
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|error| error.to_string())?;
+    let mut rules = rules;
+    rules.retain(|line| !line.trim().is_empty());
+    let config = launcher_core::export::Config {
+        name,
+        version,
+        include_launcher,
+        pack_resources,
+        modrinth_only,
+        pack_path,
+        rules,
+        extra_files,
+    };
+    let text = launcher_core::export::config_text(&config);
+    std::fs::write(&path, text).map_err(|error| error.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+pub fn export_pack_cancel(token: u64) {
+    launcher_core::export::cancel(token);
+}
+
+/// 让用户挑一个 `.mrpack` 的落点；不挑就返回空（前端就用默认位置）。
+#[tauri::command]
+pub async fn export_pack_pick_path(
+    app: tauri::AppHandle,
+    paths: State<'_, Paths>,
+    file_name: String,
+    include_launcher: bool,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let downloads = export_game_dir(&paths).join("downloads");
+    std::fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
+    let name = if file_name.trim().is_empty() {
+        format!("modpack.{}", if include_launcher { "zip" } else { "mrpack" })
+    } else {
+        file_name
+    };
+    let picked = app
+        .dialog()
+        .file()
+        .set_file_name(&name)
+        .set_directory(downloads.to_string_lossy().into_owned())
+        .add_filter(if include_launcher {
+            "压缩文件 (*.zip)"
+        } else {
+            "Modrinth 整合包 (*.mrpack)"
+        }, if include_launcher { &["zip"] } else { &["mrpack"] })
+        .blocking_save_file();
+    Ok(picked.map(|value| value.to_string()))
 }

@@ -12,7 +12,6 @@
   import { onMount } from "svelte";
     import { cachedJava } from "$lib/detect";
   import { api, type JavaInstallation, type LauncherInfo, type Settings } from "$lib/api";
-  import { setTaskLimit } from "$lib/tasks.svelte";
   import { notifySettingsSaved } from "$lib/settings-live.svelte";
 
   let settings = $state<Settings | null>(null);
@@ -37,7 +36,6 @@
     busy = "save";
     try {
       settings = await api.saveSettings(settings);
-      setTaskLimit(settings.concurrentTasks);
       notifySettingsSaved();
       announce("设置已保存");
     } catch (e) {
@@ -117,10 +115,6 @@
     <section class="panel block">
       <h2>内容下载</h2>
       <div class="grid">
-        <label>
-          <span>同时下载任务数（1–8）</span>
-          <input type="number" min="1" max="8" bind:value={settings.concurrentTasks} />
-        </label>
         <label>
           <span>速度限制（KB/s，0 表示不限制）</span>
           <input type="number" min="0" max="1048576" bind:value={settings.speedLimit} />

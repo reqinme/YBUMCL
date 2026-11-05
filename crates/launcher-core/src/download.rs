@@ -54,7 +54,19 @@ const CHUNK_MAX_PARTS: usize = 8;
 const SLOW_WINDOW: Duration = Duration::from_secs(4);
 #[cfg(test)]
 const SLOW_WINDOW: Duration = Duration::from_secs(1);
-const SLOW_BYTES_PER_SEC: u64 = 48 * 1024;
+/// 低于这个速率判定为源不通畅。PCL 的 `NetTaskSpeedLimitLow` 起始就是 256 KB/s，
+/// 但它同时受「实际限速」约束——限得比 256 KB/s 还低时，按限速本身算。
+const SLOW_CEILING_BYTES_PER_SEC: u64 = 256 * 1024;
+
+/// 慢速判定阈值：PCL 的做法是 min(256 KB/s, 限速)，不限速时就是 256 KB/s。
+fn slow_threshold() -> u64 {
+    let limit = speed_limit();
+    if limit == 0 {
+        SLOW_CEILING_BYTES_PER_SEC
+    } else {
+        limit.min(SLOW_CEILING_BYTES_PER_SEC)
+    }
+}
 /// 全局限速（字节/秒，0 = 不限）：总和一个额度，所有连接、所有任务都从这儿扣。
 static SPEED_LIMIT_BPS: AtomicU64 = AtomicU64::new(0);
 
@@ -223,10 +235,11 @@ pub struct InstallRequest {
     pub threads: Option<u32>,
 }
 impl InstallRequest {
+    /// PCL 的线程数 = 设置值 + 1（设置 1..=256 → 实际 2..=257），设置里那一个留给
+    /// 「任务本身」，其余才是并发连接。
     fn thread_count(&self) -> usize {
-        self.threads
-            .map(|n| n.clamp(1, MAX_PARALLEL_DOWNLOADS) as usize)
-            .unwrap_or(PARALLEL_DOWNLOADS)
+        let asked = self.threads.unwrap_or(PARALLEL_DOWNLOADS as u32) as usize;
+        asked.clamp(1, MAX_PARALLEL_DOWNLOADS as usize) + 1
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1307,8 +1320,8 @@ pub fn fetch_files_to(
     let last = Mutex::new(Instant::now() - Duration::from_secs(1));
     let failed: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
     let total = jobs.len();
-    // 线程数由设置决定（1–256，默认 64）；比文件数多没意义。
-    let workers = threads.clamp(1, 256).min(total).max(1);
+    // 线程数由设置决定（1–256，实际 2–257，默认 65）；比文件数多没意义。
+    let workers = threads.clamp(1, 257).min(total).max(1);
 
     // 一个文件里每读 64 KB 都会回调一次，全量转发会把 IPC 打爆；
     // 按 300 ms 节流，界面仍能看到字节在涨。
@@ -2857,7 +2870,7 @@ fn stream_once<S: Source>(
             let elapsed = window_start.elapsed();
             if elapsed >= SLOW_WINDOW {
                 let rate = window_bytes / elapsed.as_secs().max(1);
-                if rate < SLOW_BYTES_PER_SEC {
+                if rate < slow_threshold() {
                     return Err(DownloadError::Slow(format!("{} B/s", rate)));
                 }
                 window_start = Instant::now();
@@ -3297,6 +3310,22 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         self.summary.version_id = id.to_owned();
         Ok(())
     }
+    /// 只补 libraries / natives / logging。
+    ///
+    /// 老安装器写出的 `inheritsFrom` 增量 profile 没有 `assetIndex`，客户端 jar
+    /// 也在继承的原版里；`run_profile` 要求的 assetIndex 与资源对它都不适用。
+    fn run_libraries(&mut self, id: &str) -> Result<()> {
+        let metadata_path = self.root.join(format!("versions/{id}/{id}.json"));
+        inside(&self.root, &metadata_path)?;
+        let metadata = crate::read_json(&metadata_path)?;
+        let assets = serde_json::json!({ "objects": {} });
+        let jobs = plan(id, &metadata, &assets)?;
+        self.add(&jobs);
+        self.download_many(&jobs, "downloading")?;
+        self.cancel.check()?;
+        self.summary.version_id = id.to_owned();
+        Ok(())
+    }
     fn run(&mut self, game: &str, loader: Option<&str>) -> Result<InstallSummary> {
         self.run_vanilla(game)?;
         if let Some(loader) = loader {
@@ -3451,19 +3480,79 @@ fn library_artifact(library: &Value, artifact: &Value, fallback: &str) -> Result
     safe_relative(relative)?;
     let mut value = artifact.clone();
     if value["url"].as_str().is_none_or(str::is_empty) {
-        // 有些库（Cleanroom 的自带 universal jar）的 artifact 只给了 sha1，
-        // 下载根写在库条目的 url 上，没写就只能回 Mojang 的 maven。
-        let base = library["url"]
+        // 不少库（尤其老版本 Forge 的 universal jar）只给了 `name` 和 `url`，没有
+        // `downloads.artifact`；个别老安装器写的是 `http://files.minecraftforge.net/maven`，
+        // 这个域名现在直接 404，得换成 https 的 maven.minecraftforge.net 才能下到。
+        // PCL #5455：部分 Forge 的库（尤其 `:universal`）url 是空的，但文件就在
+        // forge maven 上；按 group 猜的 libraries.minecraft.net 只会 404。
+        let forge = library["name"]
             .as_str()
-            .filter(|url| url.starts_with("https://"))
-            .map(|url| url.trim_end_matches('/').to_owned())
-            .unwrap_or_else(|| "https://libraries.minecraft.net".to_owned());
+            .is_some_and(|name| name.starts_with("net.minecraftforge:forge:"));
+        let base = if forge {
+            "https://maven.minecraftforge.net".to_owned()
+        } else {
+            library_base(library, relative)
+        };
         value["url"] = Value::String(format!("{base}/{relative}"));
     }
     if value["path"].as_str().is_none() {
         value["path"] = Value::String(relative.to_owned());
     }
     Artifact::new(format!("libraries/{relative}"), &value, None, FILE_LIMIT)
+}
+
+/// 库条目没写 `downloads.artifact.url` 时，按它的 `url`、再按 group 猜一个仓库根。
+fn library_base(library: &Value, relative: &str) -> String {
+    let declared = library["url"]
+        .as_str()
+        .map(|url: &str| url.trim_end_matches('/'))
+        .filter(|url| !url.is_empty());
+    if let Some(url) = declared {
+        let url = upgrade_maven(url);
+        if url.starts_with("https://") || url.starts_with("http://") {
+            return url;
+        }
+    }
+    // 没有 url 的库多半来自加载器自己的 maven：net.minecraftforge / net.neoforged 的
+    // 文件在 Mojang 的 maven 上并不存在，落到 libraries.minecraft.net 只会 404。
+    let group = relative.split('/').take(2).collect::<Vec<_>>().join("/");
+    let base = match group.as_str() {
+        "net/minecraftforge" | "cpw/mods" | "de/oceanlabs" => "https://maven.minecraftforge.net",
+        "net/neoforged" => "https://maven.neoforged.net",
+        _ => "https://libraries.minecraft.net",
+    };
+    base.to_owned()
+}
+
+/// 老的安装器还会写 `http://files.minecraftforge.net/maven` 这种已经下线的地址。
+fn upgrade_maven(url: &str) -> String {
+    for (old, new) in [
+        (
+            "http://files.minecraftforge.net/maven",
+            "https://maven.minecraftforge.net",
+        ),
+        (
+            "https://files.minecraftforge.net/maven",
+            "https://maven.minecraftforge.net",
+        ),
+        (
+            "http://maven.minecraftforge.net",
+            "https://maven.minecraftforge.net",
+        ),
+        (
+            "http://maven.neoforged.net",
+            "https://maven.neoforged.net",
+        ),
+        (
+            "http://libraries.minecraft.net",
+            "https://libraries.minecraft.net",
+        ),
+    ] {
+        if let Some(rest) = url.strip_prefix(old) {
+            return format!("{new}{rest}");
+        }
+    }
+    url.to_owned()
 }
 fn plan(id: &str, metadata: &Value, assets: &Value) -> Result<Vec<Artifact>> {
     // Cleanroom 这类自带完整 profile 的加载器不写 downloads.client，客户端 jar 由库提供。
@@ -3860,6 +3949,34 @@ pub fn install_profile_assets(
     cancel: CancellationToken,
     emit: impl FnMut(InstallProgress),
 ) -> Result<InstallSummary> {
+    install_profile_part(game_dir, version_id, strategy, threads, cancel, emit, false)
+}
+
+/// 只按版本 json 补 libraries / natives / logging。
+///
+/// 不查 Mojang 清单，也不要求 `assetIndex`——给带 `inheritsFrom` 的增量 profile
+/// （老版本 Forge 的 `1.12.2-forge-…` 之类）用，客户端与资源由它继承的版本负责。
+pub fn install_profile_libraries(
+    game_dir: &str,
+    version_id: &str,
+    strategy: DownloadStrategy,
+    threads: Option<usize>,
+    cancel: CancellationToken,
+    emit: impl FnMut(InstallProgress),
+) -> Result<InstallSummary> {
+    install_profile_part(game_dir, version_id, strategy, threads, cancel, emit, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_profile_part(
+    game_dir: &str,
+    version_id: &str,
+    strategy: DownloadStrategy,
+    threads: Option<usize>,
+    cancel: CancellationToken,
+    emit: impl FnMut(InstallProgress),
+    libraries_only: bool,
+) -> Result<InstallSummary> {
     let root = PathBuf::from(game_dir);
     if !root.is_absolute() {
         return Err(DownloadError::Invalid(
@@ -3898,7 +4015,12 @@ pub fn install_profile_assets(
         },
         emit,
     };
-    if let Err(error) = installer.run_profile(version_id) {
+    let result = if libraries_only {
+        installer.run_libraries(version_id)
+    } else {
+        installer.run_profile(version_id)
+    };
+    if let Err(error) = result {
         installer.event(
             if matches!(error, DownloadError::Cancelled) {
                 "cancelled"

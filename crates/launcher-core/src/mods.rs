@@ -247,7 +247,9 @@ pub fn set_mod_enabled(
 }
 
 /// Delete a mod file. Only `.jar` and `.jar.disabled` files are accepted.
-pub fn delete_mod(runtime_dir: &Path, file_name: &str) -> Result<(), CoreError> {
+///
+/// The file goes to the recycle bin unless `permanent` is set.
+pub fn delete_mod(runtime_dir: &Path, file_name: &str, permanent: bool) -> Result<(), CoreError> {
     validate_mod_file_name(file_name)?;
     if ascii_case_suffix_len(file_name, b".jar").is_none()
         && ascii_case_suffix_len(file_name, b".jar.disabled").is_none()
@@ -259,7 +261,144 @@ pub fn delete_mod(runtime_dir: &Path, file_name: &str) -> Result<(), CoreError> 
 
     let (mods_dir, canonical_mods) = canonical_mods_directory(runtime_dir)?;
     let target = verified_regular_file(&mods_dir, &canonical_mods, file_name)?;
-    fs::remove_file(&target).map_err(|error| io_error(&target, error))
+    if permanent {
+        fs::remove_file(&target).map_err(|error| io_error(&target, error))
+    } else {
+        recycle_file(&target)
+    }
+}
+
+/// Put a file in the recycle bin. Non-Windows targets fall back to deleting it.
+fn recycle_file(path: &Path) -> Result<(), CoreError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::{
+            SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
+            FOF_NOERRORUI, FOF_SILENT,
+        };
+
+        let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+        from.push(0);
+        from.push(0);
+        // 结构体要求可空字段；用 0 初始化就等于全部为空。
+        let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
+        op.wFunc = FO_DELETE as u32;
+        op.pFrom = from.as_ptr();
+        op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16;
+        let code = unsafe { SHFileOperationW(&mut op) };
+        if code != 0 || op.fAnyOperationsAborted != 0 {
+            return Err(io_error(
+                path,
+                io::Error::other(format!("recycle failed (code {code})")),
+            ));
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_file(path).map_err(|error| io_error(path, error))
+    }
+}
+
+/// Read a mod's icon straight out of its jar, as a `data:` URL.
+///
+/// Saves callers from shipping their own zip reader; `None` means the jar has no
+/// usable image.
+pub fn mod_icon(runtime_dir: &Path, file_name: &str) -> Result<Option<String>, CoreError> {
+    validate_mod_file_name(file_name)?;
+    let (mods_dir, canonical_mods) = canonical_mods_directory(runtime_dir)?;
+    let target = verified_regular_file(&mods_dir, &canonical_mods, file_name)?;
+    let file = fs::File::open(&target).map_err(|error| io_error(&target, error))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|error| CoreError::Archive(format!("{}: {error}", target.display())))?;
+
+    let mut wanted: Vec<String> = Vec::new();
+    for name in [
+        FABRIC_DESCRIPTOR,
+        QUILT_DESCRIPTOR,
+        NEOFORGE_DESCRIPTOR,
+        FORGE_DESCRIPTOR,
+        LEGACY_DESCRIPTOR,
+    ] {
+        if let Some(text) = read_text_entry(&mut archive, name) {
+            wanted.extend(icon_paths(&text));
+        }
+    }
+    if let Some(found) = wanted.iter().find_map(|path| read_image_entry(&mut archive, path)) {
+        return Ok(Some(found));
+    }
+    // 描述符里没写就按常见文件名找一层。
+    for path in ["icon.png", "logo.png", "pack.png", "assets/icon.png"] {
+        if let Some(found) = read_image_entry(&mut archive, path) {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// Pull icon paths out of a descriptor without a full parse.
+fn icon_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["\"icon\"", "logoFile", "logo_file"] {
+        let mut rest = text;
+        while let Some(index) = rest.find(key) {
+            rest = &rest[index + key.len()..];
+            let trimmed = rest.trim_start();
+            if !(trimmed.starts_with(':') || trimmed.starts_with('=') || trimmed.starts_with(' '))
+            {
+                continue;
+            }
+            let trimmed = trimmed.trim_start_matches([':', '=', ' ', '\t']).trim_start();
+            let Some(quote) = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                continue;
+            };
+            let body = &trimmed[quote.len_utf8()..];
+            if let Some(end) = body.find(quote) {
+                let value = body[..end].trim();
+                if !value.is_empty() {
+                    out.push(value.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn read_text_entry<R: Read + io::Seek>(archive: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
+    let mut entry = archive.by_name(name).ok()?;
+    if entry.size() as usize > DESCRIPTOR_LIMIT {
+        return None;
+    }
+    let mut buffer = Vec::with_capacity(entry.size() as usize);
+    entry.take(DESCRIPTOR_LIMIT as u64).read_to_end(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Read an entry as a base64 `data:` URL; images have to be small.
+fn read_image_entry<R: Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<String> {
+    let name = name.trim_start_matches('/').replace('\\', "/");
+    let mut entry = archive.by_name(&name).ok()?;
+    let mime = match name.rsplit('.').next()?.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return None,
+    };
+    if entry.size() == 0 || entry.size() > 512 * 1024 {
+        return None;
+    }
+    let mut buffer = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut buffer).ok()?;
+    use base64::Engine as _;
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(buffer)
+    ))
 }
 
 /// Inspect a mod jar (or `.litemod`) and report what its descriptor says about it.
@@ -1131,9 +1270,9 @@ mod tests {
         fs::write(mods.join("a.jar"), b"jar").unwrap();
         fs::write(mods.join("b.jar.disabled"), b"disabled").unwrap();
 
-        delete_mod(&runtime, "a.jar").unwrap();
+        delete_mod(&runtime, "a.jar", true).unwrap();
         assert!(!mods.join("a.jar").exists());
-        delete_mod(&runtime, "b.jar.disabled").unwrap();
+        delete_mod(&runtime, "b.jar.disabled", true).unwrap();
         assert!(!mods.join("b.jar.disabled").exists());
     }
 
@@ -1145,7 +1284,7 @@ mod tests {
         fs::create_dir_all(&mods).unwrap();
         for name in ["worlds.zip", "options.txt", "notes.txt", "notatoggl"] {
             fs::write(mods.join(name), b"data").unwrap();
-            assert!(delete_mod(&runtime, name).is_err(), "should refuse {name}");
+            assert!(delete_mod(&runtime, name, true).is_err(), "should refuse {name}");
             assert!(mods.join(name).exists(), "should leave {name} intact");
         }
     }
@@ -1158,7 +1297,7 @@ mod tests {
         fs::create_dir_all(&mods).unwrap();
 
         fs::create_dir_all(mods.join("d.jar")).unwrap();
-        assert!(delete_mod(&runtime, "d.jar").is_err());
+        assert!(delete_mod(&runtime, "d.jar", true).is_err());
         assert!(mods.join("d.jar").is_dir());
 
         let outside = runtime.join("outside");
@@ -1166,13 +1305,13 @@ mod tests {
         fs::write(outside.join("real.jar"), b"real").unwrap();
         let link = mods.join("s.jar");
         if create_symlink_file(&link, &outside.join("real.jar")).is_ok() {
-            assert!(delete_mod(&runtime, "s.jar").is_err());
+            assert!(delete_mod(&runtime, "s.jar", true).is_err());
             assert!(link.exists() || link.is_symlink());
         }
 
-        assert!(delete_mod(&runtime, "nested/x.jar").is_err());
-        assert!(delete_mod(&runtime, "x.jar/../../y.jar").is_err());
-        assert!(delete_mod(&runtime, "evil.jar\\..\\..\\outside.jar").is_err());
+        assert!(delete_mod(&runtime, "nested/x.jar", true).is_err());
+        assert!(delete_mod(&runtime, "x.jar/../../y.jar", true).is_err());
+        assert!(delete_mod(&runtime, "evil.jar\\..\\..\\outside.jar", true).is_err());
     }
 
     #[test]
@@ -1180,7 +1319,7 @@ mod tests {
         let temp = TempDir::new();
         let runtime = canonical_runtime(&temp);
         fs::create_dir_all(runtime.join("mods")).unwrap();
-        assert!(delete_mod(&runtime, "ghost.jar").is_err());
+        assert!(delete_mod(&runtime, "ghost.jar", true).is_err());
     }
 
     #[test]
@@ -1206,7 +1345,7 @@ mod tests {
         // Now mods is a symlink; operations must refuse.
         assert!(scan_mods(&runtime).is_err() || scan_mods(&runtime).unwrap().is_empty());
         assert!(set_mod_enabled(&runtime, "a.jar", false).is_err());
-        assert!(delete_mod(&runtime, "a.jar").is_err());
+        assert!(delete_mod(&runtime, "a.jar", true).is_err());
     }
 
     /// Build a jar at `path` containing `entries`, using the `zip` writer.

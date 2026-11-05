@@ -45,8 +45,6 @@ pub struct Settings {
     pub mirror_race: bool,
     /// 首页左侧实例栏是否收起。
     pub home_rail_collapsed: bool,
-    /// 同时进行的下载任务数（1..=8）。镜像对高并发敏感，默认 3。
-    pub concurrent_tasks: u32,
     /// 内容与实例的版本/加载器不匹配时是否给黄字提示（仍可下载）。
     pub compat_warning: bool,
     /// 下载社区资源时的文件名格式（0..=4，与 PCL 的 NameFormatV2 一致）。
@@ -111,7 +109,6 @@ impl Default for Settings {
             speed_limit: 0,
             mirror_race: true,
             home_rail_collapsed: false,
-            concurrent_tasks: 3,
             page_size: default_page_size(),
             split_ratio: default_split_ratio(),
             versions_split_ratio: default_versions_split_ratio(),
@@ -150,7 +147,6 @@ impl Settings {
         self.username = self.username.trim().chars().take(24).collect();
         self.memory_mb = self.memory_mb.clamp(512, MAX_MEMORY_MB);
         self.concurrent_downloads = self.concurrent_downloads.clamp(1, 256);
-        self.concurrent_tasks = self.concurrent_tasks.clamp(1, 8);
         self.speed_limit = self.speed_limit.clamp(0, 1_048_576);
         self.page_size = self.page_size.clamp(10, 50);
         self.split_ratio = self.split_ratio.clamp(25, 65);

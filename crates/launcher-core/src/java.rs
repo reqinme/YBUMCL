@@ -129,7 +129,11 @@ fn base_range(game: &str) -> JavaRange {
     range
 }
 
-/// 版本 json 声明的下限。26.3 这类新版本只有它说得准。
+/// 版本 json 声明的下限。
+///
+/// 只有 `majorVersion >= 22` 才当硬下限——PCL 同样只在这个区间信任 json
+/// （见 `pcl_ModLaunch.vb`：`JavaVersion.Major >= 22` 时才 `MinVersion` 跟随）。
+/// 1.13–1.21 的 json 常写着 8，照着抬会把「1.7.10/1.12.2 用 Java 7 也行」判死。
 fn declared_json(value: &Value, range: &mut JavaRange) {
     if let Some(major) = value
         .get("javaVersion")
@@ -137,14 +141,23 @@ fn declared_json(value: &Value, range: &mut JavaRange) {
         .and_then(Value::as_u64)
         .and_then(|major| u32::try_from(major).ok())
     {
-        range.at_least(major);
+        if major >= 22 {
+            range.at_least(major);
+        }
     }
 }
 
 fn forge_range(game: &str, forge: &str, range: &mut JavaRange) {
     let parts = numeric(game);
     let minor = parts.get(1).copied().unwrap_or(0);
-    if (6..=7).contains(&minor) {
+    // 1.7.10 的 Forge 既能跑 Java 7 也能跑 Java 8（安装器自己写的
+    // `javaVersion` 通常就是 8），只有 1.6.4 及更早才锁死 7。
+    if minor == 7 {
+        range.at_least(7);
+        range.at_most(8);
+        return;
+    }
+    if minor == 6 {
         range.exactly(7);
         return;
     }

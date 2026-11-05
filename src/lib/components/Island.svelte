@@ -1,7 +1,5 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import { page } from "$app/stores";
-  import { downloadsNav } from "$lib/downloads-nav.svelte";
   import { notice } from "$lib/tasks.svelte";
 </script>
 
@@ -9,10 +7,7 @@
   class="island"
   class:hidden={!notice.text}
   title="查看下载任务"
-  onclick={() => {
-    downloadsNav.tasksOpen = true;
-    if ($page.url.pathname !== "/downloads") void goto("/downloads");
-  }}
+  onclick={() => void goto("/tasks")}
   aria-hidden={!notice.text}
   tabindex={notice.text ? 0 : -1}
 >

@@ -4,6 +4,7 @@
   import { api } from "$lib/api";
   import Logo from "./Logo.svelte";
   import Island from "./Island.svelte";
+  import TaskRing from "./TaskRing.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
   import avatarOffline from "$lib/assets/avatar-offline.png";
   import { settingsLive } from "$lib/settings-live.svelte";
@@ -118,16 +119,22 @@
     </div>
   </a>
 
-  <div class="links" bind:this={linksEl}>
-    <span
-      class="pill"
-      class:ready={pillReady}
-      style="--x:{pillX}px; --y:{pillY}px; --w:{pillW}px; --h:{pillH}px; --ms:{slideMs}ms"
-      aria-hidden="true"
-    ></span>
-    {#each items as item (item.href)}
-      <a class="link" class:active={isActive(item.href)} href={item.href}>{item.label}</a>
-    {/each}
+  <div class="mid">
+    <div class="links" bind:this={linksEl}>
+      <span
+        class="pill"
+        class:ready={pillReady}
+        style="--x:{pillX}px; --y:{pillY}px; --w:{pillW}px; --h:{pillH}px; --ms:{slideMs}ms"
+        aria-hidden="true"
+      ></span>
+      {#each items as item (item.href)}
+        <a class="link" class:active={isActive(item.href)} href={item.href}>{item.label}</a>
+      {/each}
+    </div>
+
+    <div class="tasks">
+      <TaskRing />
+    </div>
   </div>
 
   <div class="right">
@@ -142,6 +149,7 @@
     </span>
   </a>
 </nav>
+
 
 <ErrorDialog />
 
@@ -191,7 +199,6 @@
     align-items: center;
     gap: 2px;
     flex: 0 1 auto;
-    margin-right: auto;
     padding: 4px;
     border-radius: 999px;
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.045));
@@ -285,5 +292,21 @@
   .who small {
     font-size: 11px;
     color: var(--text-dim);
+  }
+
+  /* 圆钮跟在导航药丸后面，面板从它下面弹出来，盖在页面上但不换页。 */
+  .mid {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 1 auto;
+    margin-right: auto;
+    min-width: 0;
+  }
+  .tasks {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: none;
   }
 </style>

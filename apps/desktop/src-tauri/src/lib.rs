@@ -2,6 +2,8 @@ mod categories;
 mod commands;
 mod favorites;
 mod game_folders;
+mod instance_cache;
+mod mod_projects;
 mod instances;
 mod portable;
 mod recycle;
@@ -58,6 +60,14 @@ pub fn run() {
         commands::image_data_url,
         commands::read_servers,
         commands::export_instance_zip,
+        commands::export_pack_layout,
+        commands::export_pack_begin,
+        commands::export_pack_identify,
+        commands::export_pack_finish,
+        commands::export_pack_pick_path,
+        commands::export_pack_load_config,
+        commands::export_pack_save_config,
+        commands::export_pack_cancel,
         commands::list_versions,
             commands::save_version_settings,
             commands::delete_version,
@@ -132,6 +142,10 @@ pub fn run() {
             commands::list_mods,
             commands::set_mod_enabled,
             commands::remove_mod,
+            commands::mod_icon,
+            commands::mod_project,
+            commands::check_mod_updates,
+            commands::apply_mod_update,
             commands::add_mods,
             commands::dir_usage,
             commands::open_folder,
@@ -203,6 +217,19 @@ pub fn run() {
                     Err(error) => eprintln!("rename legacy instances: {error}"),
                 }
             });
+
+            // 照 PCL 的 InstanceCache：启动时先把所有实例的概述算好写进缓存，
+            // 之后打开版本页 / 实例页直接读缓存，不用再等「正在读取版本」。
+            {
+                let paths_warm = paths.clone();
+                std::thread::spawn(move || {
+                    let game_dir = game_folders::current(&paths_warm);
+                    let data_dir = paths_warm.data_dir().to_owned();
+                    // 给合并线程一点时间，别和小写盘抢同一个目录。
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    commands::warm_instance_cache(&game_dir, &data_dir);
+                });
+            }
 
             // 窗口在代码里创建，唯一目的是把 WebView2 的用户数据目录
             // 强制指到 `YBUMCL/webview2`，否则它会写进 %LOCALAPPDATA%，

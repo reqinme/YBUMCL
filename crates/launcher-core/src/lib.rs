@@ -18,6 +18,7 @@ pub mod cleanroom;
 pub mod curseforge;
 pub mod dates;
 pub mod download;
+pub mod export;
 pub mod icons;
 mod inheritance;
 /// 把多个版本 JSON 合并成 PCL2 风格的自包含实例。
@@ -28,9 +29,10 @@ pub mod loader_catalog;
 pub mod merge;
 /// Installer/profile support for modern Forge and NeoForge metadata.
 pub mod modloader;
+pub mod mod_updates;
 pub mod modpack;
 pub mod modrinth;
-mod mods;
+pub mod mods;
 pub mod names;
 pub mod packages;
 /// 读 `servers.dat`（服务器列表标签页用）。
@@ -125,6 +127,10 @@ pub struct LaunchRequest {
     /// 实例设置里的「关闭文件校验」：启动前不逐个检查文件在不在。
     #[serde(default)]
     pub skip_file_check: bool,
+    /// 选中的 Java 比版本要求的旧时，允许自动改用探测到的合适 Java。
+    /// 默认关闭，只有启动器界面打开；测试与其他调用方保持「报错」的老行为。
+    #[serde(default)]
+    pub allow_java_upgrade: bool,
     /// 实例设置里的「使用调试级别 log4j 配置文件」。
     #[serde(default)]
     pub log4j_debug: bool,
@@ -335,6 +341,10 @@ fn loader_main(main: &str) -> bool {
     matches!(
         main,
         "net.minecraftforge.bootstrap.ForgeBootstrap"
+            // Forge 1.13–1.17 的入口（1.16.5-36.2.34 就是它）。
+            | "cpw.mods.modlauncher.Launcher"
+            | "net.neoforged.modlauncher.Launcher"
+            | "com.cleanroommc.modlauncher.Launcher"
             | "cpw.mods.bootstraplauncher.BootstrapLauncher"
             | "net.neoforged.bootstraplauncher.BootstrapLauncher"
             | "com.cleanroommc.bootstraplauncher.BootstrapLauncher"
@@ -631,9 +641,31 @@ pub fn detect_java() -> Vec<JavaInstallation> {
         }
     }
     let mut seen = BTreeSet::new();
-    found.retain(|java| seen.insert(java.path.clone()));
-    found.sort_by(|a, b| b.major.cmp(&a.major).then(a.path.cmp(&b.path)));
+    // `C:\Program Files\Common Files\Oracle\Java\javapath\java.exe` 是个转发器，
+    // 本身不带版本，探测出来的 major 取决于它指向谁；PCL 也会剔除这类 shim。
+    found.retain(|java| {
+        let lower = java.path.to_ascii_lowercase();
+        !lower.contains("\\javapath\\") && seen.insert(java.path.clone())
+    });
+    // PCL 的 JavaSorter 给 8/17/21 三种「主流 JDK」更高权重，这里照做：
+    // 同权重时大版本优先，再按路径稳定排序。
+    found.sort_by(|a, b| {
+        java_weight(b.major)
+            .cmp(&java_weight(a.major))
+            .then(b.major.cmp(&a.major))
+            .then(a.path.cmp(&b.path))
+    });
     found
+}
+
+/// PCL `JavaSorter` 的权重：8/17/21 是各年代的「标准 JDK」，优先于 11、25 这类。
+pub fn java_weight(major: u32) -> u32 {
+    match major {
+        17 => 31,
+        8 => 30,
+        21 => 29,
+        _ => major.min(28),
+    }
 }
 
 /// 现代版本的元数据把各架构的原生库拆成了独立坐标（`...:natives-windows-arm64`），
@@ -1152,8 +1184,42 @@ fn prepare(
     let version_dir = root.join("versions").join(&request.version_id);
     let resolved = inheritance::resolve_version(&root, &request.version_id)?;
     let v = resolved.metadata;
-    let java_major = validate_java(&java)?;
-    if let Some(required) = v["javaVersion"]["majorVersion"].as_u64() {
+    let mut java = java;
+    let mut java_major = validate_java(&java)?;
+    let required_java = v["javaVersion"]["majorVersion"].as_u64();
+    if let (Some(required), true) = (required_java, request.allow_java_upgrade) {
+        if (java_major as u64) < required {
+            // PCL 的做法是挑一个满足要求的 Java 直接用，而不是拦住不让玩。
+            // 这里在探测到的列表里挑满足下限的最小大版本（Java 21 可用就不
+            // 硬塞 Java 25），挑不到才报错。
+            let mut candidates: Vec<JavaInstallation> = detect_java()
+                .into_iter()
+                .filter(|item| item.major as u64 >= required)
+                .collect();
+            candidates.sort_by_key(|item| item.major);
+            let mut picked = None;
+            for item in candidates {
+                let Ok(path) = fs::canonicalize(&item.path) else {
+                    continue;
+                };
+                let Some(runtime) = java_version(&path) else {
+                    continue;
+                };
+                if (runtime.major as u64) >= required {
+                    picked = Some((path, runtime.major));
+                    break;
+                }
+            }
+            let Some((path, major)) = picked else {
+                return Err(CoreError::InvalidInput(format!(
+                    "This version requires Java {required} or newer; selected Java is {java_major}"
+                )));
+            };
+            java = path;
+            java_major = major;
+        }
+    }
+    if let Some(required) = required_java {
         if (java_major as u64) < required {
             return Err(CoreError::InvalidInput(format!(
                 "This version requires Java {required} or newer; selected Java is {java_major}"
@@ -1746,9 +1812,18 @@ fn prepare(
         });
         // 模块系统的开放/导出开关：加载器（LabyMod、Forge 系）都要靠它反射 JDK 内部类，
         // 只允许 `模块/包=ALL-UNNAMED` 这种形式。
-        let module_flag = ["--add-opens=", "--add-exports=", "--add-reads="]
+        // 目标模块不一定叫 ALL-UNNAMED：Forge 1.16.5 就写
+        // `--add-exports=jdk.naming.dns/com.sun.jndi.dns=java.naming`。
+        // 这类开关只放宽模块可见性、不加载代码，值里只要没有怪字符就照发。
+        let module_flag = ["--add-opens=", "--add-exports=", "--add-reads=", "--add-modules="]
             .iter()
-            .any(|prefix| arg.starts_with(prefix) && arg.ends_with("=ALL-UNNAMED"));
+            .find_map(|prefix| arg.strip_prefix(prefix))
+            .is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.$/*+=-".contains(&b))
+            });
         let allowed_xx = [
             "-XX:+UseG1GC",
             "-XX:+UnlockExperimentalVMOptions",
@@ -1843,13 +1918,26 @@ fn prepare(
             java_launch_path(&natives_dir)
         ));
     }
-    for flag in [
-        "-Dfile.encoding=UTF-8",
-        "-Dsun.stdout.encoding=UTF-8",
-        "-Dsun.stderr.encoding=UTF-8",
-        "-Dstdout.encoding=UTF-8",
-        "-Dstderr.encoding=UTF-8",
-    ] {
+    // PCL 的 log4shell 防御参数：不管版本 json 有没有写，都补上。
+    if !jvm
+        .iter()
+        .any(|a| a.starts_with("-Dlog4j2.formatMsgNoLookups="))
+    {
+        jvm.push("-Dlog4j2.formatMsgNoLookups=true".into());
+    }
+    // 有些版本的 json 会带 `-XX:MaxDirectMemorySize=256M`，现代加载器会因此崩，
+    // PCL 也是直接剔掉（#3511）。
+    jvm.retain(|arg| arg != "-XX:MaxDirectMemorySize=256M");
+    // 编码参数按 Java 版本给（PCL 同款）：Java 8 不加，9+ 才加 stdout/stderr，
+    // 18+ 用 COMPAT，免得老 mod 的中文反而乱码。
+    let mut encodings: Vec<&str> = vec![];
+    if java_major > 8 {
+        encodings.extend(["-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8"]);
+    }
+    if java_major >= 18 {
+        encodings.push("-Dfile.encoding=COMPAT");
+    }
+    for flag in encodings {
         if !jvm
             .iter()
             .any(|a| a.starts_with(flag.split('=').next().unwrap_or(flag)))

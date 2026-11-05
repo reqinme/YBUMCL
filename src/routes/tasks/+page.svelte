@@ -1,13 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
-  import { goto } from "$app/navigation";
-  import { downloadsNav } from "$lib/downloads-nav.svelte";
-
-  // 兼容直接访问 /tasks：把下载页的任务层打开，再回到下载页（不再单独渲染一份任务列表）。
-  onMount(() => {
-    downloadsNav.tasksOpen = true;
-    void goto("/downloads", { replaceState: true });
-  });
+  // 下载任务页：导航栏那颗圆钮点进来就是这里，占满内容区。
+  import TasksPanel from "$lib/components/TasksPanel.svelte";
+  import { goBackPage } from "$lib/page-history.svelte";
 </script>
 
-<div class="page"></div>
+<TasksPanel onback={() => void goBackPage()} />

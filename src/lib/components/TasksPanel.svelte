@@ -12,8 +12,8 @@
   import { forgetScan } from "$lib/detect";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
 
-  /// 由下载页传进来：点返回或按 Esc 时收回这一层。
-  let { onback }: { onback: () => void } = $props();
+  /// 页面里不传；只有作为浮层用时才给一个「返回」动作。
+  let { onback = null }: { onback?: (() => void) | null } = $props();
 
   const labels: Record<string, string> = {
     queued: "排队中",
@@ -46,12 +46,12 @@
   /// 正在跑的安装任务可以从这里停：暂停保留断点，取消清掉半成品。
   let stopping = $state<"pause" | "cancel" | null>(null);
 
-  async function stop(mode: "pause" | "cancel") {
+  async function stop(taskId: number, mode: "pause" | "cancel") {
     stopping = mode;
     // 页面那一侧负责把「暂停 / 取消」写进任务卡文案，它只认这个标记。
     markStop(mode);
     try {
-      await api.cancelInstall(mode);
+      await api.cancelInstall(taskId, mode);
     } finally {
       stopping = null;
     }
@@ -114,11 +114,13 @@
 <div class="tasks-panel">
   <header class="page-head">
     <div class="head-main">
-      <button class="back" onclick={onback} title="返回下载页（Esc）" aria-label="返回">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M15 5 8 12l7 7" />
-        </svg>
-      </button>
+      {#if onback}
+        <button class="back" onclick={onback} title="返回上一页（Esc）" aria-label="返回">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 5 8 12l7 7" />
+          </svg>
+        </button>
+      {/if}
       <div>
         <h1>下载任务</h1>
         <p class="dim small">下载在后台进行，完成后这里会留一条记录；失败的任务会写明原因。</p>
@@ -178,8 +180,8 @@
           {/if}
           {#if task.status === "running"}
             <div class="task-actions">
-              <button class="btn" onclick={() => stop("pause")} disabled={stopping !== null}>暂停</button>
-              <button class="btn" onclick={() => stop("cancel")} disabled={stopping !== null}>取消</button>
+              <button class="btn" onclick={() => stop(task.id, "pause")} disabled={stopping !== null}>暂停</button>
+              <button class="btn" onclick={() => stop(task.id, "cancel")} disabled={stopping !== null}>取消</button>
             </div>
           {/if}
           {#if task.status === "paused"}

@@ -5,6 +5,8 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
+  import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+  import { loaderLabels } from "$lib/loader-ranges";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { startVersion } from "$lib/launch";
@@ -12,6 +14,7 @@
   import { showError } from "$lib/dialogs.svelte";
   import { cachedJava } from "$lib/detect";
   import MinecraftInstall from "$lib/components/MinecraftInstall.svelte";
+  import PackExport from "$lib/components/PackExport.svelte";
   import type { InstanceLoader } from "$lib/api";
   import { blockIcons, resolveIconUrl } from "$lib/version-icon";
   import { absorbCategories, isStarred } from "$lib/starred.svelte";
@@ -26,6 +29,7 @@
     type EntryInfo,
     type JavaInstallation,
     type ModEntry,
+    type ModUpdate,
     type ServerEntry,
     type VersionSettings,
     type VersionView
@@ -51,11 +55,12 @@
   let mods = $state<ModEntry[]>([]);
   let gameDir = $state("");
   let tab = $state<Tab>("overview");
-  let loading = $state(true);
   let busy = $state("");
   let dragging = $state(false);
   /// 待确认的删除：版本本身或某个模组，确认框关掉前不动磁盘。
-  let pendingDelete = $state<{ kind: "version" } | { kind: "mod"; mod: ModEntry } | null>(null);
+  let pendingDelete = $state<
+    { kind: "version" } | { kind: "mod"; mod: ModEntry } | null
+  >(null);
   let pendingReset = $state(false);
 
   /// 实例实际根目录（隔离实例是 versions/<id>），各标签都从这里拼子目录。
@@ -68,6 +73,30 @@
   let textView = $state<{ title: string; body: string } | null>(null);
   let shots = $state<Record<string, string>>({});
   let exporting = $state(false);
+
+  /// 模组页：搜索词、筛选、勾选、图标缓存、更新结果。
+  let modQuery = $state("");
+  let modFilter = $state<"all" | "enabled" | "disabled" | "updatable">("all");
+  let selectedMods = $state(new Set<string>());
+
+  /// 批量栏的按钮跟着选中项的实际状态变灰（PCL 也是这个逻辑）。
+  const selectedModList = $derived(mods.filter((mod) => selectedMods.has(mod.fileName)));
+  const selectedAllEnabled = $derived(
+    selectedModList.length > 0 && selectedModList.every((mod) => mod.enabled)
+  );
+  const selectedAllDisabled = $derived(
+    selectedModList.length > 0 && selectedModList.every((mod) => !mod.enabled)
+  );
+  const selectedAnyUpdatable = $derived(
+    selectedModList.some((mod) => modUpdates[mod.fileName]?.canUpdate)
+  );
+  let modIcons = $state<Record<string, string | null>>({});
+  let modUpdates = $state<Record<string, ModUpdate>>({});
+  let checkingUpdates = $state(false);
+  let updateChecked = $state(false);
+  let modDetail = $state<ModEntry | null>(null);
+  /// 批量更新前的风险确认。
+  let updateConfirm = $state(false);
 
   /// 自定义图标的图片数据（`icon` 是 custom 时才有）。
   let iconUrl = $state<string | null>(null);
@@ -254,7 +283,6 @@
   }
 
   async function load() {
-    loading = true;
     try {
       const [dir, list] = await Promise.all([api.defaultGameDir(), api.listVersions()]);
       gameDir = dir;
@@ -305,13 +333,297 @@
     } catch (e) {
       showError("读取版本失败", "版本目录或者模组列表没读出来。", String(e));
     } finally {
-      loading = false;
     }
   }
 
   async function loadMods() {
     if (!version) return;
     mods = await api.listMods(gameDir, gameDirectory);
+    // 列表变了：把勾选里已经不存在的文件名去掉，再补图标（更新结果保留，用户可能正要更新）。
+    const alive = new Set(mods.map((mod) => mod.fileName));
+    selectedMods = new Set([...selectedMods].filter((name) => alive.has(name)));
+    void ensureModIcons();
+    if (updateChecked) void refreshUpdates(false);
+  }
+
+  /// 更新检查用的加载器 id：取实例的第一个加载器。
+  const modLoader = $derived(version?.loadersDetail?.[0]?.loader ?? "");
+  /// 这个实例能不能装模组：有 Forge/NeoForge/Fabric/Quilt/LiteLoader/Cleanroom 之一才算。
+  /// OptiFine 只是补丁，单独存在时原版照样读不了 mod。
+  const canUseMods = $derived(
+    (version?.loadersDetail ?? []).some(
+      (item) => item.loader !== "optifine",
+    ),
+  );
+  /** 头部信息行里的加载器标签：每个加载器一格，带版本号；原版实例显示「原版」。 */
+  const headerLoaders = $derived(
+    version ? loaderLabels(version.loadersDetail) : [],
+  );
+
+
+  /// 展示名：描述符里写了 displayName / name 就用它，否则把文件名的版本尾巴削掉。
+  /// PCL 跳下载页搜索时用的也是显示名，不会把 "-1.0.14-1.21.1-alpha" 一起塞进去。
+  function stripModVersion(stem: string): string {
+    let name = stem;
+    name = name.replace(/[-_ ](?:neoforge|forge|fabric|quilt|liteloader)[-_ ].*$/i, "");
+    name = name.replace(/[-_ ]v?\d[\w.+-]*$/i, "");
+    return name.trim() || stem;
+  }
+
+  function modDisplayName(mod: ModEntry): string {
+    const declared = mod.metadata?.name?.trim();
+    if (declared) return declared;
+    return stripModVersion(mod.modName || mod.fileName.replace(/\.jar(?:\.disabled)?$/i, ""));
+  }
+
+  /// 搜索 + 筛选后的列表：启用的排前面，再按名字排。
+  const shownMods = $derived.by(() => {
+    const needle = modQuery.trim().toLowerCase();
+    const hits = mods.filter((mod) => {
+      if (modFilter === "enabled" && !mod.enabled) return false;
+      if (modFilter === "disabled" && mod.enabled) return false;
+      if (modFilter === "updatable" && !modUpdates[mod.fileName]?.canUpdate) return false;
+      if (!needle) return true;
+      const meta = mod.metadata;
+      const haystack = [
+        modDisplayName(mod),
+        mod.modName,
+        mod.fileName,
+        meta?.name ?? "",
+        meta?.modId ?? "",
+        meta?.description ?? "",
+        ...(meta?.authors ?? [])
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(needle);
+    });
+    return hits.sort((a, b) => {
+      if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
+      return modDisplayName(a).localeCompare(modDisplayName(b), "zh-CN");
+    });
+  });
+
+  const enabledCount = $derived(mods.filter((mod) => mod.enabled).length);
+  const updatableCount = $derived(
+    Object.values(modUpdates).filter((item) => item.canUpdate).length
+  );
+  const allShownSelected = $derived(
+    shownMods.length > 0 && shownMods.every((mod) => selectedMods.has(mod.fileName))
+  );
+  /// 筛选按钮带计数，按条件隐藏（PCL 的做法）：全部永远在。
+  const modFilterOptions = $derived.by(() => {
+    const options: { id: "all" | "enabled" | "disabled" | "updatable"; label: string; count: number }[] = [
+      { id: "all", label: "全部", count: mods.length }
+    ];
+    if (enabledCount > 0) options.push({ id: "enabled", label: "已启用", count: enabledCount });
+    if (mods.length - enabledCount > 0)
+      options.push({ id: "disabled", label: "已禁用", count: mods.length - enabledCount });
+    if (updatableCount > 0) options.push({ id: "updatable", label: "可更新", count: updatableCount });
+    return options;
+  });
+
+  function downloadsModUrl(query = "") {
+    return query ? `/downloads?mod=${encodeURIComponent(query)}` : "/downloads?mod=";
+  }
+
+  /// 右键模组：照 PCL 的「信息」行为。
+  /// 认领取到项目 → 打开下载页并直接把项目详情摆出来（PCL 的 ResourceDetail）；
+  /// 认不出来 → 和 PCL 一样打开 mcmod.cn 的百科搜索，而不是在站内瞎搜。
+  async function openModDownload(mod: ModEntry) {
+    const name = modDisplayName(mod);
+    let project = "";
+    try {
+      const found = await api.modProject(gameDir, gameDirectory, mod.fileName);
+      if (found) project = `&project=${encodeURIComponent(`${found.source}:${found.projectId}`)}`;
+    } catch {
+      /* 认领失败走下面的百科搜索 */
+    }
+    if (!project) {
+      await openModWikiByName(name);
+      return;
+    }
+    const mc = version?.gameVersion?.trim();
+    const loader = modLoader;
+    const extra =
+      (mc ? `&mc=${encodeURIComponent(mc)}` : "") + (loader ? `&loader=${encodeURIComponent(loader)}` : "");
+    goto(`${downloadsModUrl(name)}${extra}${project}`);
+  }
+
+  /// 认不出项目时的去处：PCL 用 `https://www.mcmod.cn/s?key=<显示名>`。
+  async function openModWikiByName(name: string) {
+    try {
+      await api.openUrl(`https://www.mcmod.cn/s?key=${encodeURIComponent(name)}`);
+    } catch (e) {
+      showError("打开百科失败", "默认浏览器没起来。", String(e));
+    }
+  }
+
+  function toggleSelect(mod: ModEntry) {
+    const next = new Set(selectedMods);
+    if (next.has(mod.fileName)) next.delete(mod.fileName);
+    else next.add(mod.fileName);
+    selectedMods = next;
+  }
+
+  function toggleSelectAll() {
+    selectedMods = allShownSelected
+      ? new Set()
+      : new Set(shownMods.map((mod) => mod.fileName));
+  }
+
+  /// 逐个补图标：只问一次，拿不到的记成 null，滚动时不重复请求。
+  async function ensureModIcons() {
+    for (const mod of mods) {
+      if (mod.fileName in modIcons) continue;
+      // 描述符里没写 icon 的模组也可能有 icon.png / logo.png，
+      // 交给后端按常见文件名再找一层，别在元数据这一层就放弃。
+      try {
+        const icon = await api.modIcon(gameDir, gameDirectory, mod.fileName);
+        modIcons = { ...modIcons, [mod.fileName]: icon };
+      } catch {
+        modIcons = { ...modIcons, [mod.fileName]: null };
+      }
+    }
+  }
+
+  /// 查更新：几百个模组要算哈希再问两站，比较慢，只在用户点「检查更新」或切到可更新时跑。
+  async function refreshUpdates(notify: boolean) {
+    if (!version || checkingUpdates) return;
+    checkingUpdates = true;
+    updateChecked = true;
+    try {
+      const list = await api.checkModUpdates(
+        gameDir,
+        gameDirectory,
+        version.gameVersion ?? version.id,
+        modLoader
+      );
+      const map: Record<string, ModUpdate> = {};
+      for (const item of list) {
+        if (item.canUpdate) map[item.fileName] = item;
+      }
+      modUpdates = map;
+      if (notify) {
+        announce(
+          Object.keys(map).length > 0
+            ? `有 ${Object.keys(map).length} 个模组可以更新`
+            : "模组都是最新的"
+        );
+      }
+    } catch (e) {
+      if (notify) showError("检查更新失败", "两个来源都没查通，过会儿再试。", String(e));
+    } finally {
+      checkingUpdates = false;
+    }
+  }
+
+  /// 从磁盘选 .jar 装进 mods。
+  async function installModFiles() {
+    if (!version) return;
+    try {
+      const picked = await openFileDialog({
+        multiple: true,
+        filters: [{ name: "Mod", extensions: ["jar"] }]
+      });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      await importPaths(paths);
+    } catch (e) {
+      showError("选择文件失败", "系统文件对话框没打开。", String(e));
+    }
+  }
+
+  async function openModWiki() {
+    const name = modDetail ? modDisplayName(modDetail) : "";
+    if (!name) return;
+    await openModWikiByName(name);
+  }
+
+  async function revealMod(mod: ModEntry) {
+    try {
+      await api.revealPath(`${root}${SEP}mods${SEP}${mod.fileName}`);
+    } catch (e) {
+      showError("打开位置失败", "这个文件可能已经被移走了。", String(e));
+    }
+  }
+
+  /// 批量改启用状态：只处理状态需要变化的文件。
+  async function batchSetEnabled(enabled: boolean) {
+    if (!version || selectedMods.size === 0) return;
+    busy = "mods";
+    try {
+      for (const name of selectedMods) {
+        const mod = mods.find((item) => item.fileName === name);
+        if (!mod || mod.enabled === enabled) continue;
+        await api.setModEnabled(gameDir, gameDirectory, name, enabled);
+      }
+      await loadMods();
+      announce(enabled ? "已启用选中的模组" : "已禁用选中的模组");
+    } catch (e) {
+      showError("改模组状态失败", "文件改不了名，可能被占用。", String(e));
+    } finally {
+      busy = "";
+    }
+  }
+
+  async function batchDelete() {
+    if (!version || selectedMods.size === 0) return;
+    busy = "mods";
+    try {
+      for (const name of selectedMods) {
+        await api.removeMod(gameDir, gameDirectory, name, false);
+      }
+      selectedMods = new Set();
+      await loadMods();
+      announce("模组已删除");
+    } catch (e) {
+      showError("删除模组失败", "文件删不掉，可能被游戏占用。", String(e));
+    } finally {
+      busy = "";
+    }
+  }
+
+  /// 选中的模组里有能更新的才弹确认框。
+  function askUpdate() {
+    const targets = [...selectedMods].filter((name) => modUpdates[name]);
+    if (targets.length === 0) {
+      announce("选中的模组没有新版本");
+      return;
+    }
+    updateConfirm = true;
+  }
+
+  /// 更新选中的模组：先警告再替换，一次一个，失败就停。
+  async function batchUpdate() {
+    if (!version || selectedMods.size === 0) return;
+    const targets = [...selectedMods]
+      .map((name) => modUpdates[name])
+      .filter((item): item is ModUpdate => Boolean(item));
+    if (targets.length === 0) {
+      announce("选中的模组没有新版本");
+      return;
+    }
+    busy = "mods";
+    let done = 0;
+    try {
+      for (const update of targets) {
+        await api.applyModUpdate(gameDir, gameDirectory, update);
+        done += 1;
+      }
+      selectedMods = new Set();
+      await loadMods();
+      announce(`已更新 ${done} 个模组`);
+    } catch (e) {
+      showError(
+        "更新模组失败",
+        done > 0 ? `已更新 ${done} 个，剩下的没换成功。` : "新版本没下载下来，旧文件还在。",
+        String(e)
+      );
+      await loadMods();
+    } finally {
+      busy = "";
+    }
   }
 
   /// 空着时框里显示这个（跟游戏里真用的一样），实际存的是空字符串。
@@ -760,11 +1072,11 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     { id: "settings", label: "设置" },
     { id: "modify", label: "修改" },
     { id: "export", label: "导出" },
-    { id: "saves", label: "存档" },
-    { id: "screenshots", label: "截图" },
     { id: "mods", label: "模组" },
     { id: "resourcepacks", label: "资源包" },
     { id: "shaders", label: "光影包" },
+    { id: "saves", label: "存档" },
+    { id: "screenshots", label: "截图" },
     { id: "schematics", label: "投影" },
     { id: "servers", label: "服务器" },
     { id: "logs", label: "日志" },
@@ -891,15 +1203,15 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     }
   }
 
-  async function remove(mod: ModEntry) {
-    const target = pendingDelete;
+  /// 删除单个模组：默认进回收站，按住 Shift 确认才是永久删除。
+  async function removeMod(mod: ModEntry, permanent: boolean) {
     pendingDelete = null;
-    if (!target || target.kind !== "mod" || !version) return;
-    busy = target.mod.fileName;
+    if (!version) return;
+    busy = mod.fileName;
     try {
-      await api.removeMod(gameDir, gameDirectory, target.mod.fileName);
+      await api.removeMod(gameDir, gameDirectory, mod.fileName, permanent);
       await loadMods();
-      announce("模组已删除");
+      announce(permanent ? "模组已永久删除" : "模组已删除，可在回收站找回");
     } catch (e) {
       showError("删除模组失败", "文件删不掉，可能被游戏占用。", String(e));
     } finally {
@@ -940,6 +1252,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   });
 </script>
 
+<div class="route">
 <header class="head">
   <button class="btn ghost" onclick={() => goto("/versions")}>← 返回</button>
   <h1>{version?.id ?? id}<span class="kind">{version?.kind ?? ""}</span></h1>
@@ -949,13 +1262,11 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   </button>
 </header>
 
-{#if loading}<p class="dim">正在读取版本…</p>{/if}
-
 {#if version}
   <nav class="tabs">
     {#each TABS as item (item.id)}
       <button class="tab" class:active={tab === item.id} onclick={() => void switchTab(item.id)}>
-        {item.label}{#if item.id === "mods" && mods.length > 0} {mods.length}{/if}
+        {item.label}
       </button>
     {/each}
   </nav>
@@ -1028,6 +1339,11 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           <img src={grassIcon} alt="" />
           <div><span>Minecraft</span><strong>{version.gameVersion || "未知"}</strong></div>
         </div>
+        {#each headerLoaders as label}
+          <div class="stat">
+            <span class="loader-tag">{label}</span>
+          </div>
+        {/each}
       </div>
     </section>
 
@@ -1086,19 +1402,145 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       </div>
     </section>
   {:else if tab === "mods"}
-    <section class="panel">
-      <p class="dim">把 .jar 拖进窗口即可安装。{version.isolated ? `模组目录：versions\\${version.id}\\mods` : "模组目录：.minecraft\\mods"}</p>
-      {#each mods as mod (mod.fileName)}
-        <div class="mod" class:disabled={!mod.enabled}>
-          <input type="checkbox" checked={mod.enabled} disabled={busy !== ""} onchange={() => toggle(mod)} />
-          <div class="mod-main">
-            <strong>{mod.modName}</strong>
-            <small>{mod.metadata?.version ?? "—"} · {mod.metadata?.loader ?? "未知加载器"} · {(mod.sizeBytes / 1024).toFixed(0)} KB</small>
+    <section class="mods-pane">
+      {#if !canUseMods}
+        <div class="no-loader">
+          <h3>该版本不可使用 Mod</h3>
+          <p>你需要先安装 Forge、Fabric 等 Mod 加载器才能使用 Mod，请在下载页面安装这些版本。</p>
+          <p>
+            如果你已经安装过了 Mod 加载器，那么你很可能会选择了错误的版本，请点击版本选择按钮切换版本。
+          </p>
+          <div class="no-loader-actions">
+            <button class="btn" onclick={() => goto("/downloads")}>转到下载页面</button>
+            <button class="btn ghost" onclick={() => goto("/versions")}>版本选择</button>
           </div>
-          <button class="btn ghost" disabled={busy !== ""} onclick={() => (pendingDelete = { kind: "mod", mod })}>删除</button>
         </div>
-      {/each}
-      {#if mods.length === 0}<p class="dim">mods 目录还是空的。模组要和版本、加载器匹配。</p>{/if}
+      {:else if mods.length === 0}
+        <div class="empty-card">
+          <h3>还没有模组</h3>
+          <p class="dim">把 .jar 拖进这个窗口就能装。模组要和版本、加载器匹配，否则游戏起不来。</p>
+          <div class="empty-actions">
+            <button class="btn" onclick={() => goto(downloadsModUrl())}>下载 Mod</button>
+            <button class="btn" onclick={() => void installModFiles()}>从文件安装</button>
+            <button class="btn ghost" onclick={() => openFolder("mods")}>打开文件夹</button>
+          </div>
+        </div>
+      {:else}
+        <div class="mods-head">
+          <input class="mods-search" placeholder="搜索名称、描述或标签" bind:value={modQuery} />
+          <div class="mods-tools">
+            <button class="btn" onclick={() => openFolder("mods")}>打开文件夹</button>
+            <button class="btn" disabled={busy !== ""} onclick={() => void installModFiles()}>从文件安装</button>
+            <button class="btn" onclick={() => goto(downloadsModUrl())}>下载 Mod</button>
+            <button class="btn" onclick={toggleSelectAll}>{allShownSelected ? "取消全选" : "全选"}</button>
+          </div>
+        </div>
+        <div class="mods-filters">
+          {#each modFilterOptions as option (option.id)}
+            <button
+              class="chip"
+              class:active={modFilter === option.id}
+              onclick={() => (modFilter = option.id)}
+            >{option.label}（{option.count}）</button>
+          {/each}
+          <span class="grow"></span>
+          <button
+            class="btn ghost"
+            disabled={checkingUpdates}
+            onclick={() => void refreshUpdates(true)}
+          >{checkingUpdates ? "正在检查更新…" : "检查更新"}</button>
+        </div>
+        <p class="dim">
+          共 {mods.length} 个模组{#if modQuery.trim()}，匹配 {shownMods.length} 个{/if}{#if updatableCount > 0}，其中 {updatableCount} 个可更新{/if}
+        </p>
+        <div class="mod-list">
+          {#each shownMods as mod (mod.fileName)}
+            <div
+              class="mod-row"
+              class:disabled={!mod.enabled}
+              class:picked={selectedMods.has(mod.fileName)}
+              role="presentation"
+              title="右键打开这个模组的下载页"
+              onclick={() => toggleSelect(mod)}
+              oncontextmenu={(event) => {
+                event.preventDefault();
+                void openModDownload(mod);
+              }}
+              onkeydown={() => {}}
+            >
+              <input
+                type="checkbox"
+                checked={selectedMods.has(mod.fileName)}
+                onclick={(event) => event.stopPropagation()}
+                onchange={() => toggleSelect(mod)}
+              />
+              <span class="mod-icon">
+                {#if modIcons[mod.fileName]}
+                  <img src={modIcons[mod.fileName]} alt="" />
+                {:else}
+                  <span class="mod-icon-fallback" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                      <path d="M12 3 20 7.3v9.4L12 21 4 16.7V7.3Z" />
+                      <path d="M12 12.2 20 7.3M12 12.2 4 7.3M12 12.2V21" />
+                    </svg>
+                  </span>
+                {/if}
+              </span>
+              <div class="mod-name">
+                <strong title={mod.fileName}>{modDisplayName(mod)}</strong>
+                <small>
+                  {mod.metadata?.version ?? "—"} · {mod.metadata?.loader ?? "未知加载器"}
+                </small>
+              </div>
+              {#if modUpdates[mod.fileName]?.canUpdate}
+                <span class="tag-update" title="有新版本">可更新</span>
+              {/if}
+              <span class="mod-meta">{(mod.sizeBytes / 1024).toFixed(0)} KB</span>
+              <div class="mod-actions">
+                <button class="mini" onclick={(event) => { event.stopPropagation(); modDetail = mod; }}>详情</button>
+                <button class="mini" onclick={(event) => { event.stopPropagation(); void revealMod(mod); }}>打开位置</button>
+                <button
+                  class="mini"
+                  disabled={busy !== ""}
+                  onclick={(event) => { event.stopPropagation(); void toggle(mod); }}
+                >{mod.enabled ? "禁用" : "启用"}</button>
+                <button
+                  class="mini danger"
+                  disabled={busy !== ""}
+                  onclick={(event) => { event.stopPropagation(); pendingDelete = { kind: "mod", mod }; }}
+                >删除</button>
+              </div>
+            </div>
+          {/each}
+          {#if shownMods.length === 0}
+            <p class="dim">没有匹配的模组。</p>
+          {/if}
+        </div>
+        {#if selectedMods.size > 0}
+          <div class="mod-bar">
+            <span class="dim">已选 {selectedMods.size} 个文件</span>
+            <div class="mod-bar-actions">
+              <button
+                class="btn"
+                disabled={busy !== "" || checkingUpdates || !selectedAnyUpdatable}
+                onclick={askUpdate}>更新</button
+              >
+              <button
+                class="btn"
+                disabled={busy !== "" || selectedAllEnabled}
+                onclick={() => void batchSetEnabled(true)}>启用</button
+              >
+              <button
+                class="btn"
+                disabled={busy !== "" || selectedAllDisabled}
+                onclick={() => void batchSetEnabled(false)}>禁用</button
+              >
+              <button class="btn danger" disabled={busy !== ""} onclick={() => void batchDelete()}>删除</button>
+              <button class="btn ghost" onclick={() => (selectedMods = new Set())}>取消选择</button>
+            </div>
+          </div>
+        {/if}
+      {/if}
     </section>
   {:else if tab === "settings"}
     <div class="cards">
@@ -1440,23 +1882,19 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       <div class="float-tip" use:float style={`left:${tip.x}px; top:${tip.y}px`}>{tip.text}</div>
     {/if}
   {:else if tab === "modify"}
-    <section class="panel fill">
+    <section class="fill">
       <MinecraftInstall
         gameDir={gameDir}
         lockedName={version.id}
         currentGame={version.gameVersion}
         currentLoaders={version.loaders}
+        currentLoaderParts={version.loadersDetail}
         oninstalled={() => void load()}
       />
     </section>
   {:else if tab === "export"}
-    <section class="panel">
-      <p class="dim">把这个实例打成 zip：manifest.json + 目录里的全部文件，换台机器也能照着重装。</p>
-      <div class="row">
-        <button class="btn primary" disabled={exporting} onclick={() => void exportZip()}>
-          {exporting ? "导出中…" : "导出为 zip"}
-        </button>
-      </div>
+    <section class="fill">
+      <PackExport id={version.id} />
     </section>
   {:else if tab === "servers"}
     <section class="panel">
@@ -1557,10 +1995,56 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     ? ""
     : pendingDelete.kind === "version"
       ? `删除实例「${id}」？\n\nversions\\${id} 整个目录会被丢进回收站，里面的存档、模组、配置都在其中；按住 Shift 再点是永久删除。`
-      : `删除模组「${pendingDelete.mod.modName}」？文件会直接删掉。`}
+      : `删除模组「${pendingDelete.mod.modName}」？
+
+不按 Shift 会进回收站，还能捞回来；按住 Shift 点击是永久删除。`}
   oncancel={() => (pendingDelete = null)}
-  onconfirm={() => void (pendingDelete?.kind === "mod" ? remove(pendingDelete.mod) : removeVersion())}
+  onconfirm={(event) =>
+    void (pendingDelete?.kind === "mod"
+      ? removeMod(pendingDelete.mod, event.shiftKey)
+      : removeVersion())}
 />
+
+<ConfirmDialog
+  open={updateConfirm}
+  message="更新会先下载新版本，再替换掉旧文件。新版本可能不再兼容现在的存档或其他模组；装坏了可以从回收站找回旧文件。要继续吗？"
+  confirmLabel="继续更新"
+  oncancel={() => (updateConfirm = false)}
+  onconfirm={() => {
+    updateConfirm = false;
+    void batchUpdate();
+  }}
+/>
+
+<Modal open={modDetail !== null} title="模组详情" onclose={() => (modDetail = null)}>
+  {#if modDetail}
+    <p><strong>{modDetail.modName}</strong></p>
+    <p class="hint mono">{modDetail.fileName}</p>
+    {#if modDetail.metadata?.description}
+      <p class="hint">{modDetail.metadata.description}</p>
+    {/if}
+    <p class="hint">
+      版本 {modDetail.metadata?.version ?? "—"} · 加载器 {modDetail.metadata?.loader ?? "未知"} · 大小 {(modDetail.sizeBytes / 1024).toFixed(0)} KB{#if modDetail.metadata?.authors?.length} · 作者 {modDetail.metadata.authors.join("、")}{/if}
+    </p>
+    {#if modUpdates[modDetail.fileName]}
+      <p class="hint">
+        来源 {modUpdates[modDetail.fileName].source === "modrinth" ? "Modrinth" : "CurseForge"} · 最新 {modUpdates[modDetail.fileName].latestVersion}
+      </p>
+    {/if}
+  {/if}
+  {#snippet footer()}
+    <button class="btn" onclick={() => void openModWiki()}>百科搜索</button>
+    <button
+      class="btn ghost"
+      onclick={() => {
+        const target = modDetail;
+        modDetail = null;
+        if (target) void openModDownload(target);
+      }}>下载页搜索</button
+    >
+    <button class="btn ghost" onclick={() => (modDetail = null)}>关闭</button>
+  {/snippet}
+</Modal>
 
 <Modal open={renameOpen} title="修改实例名" onclose={() => (renameOpen = false)}>
   <input
@@ -1638,6 +2122,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     </button>
   {/snippet}
 </Modal>
+</div>
 
 <style>
   .servers {
@@ -1726,22 +2211,28 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     color: var(--text-dim);
   }
 
-  /* 「修改」页内容比窗口短，面板要撑到底，不然下面露出一截背景。 */
-  .panel.fill {
+  /* 整页是一条纵向流：头部与标签栏按内容占高，剩下的全给下面的内容区。 */
+  .route {
     display: flex;
     flex-direction: column;
-    min-height: calc(100vh - 150px);
+    min-height: 100%;
+    max-height: 100%;
   }
-  .panel.fill :global(.install) {
+  /* 「修改」页照下载页的版式：双栏吃掉剩下的全部空间，底下不再露背景。 */
+  .fill {
+    display: flex;
+    flex-direction: column;
     flex: 1;
     min-height: 0;
   }
-  .panel.fill :global(.install .col) {
+  .fill :global(.install) {
+    flex: 1;
     min-height: 0;
   }
-  .panel.fill :global(.install .list) {
+  /* 导出页两栏各自滚动，别让整页跟着跑。 */
+  .fill :global(.wrap) {
     flex: 1;
-    max-height: none;
+    min-height: 0;
   }
 
   .head {
@@ -1749,6 +2240,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     align-items: center;
     gap: 14px;
     padding: 4px 2px 14px;
+    flex: none;
   }
   .head h1 {
     margin: 0;
@@ -1772,6 +2264,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     display: flex;
     gap: 8px;
     padding: 0 2px 12px;
+    flex: none;
   }
   .tab {
     border: 1px solid transparent;
@@ -1925,6 +2418,18 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     display: flex;
     gap: 8px;
     align-items: center;
+  }
+  .loader-tag {
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: rgb(255 255 255 / 0.04);
+    color: var(--text);
+    font-size: 12px;
+    white-space: nowrap;
   }
   .stat img {
     width: 26px;
@@ -2103,28 +2608,234 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     font-size: 12px;
     color: var(--text-dim);
   }
-  .mod {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 12px;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    margin-top: 8px;
-  }
-  .mod.disabled {
-    opacity: 0.55;
-  }
-  .mod-main {
+  /* 模组页：搜索 + 筛选 + 44px 列表 + 底部批量栏 */
+  .mods-pane {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 10px;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .mods-head {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+    flex: none;
+  }
+  .mods-search {
+    flex: 1 1 220px;
+    min-width: 160px;
+    padding: 8px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface-2, rgb(0 0 0 / 0.25));
+    color: var(--text);
+    font: inherit;
+  }
+  .mods-tools {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .mods-filters {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    flex: none;
+  }
+  .mods-filters .grow {
+    flex: 1;
+  }
+  .chip {
+    padding: 5px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .chip.active {
+    background: rgb(127 176 105 / 0.22);
+    border-color: rgb(127 176 105 / 0.55);
+    color: var(--text);
+  }
+  .mod-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .mod-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 44px;
+    padding: 5px 10px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background: rgb(255 255 255 / 0.03);
+    cursor: pointer;
+  }
+  .mod-row:hover {
+    background: rgb(255 255 255 / 0.07);
+  }
+  .mod-row.picked {
+    border-color: rgb(127 176 105 / 0.5);
+  }
+  .mod-row.disabled strong,
+  .mod-row.disabled .mod-meta {
+    opacity: 0.55;
+  }
+  .mod-row.disabled strong {
+    text-decoration: line-through;
+  }
+  .mod-icon {
+    width: 34px;
+    height: 34px;
+    flex: none;
+    border-radius: 8px;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+    background: rgb(255 255 255 / 0.06);
+  }
+  .mod-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .mod-icon-fallback {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    background: rgb(255 255 255 / 0.1);
+    color: rgb(255 255 255 / 0.55);
+    display: grid;
+    place-items: center;
+  }
+  .mod-icon-fallback :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+  .mod-name {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
     flex: 1;
     min-width: 0;
   }
-  .mod-main small {
+  .mod-name strong {
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mod-name small,
+  .mod-meta {
     color: var(--text-dim);
     font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mod-actions {
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .mod-row:hover .mod-actions {
+    opacity: 1;
+  }
+  .mini {
+    font: inherit;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: rgb(255 255 255 / 0.06);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .mini.danger {
+    color: var(--danger, #e2725b);
+  }
+  .tag-update {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgb(127 176 105 / 0.3);
+    flex: none;
+  }
+  .mod-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--panel-solid, rgb(20 22 26 / 0.95));
+    flex: none;
+  }
+  .mod-bar-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  /* 原版实例的模组页：照 PCL 的提示，说明要先装加载器。 */
+  .no-loader {
+    margin: 8px 0;
+    padding: 26px;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .no-loader h3 {
+    margin: 0 0 4px;
+    font-size: 18px;
+    color: var(--yb-green);
+  }
+  .no-loader p {
+    margin: 0;
+    line-height: 1.6;
+    color: var(--text);
+  }
+  .no-loader-actions {
+    margin-top: 6px;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .empty-card {
+    padding: 26px;
+    border-radius: 14px;
+    border: 1px dashed var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    align-items: flex-start;
+  }
+  .empty-card h3 {
+    margin: 0;
+    font-size: 15px;
+  }
+  .empty-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
   }
   .drop {
     position: fixed;

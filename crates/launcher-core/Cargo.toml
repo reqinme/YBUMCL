@@ -16,5 +16,11 @@ regex = "1"
 # 下载 CDN 上的压缩响应也省带宽。PCL 的 HttpClient 同样开了 AutomaticDecompression。
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls", "gzip", "brotli", "deflate"] }
 sha1 = "0.10"
+sha2 = "0.10"
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+# 删除模组时丢进回收站；非 Windows 直接删文件。
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_Foundation"] }

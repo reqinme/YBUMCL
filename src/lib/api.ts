@@ -275,6 +275,8 @@ export type ServerEntry = {
 export type InstanceLoader = {
   loader:
     | "fabric"
+    | "legacyfabric"
+    | "labymod"
     | "quilt"
     | "forge"
     | "neoforge"
@@ -341,7 +343,6 @@ export type Settings = {
   speedLimit: number;
   homeRailCollapsed: boolean;
   /// 同时进行的下载任务数（1–8）。
-  concurrentTasks: number;
   pageSize: number;
   splitRatio: number;
   /** 版本页左栏宽度百分比（12–30），全局一份。 */
@@ -365,6 +366,10 @@ export type ModMetadata = {
   authors: string[];
   description: string | null;
   loader: string | null;
+  /// 描述符里声明了图标，或 jar 里带了图标文件。
+  icon: boolean;
+  /// 描述符条目名，例如 `fabric.mod.json`。
+  descriptor: string | null;
 };
 
 export type ModEntry = {
@@ -383,6 +388,18 @@ export type ModImportOutcome = {
   fileName: string | null;
   status: string;
   message: string | null;
+};
+
+/// 一条模组的更新情况；只有能识别出来源（Modrinth / CurseForge）的才有。
+export type ModUpdate = {
+  fileName: string;
+  source: "modrinth" | "curseforge";
+  projectId: string;
+  currentVersion: string;
+  latestVersion: string;
+  latestFileName: string;
+  latestUrl: string;
+  canUpdate: boolean;
 };
 
 export const api = {
@@ -501,12 +518,12 @@ export const api = {
       gameVersion,
       versions,
     }),
-  installGameVersion: (request: InstallRequest) =>
-    invoke<InstallSummary>("install_game_version", { request }),
-  installGameModloader: (request: ModLoaderInstallRequest) =>
-    invoke<InstallSummary>("install_game_modloader", { request }),
-  installGameInstance: (request: InstanceRequest) =>
-    invoke<InstallSummary>("install_game_instance", { request }),
+  installGameVersion: (request: InstallRequest, installId?: number) =>
+    invoke<InstallSummary>("install_game_version", { request, installId }),
+  installGameModloader: (request: ModLoaderInstallRequest, installId?: number) =>
+    invoke<InstallSummary>("install_game_modloader", { request, installId }),
+  installGameInstance: (request: InstanceRequest, installId?: number) =>
+    invoke<InstallSummary>("install_game_instance", { request, installId }),
   /** 实例实际用的根目录（隔离实例是 `versions/<id>`）。 */
   instanceRoot: (id: string) => invoke<string>("instance_root", { id }),
   listEntries: (path: string) => invoke<EntryInfo[]>("list_entries", { path }),
@@ -518,11 +535,48 @@ export const api = {
   /** 把实例打成 zip；返回 null 表示用户在另存为里取消。 */
   exportInstanceZip: (id: string, taskId?: number) =>
     invoke<string | null>("export_instance_zip", { id, taskId }),
+  /// 整合包导出的选项表（可见性/子项都按实例目录探过）。
+  exportPackLayout: (id: string) =>
+    invoke<ExportOptionView[]>("export_pack_layout", { id }),
+  /// 第一阶段：按规则挑文件、算哈希，返回任务 token。
+  exportPackBegin: (id: string, rules: string[], taskId?: number) =>
+    invoke<number>("export_pack_begin", { id, rules, taskId }),
+  /// 第二阶段：联网识别，返回 `[认出来的, 待识别的]`。
+  exportPackIdentify: (token: number, modrinthOnly: boolean) =>
+    invoke<[number, number]>("export_pack_identify", { token, modrinthOnly }),
+  /// 第三阶段：写索引并打包；`target` 为空时落到游戏的 downloads。
+  exportPackFinish: (args: {
+    id: string;
+    token: number;
+    name: string;
+    version: string;
+    includeLauncher: boolean;
+    taskId?: number;
+    target?: string | null;
+  }) => invoke<string | null>("export_pack_finish", args),
+  exportPackPickPath: (fileName: string, includeLauncher: boolean) =>
+    invoke<string | null>("export_pack_pick_path", { fileName, includeLauncher }),
+  /// 读一份 PCL 格式的导出配置；取消返回 null。
+  exportPackLoadConfig: () => invoke<ExportConfigView | null>("export_pack_load_config"),
+  /// 把当前勾选写成 PCL 格式的导出配置；取消返回 null。
+  exportPackSaveConfig: (args: {
+    name: string;
+    version: string;
+    includeLauncher: boolean;
+    packResources: boolean;
+    modrinthOnly: boolean;
+    packPath: string | null;
+    rules: string[];
+    extraFiles: string[];
+  }) => invoke<string | null>("export_pack_save_config", args),
+  exportPackCancel: (token: number) =>
+    invoke<void>("export_pack_cancel", { token }),
   instanceNameTaken: (gameDir: string, name: string) =>
     invoke<boolean>("instance_name_taken", { gameDir, name }),
   /// `mode = "pause"` 只停不清（半截 `.part` 留着续传）；其它值等于取消并清理。
-  cancelInstall: (mode: "pause" | "cancel" = "cancel") =>
-    invoke<boolean>("cancel_install", { mode }),
+  /// 停某一个安装任务（按前端任务卡的 id 找），`mode = "pause"` 只停不清。
+  cancelInstall: (installId: number | null | undefined, mode: "pause" | "cancel" = "cancel") =>
+    invoke<boolean>("cancel_install", { installId: installId ?? null, mode }),
   /// 安装包：把单个加载器（或原版客户端）的文件下载到指定目录。
   downloadPackage: (
     kind: string,
@@ -752,7 +806,34 @@ export const api = {
     gameDir: string,
     gameDirectory: string | null,
     fileName: string,
-  ) => invoke<void>("remove_mod", { gameDir, gameDirectory, fileName }),
+    permanent = false,
+  ) => invoke<void>("remove_mod", { gameDir, gameDirectory, fileName, permanent }),
+  modIcon: (gameDir: string, gameDirectory: string | null, fileName: string) =>
+    invoke<string | null>("mod_icon", { gameDir, gameDirectory, fileName }),
+  /// 认领这个 jar 在 Modrinth / CurseForge 上的项目；认不到就是 null。
+  modProject: (gameDir: string, gameDirectory: string | null, fileName: string) =>
+    invoke<{ source: string; projectId: string } | null>("mod_project", {
+      gameDir,
+      gameDirectory,
+      fileName
+    }),
+  checkModUpdates: (
+    gameDir: string,
+    gameDirectory: string | null,
+    gameVersion: string,
+    loader: string,
+  ) =>
+    invoke<ModUpdate[]>("check_mod_updates", {
+      gameDir,
+      gameDirectory,
+      gameVersion,
+      loader,
+    }),
+  applyModUpdate: (
+    gameDir: string,
+    gameDirectory: string | null,
+    update: ModUpdate,
+  ) => invoke<string>("apply_mod_update", { gameDir, gameDirectory, update }),
   addMods: (
     gameDir: string,
     gameDirectory: string | null,
@@ -787,7 +868,7 @@ export const api = {
     threads?: number;
     /** 资源站上这个整合包的图标地址；装完由后端存成实例图标。 */
     iconUrl?: string | null;
-  }) =>
+  }, installId?: number) =>
     invoke<{
       versionId: string;
       path: string;
@@ -805,7 +886,7 @@ export const api = {
         downloads: number;
         tags: string[];
       } | null;
-    }>("install_modpack", { request }),
+    }>("install_modpack", { request, installId }),
   /// FTB 整合包：后端把版本清单写成临时 mrpack，再走同一个安装流程。
   installFtb: (request: {
     gameDir: string;
@@ -816,7 +897,7 @@ export const api = {
     strategy: DownloadStrategy;
     /** FTB 项目在资源站上的图标地址；装完由后端存成实例图标。 */
     iconUrl?: string | null;
-  }) =>
+  }, installId?: number) =>
     invoke<{
       versionId: string;
       path: string;
@@ -824,7 +905,7 @@ export const api = {
       files: number;
       failed: number;
       missing: string[];
-    }>("install_ftb_modpack", { ...request }),
+    }>("install_ftb_modpack", { ...request, installId }),
 
   cleanupTargets: () => invoke<CleanTarget[]>("cleanup_targets"),
   cleanupRun: (key: string) => invoke<number>("cleanup_run", { key }),
@@ -937,3 +1018,34 @@ export interface MrVersion {
   fileUrl: string;
   fileSize: number;
 }
+
+/// 导出页的一个选项（分组标题或可勾选项）。
+export type ExportConfigView = {
+  configPath: string;
+  name: string;
+  version: string;
+  includeLauncher: boolean;
+  packResources: boolean;
+  modrinthOnly: boolean;
+  packPath: string | null;
+  rules: string[];
+  extraFiles: string[];
+};
+
+export type ExportEntryView = {
+  label: string;
+  hint: string;
+  rule: string;
+};
+
+export type ExportOptionView = {
+  id: string;
+  parent: string | null;
+  title: string;
+  description: string;
+  visible: boolean;
+  checked: boolean;
+  dynamic: boolean;
+  entries: ExportEntryView[];
+  rules: string[];
+};

@@ -597,3 +597,70 @@ mod tests {
         assert_eq!(sort_field("relevance"), 2);
     }
 }
+
+/// 批量按文件指纹反查下载地址（导出整合包用）。
+/// 返回 `(fingerprint, downloadUrl)`。
+pub fn fingerprints(hashes: &[u32]) -> Result<Vec<(u32, String)>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for chunk in hashes.chunks(1000) {
+        let body = serde_json::json!({ "fingerprints": chunk });
+        let value = post("/fingerprints/432", &body)?;
+        let matches = value["data"]["exactMatches"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for item in matches {
+            let Some(file) = item.get("file") else {
+                continue;
+            };
+            let Some(url) = file["downloadUrl"].as_str() else {
+                continue;
+            };
+            if url.is_empty() {
+                continue;
+            }
+            if let Some(fingerprint) = file["fileFingerprint"]
+                .as_u64()
+                .map(|value| value as u32)
+            {
+                out.push((fingerprint, url.to_owned()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 按文件指纹批量反查，带上 modId / fileId（判断有没有新版本用）。
+/// 返回 `(fingerprint, modId, fileId)`。
+pub fn fingerprint_details(hashes: &[u32]) -> Result<Vec<(u32, u64, u64)>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for chunk in hashes.chunks(1000) {
+        let body = serde_json::json!({ "fingerprints": chunk });
+        let value = post("/fingerprints/432", &body)?;
+        let matches = value["data"]["exactMatches"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for item in matches {
+            let file = &item["file"];
+            let Some(fingerprint) = file["fileFingerprint"].as_u64() else {
+                continue;
+            };
+            // 官方接口把模块 id 放在 `modId`，社区镜像只给 `id`——两个都认。
+            let Some(mod_id) = item["modId"].as_u64().or_else(|| item["id"].as_u64()) else {
+                continue;
+            };
+            let Some(file_id) = file["id"].as_u64() else {
+                continue;
+            };
+            out.push((fingerprint as u32, mod_id, file_id));
+        }
+    }
+    Ok(out)
+}
