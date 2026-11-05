@@ -106,6 +106,7 @@ fn same_instance(
         total_files: 0,
         downloaded_bytes: 0,
         total_bytes: 0,
+        percent: None,
     });
     Some(InstallSummary {
         version_id: name.to_owned(),
@@ -671,6 +672,7 @@ fn event(
         total_files: total,
         downloaded_bytes: bytes,
         total_bytes: 0,
+        percent: None,
     });
 }
 

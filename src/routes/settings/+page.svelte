@@ -13,6 +13,7 @@
     import { cachedJava } from "$lib/detect";
   import { api, type JavaInstallation, type LauncherInfo, type Settings } from "$lib/api";
   import { notifySettingsSaved } from "$lib/settings-live.svelte";
+  import { speedTierOptions } from "$lib/speed";
 
   let settings = $state<Settings | null>(null);
   let info = $state<LauncherInfo | null>(null);
@@ -106,6 +107,17 @@
           <span>最大线程数（1–256）</span>
           <input type="number" min="1" max="256" bind:value={settings.concurrentDownloads} />
         </label>
+        <label>
+          <span>速度限制</span>
+          <Dropdown
+            value={String(settings.downloadSpeed)}
+            label="速度限制"
+            onchange={(next) => {
+              if (settings) settings.downloadSpeed = Number(next);
+            }}
+            options={speedTierOptions()}
+          />
+        </label>
       </div>
       <p class="dim">
         官方源在校园网里可能很慢；镜像由社区维护，与官方内容一致（按 SHA1 校验）。只有存在镜像的文件才按这里的策略走，没有镜像的条目（比如原版清单）一律直接连官方。并发数调大通常更快，但会更吃带宽。
@@ -115,10 +127,6 @@
     <section class="panel block">
       <h2>内容下载</h2>
       <div class="grid">
-        <label>
-          <span>速度限制（KB/s，0 表示不限制）</span>
-          <input type="number" min="0" max="1048576" bind:value={settings.speedLimit} />
-        </label>
         <label>
           <span>内容列表每页条数（10–50）</span>
           <input type="number" min="10" max="50" bind:value={settings.pageSize} />

@@ -11,17 +11,16 @@
     pauseTask,
     requeueTask,
     resumeTask,
-    setTaskLive,
     setTaskOutput,
     setTaskResume,
     submitTask,
     setTaskNote,
-    stopState,
     takeStop,
     type Task,
     type TaskResult
   } from "$lib/tasks.svelte";
   import { showError } from "$lib/dialogs.svelte";
+  import { trackInstall, untrackInstall } from "$lib/install-live";
   import { supportsLoader, type LoaderKind } from "$lib/loader-ranges";
   import Dropdown from "$lib/components/Dropdown.svelte";
   import { SIDES, TAGS, type SideFilter, type TagOption } from "$lib/content-tags";
@@ -47,11 +46,9 @@
   import { page } from "$app/state";
   import {
     api,
-    onInstallProgress,
     type DownloadStrategy,
     onModpackProgress,
     type FabricLoaderVersion,
-    type InstallProgress,
     type InstallSummary,
     type InstanceLoader,
     type JavaInstallation,
@@ -79,32 +76,6 @@
     | "cleanroom"
     | "liteloader"
     | "optifine";
-
-  const STAGE_TEXT: Record<string, string> = {
-    manifest: "读取版本清单",
-    metadata: "下载版本元数据",
-    "asset-index": "下载资源索引",
-    downloading: "下载游戏文件",
-    "fabric-profile": "写入 Fabric 配置",
-    "fabric-checksum": "校验 Fabric 元数据",
-    "fabric-libraries": "下载 Fabric 库",
-    "instance-vanilla": "准备原版文件",
-    "instance-loader": "安装加载器",
-    "instance-merge": "合并成实例",
-    "quilt-profile": "写入 Quilt 配置",
-    "quilt-checksum": "校验 Quilt 元数据",
-    "quilt-libraries": "下载 Quilt 库",
-    forge: "运行 Forge 安装器",
-    "modloader-installer": "下载安装器",
-    "modloader-prepare": "准备游戏文件",
-    "modloader-libraries": "下载加载器库",
-    "modloader-install": "运行加载器安装器",
-    "modloader-verify": "校验加载器文件",
-    "modloader-publish": "写入版本配置",
-    complete: "完成",
-    cancelled: "已取消",
-    failed: "失败"
-  };
 
   const LOADER_NAME: Record<string, string> = {
     forge: "Forge",
@@ -207,14 +178,10 @@
   /// 命中缓存时清单的年龄；0 表示刚拉的。
   let manifestAgeMs = $state(0);
   let busy = $state(false);
-  let progress = $state<InstallProgress | null>(null);
   let summary = $state<InstallSummary | null>(null);
   /// 安装任务在任务列表里的 id：进度都推到那张卡片上，面板里不再放进度条。
   let installTaskId = $state<number | null>(null);
   let unlisten: Array<() => void> = [];
-
-  // 速度与剩余时间：按两次进度事件之间的字节差估算，取最近 4 秒的窗口。
-  let sample = $state({ at: 0, bytes: 0, rate: 0 });
 
   /// 清单顺序当底子，愚人节版挪到它基于的正式版后面（否则按名字会飞到最上面）。
   const orderedVersions = $derived.by(() => {
@@ -316,69 +283,6 @@
     const units = ["B", "KB", "MB", "GB"];
     const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
     return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
-  }
-
-  function noteProgress(event: InstallProgress) {
-    const now = Date.now();
-    const previous = sample;
-    if (!previous.at || event.downloadedBytes < previous.bytes) {
-      sample = { at: now, bytes: event.downloadedBytes, rate: 0 };
-      return;
-    }
-    const elapsed = now - previous.at;
-    if (elapsed < 350) return;
-    const rate = ((event.downloadedBytes - previous.bytes) * 1000) / elapsed;
-    // 滑动平均，避免单次抖动让数字乱跳
-    sample = {
-      at: now,
-      bytes: event.downloadedBytes,
-      rate: previous.rate ? previous.rate * 0.6 + rate * 0.4 : rate
-    };
-  }
-
-  /// 把一次进度事件翻成任务卡片上的实时状态（进度条 + 一行明细 + 当前文件）。
-  function liveFrom(event: InstallProgress) {
-    const percent =
-      event.totalBytes > 0
-        ? Math.min(100, (event.downloadedBytes / event.totalBytes) * 100)
-        : event.totalFiles > 0
-          ? Math.min(100, (event.completedFiles / event.totalFiles) * 100)
-          : 0;
-    const parts = [
-      `${event.completedFiles}/${event.totalFiles} 文件`,
-      `${formatBytes(event.downloadedBytes)} / ${formatBytes(event.totalBytes)}`
-    ];
-    if (sample.rate > 0) {
-      parts.push(`${formatBytes(sample.rate)}/s`);
-      const left = event.totalBytes - event.downloadedBytes;
-      if (left > 0) {
-        const seconds = left / sample.rate;
-        if (seconds < 24 * 3600) {
-          parts.push(
-            seconds < 60
-              ? `剩余约 ${Math.max(1, Math.round(seconds))} 秒`
-              : seconds < 3600
-                ? `剩余约 ${Math.round(seconds / 60)} 分钟`
-                : `剩余约 ${(seconds / 3600).toFixed(1)} 小时`
-          );
-        }
-      }
-    }
-    // 加载器阶段是「一个个文件/一步补丁」在跑，带上完成数，别只写一句「安装中」。
-    const stageBase = STAGE_TEXT[event.stage] ?? event.stage;
-    const stageCount =
-      event.totalFiles > 0 && event.stage !== "complete"
-        ? ` ${event.completedFiles}/${event.totalFiles}`
-        : "";
-    return {
-      percent,
-      stage:
-        (pausedRun || stopState.mode === "pause") && event.stage === "cancelled"
-          ? "已暂停"
-          : `${stageBase}${stageCount}`,
-      detail: parts.join(" · "),
-      path: event.path ?? ""
-    };
   }
 
   async function loadManifest(force = false) {
@@ -792,11 +696,11 @@
     const { name } = plan;
     if (installTaskId !== taskId) resumeTask(taskId);
     installTaskId = taskId;
+    trackInstall(taskId);
     busy = true;
     clearStop();
     pausedRun = false;
     summary = null;
-    progress = null;
     announce(`开始安装 ${name} · 正在下载游戏文件`);
     try {
       if (plan.javaPath === "" && plan.loaders.length > 0 && isModloader && !javaPlan?.path) {
@@ -853,6 +757,7 @@
       busy = false;
       stopping = null;
       installTaskId = null;
+      untrackInstall();
     }
   }
 
@@ -882,7 +787,6 @@
       // 取消是「这一轮作废」：面板上不留进度，进度只在任务列表里查。
       // 暂停要保留，好让「重试」接着下。
       if (mode === "cancel") {
-        progress = null;
         summary = null;
       }
     } catch (e) {
@@ -2951,13 +2855,6 @@
   onMount(async () => {
     window.addEventListener("keydown", onEscape, true);
     document.addEventListener("pointerdown", onDocPointer);
-    unlisten.push(
-      await onInstallProgress((event) => {
-        noteProgress(event);
-        progress = event;
-        if (installTaskId !== null) setTaskLive(installTaskId, liveFrom(event));
-      })
-    );
     // 整合包安装分好几步（下包、装加载器、下内容、解压覆盖），这里把后台推来的
     // 阶段写进任务卡片——否则 40 多个文件下十分钟，界面只有一个「进行中」。
     unlisten.push(

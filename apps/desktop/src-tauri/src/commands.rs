@@ -1635,7 +1635,9 @@ pub fn sync_global_strategy(paths: &crate::portable::Paths) -> launcher_core::do
     let global = crate::settings::load(paths);
     let strategy = strategy_of(global.download_strategy.as_deref());
     launcher_core::download::set_strategy(strategy);
-    launcher_core::download::set_speed_limit(global.speed_limit);
+    launcher_core::download::set_speed_limit(launcher_core::download::tier_limit(
+        global.download_speed,
+    ));
     strategy
 }
 
@@ -3092,7 +3094,9 @@ pub fn save_settings(
 ) -> Result<crate::settings::Settings, String> {
     let saved = crate::settings::save(&paths, settings)?;
     launcher_core::download::set_strategy(strategy_of(saved.download_strategy.as_deref()));
-    launcher_core::download::set_speed_limit(saved.speed_limit);
+    launcher_core::download::set_speed_limit(launcher_core::download::tier_limit(
+        saved.download_speed,
+    ));
     Ok(saved)
 }
 

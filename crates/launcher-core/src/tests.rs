@@ -1630,10 +1630,10 @@ fn plan_chunks_covers_the_file_without_gaps() {
 #[test]
 fn speed_limit_only_slows_when_it_is_set() {
     // 0 = 不限速：记账直接返回，不该有任何等待。
-    download::set_speed_limit(0);
+    let unlimited = download::Rate::new(0);
     let start = std::time::Instant::now();
     for _ in 0..2000 {
-        download::rate::throttle(4096);
+        unlimited.throttle(4096);
     }
     assert!(
         start.elapsed() < std::time::Duration::from_millis(200),
@@ -1642,15 +1642,29 @@ fn speed_limit_only_slows_when_it_is_set() {
     );
 
     // 64 KB/s 下领 16 KiB 应该等约 0.25 s。
-    download::set_speed_limit(64);
+    let limited = download::Rate::new(64 * 1024);
     let start = std::time::Instant::now();
-    download::rate::throttle(16 * 1024);
+    limited.throttle(16 * 1024);
     let took = start.elapsed();
-    download::set_speed_limit(0);
     assert!(
         took >= std::time::Duration::from_millis(150),
         "限速后应当阻塞，实际只等了 {took:?}"
     );
+}
+
+#[test]
+fn speed_tiers_match_pcl() {
+    // PCL `NetTaskSpeedLimitHigh`：0..=14 每档 0.1 MB/s，15..=31 每档 0.5，
+    // 32..=41 每档 1 MB/s，42 不限。
+    assert_eq!(download::tier_limit(0), 104_858);
+    assert_eq!(download::tier_limit(14), 1_572_864);
+    assert_eq!(download::tier_limit(15), 2_097_152);
+    assert_eq!(download::tier_limit(31), 10_485_760);
+    assert_eq!(download::tier_limit(32), 11_534_336);
+    assert_eq!(download::tier_limit(41), 20_971_520);
+    assert_eq!(download::tier_limit(42), 0);
+    assert_eq!(download::tier_for_limit(2_097_152), 15);
+    assert_eq!(download::tier_for_limit(0), 42);
 }
 
 #[test]

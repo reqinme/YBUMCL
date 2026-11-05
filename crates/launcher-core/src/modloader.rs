@@ -953,6 +953,7 @@ fn event(emit: &impl Fn(InstallProgress), version_id: &str, stage: &str, path: &
         total_files: 0,
         downloaded_bytes: 0,
         total_bytes: 0,
+        percent: None,
     });
 }
 
@@ -1448,16 +1449,41 @@ fn run_processors(
             "modloader-install",
             &format!("processor {}/{total}: {main}", index + 1),
         );
-        run_java_classpath(
-            java,
-            &classpath,
-            &main,
-            stage,
-            stage,
-            &args,
-            cancel,
-            |line| event(progress, profile_id, "modloader-install", line),
-        )?;
+        // 单个 processor 失败多是偶发（文件刚写完、杀软还在扫），重试一次就够；
+        // 同一步连败两次才真报错，避免一个坏步骤把整次安装判死。
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match run_java_classpath(
+                java,
+                &classpath,
+                &main,
+                stage,
+                stage,
+                &args,
+                cancel,
+                |line| event(progress, profile_id, "modloader-install", line),
+            ) {
+                Ok(()) => break,
+                Err(DownloadError::Cancelled) => {
+                    return Err(DownloadError::Cancelled);
+                }
+                Err(error) if attempt < 2 => {
+                    event(
+                        progress,
+                        profile_id,
+                        "modloader-install",
+                        &format!(
+                            "processor {}/{} 失败，重试：{error}",
+                            index + 1,
+                            total
+                        ),
+                    );
+                    thread::sleep(Duration::from_millis(600));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
     if let Some(patched) = tokens.get("PATCHED") {
         let path = PathBuf::from(patched);
@@ -1650,6 +1676,7 @@ fn prefetch_installer_libraries(
                         total_files: total,
                         downloaded_bytes: 0,
                         total_bytes: 0,
+                        percent: None,
                     });
                 });
             }
@@ -1683,6 +1710,7 @@ fn prefetch_installer_libraries(
         total_files: total,
         downloaded_bytes: 0,
         total_bytes: 0,
+        percent: None,
     });
     Ok(())
 }
@@ -2193,6 +2221,7 @@ fn install_forge_family(
         total_files: summary.downloaded_files + summary.skipped_files,
         downloaded_bytes: summary.downloaded_bytes,
         total_bytes: summary.downloaded_bytes,
+        percent: None,
     });
     Ok(summary)
 }
@@ -2257,6 +2286,7 @@ fn install_cleanroom(
         total_files: 0,
         downloaded_bytes: 0,
         total_bytes: 0,
+        percent: None,
     });
     let mut summary = InstallSummary {
         version_id: profile_label(r),
@@ -2793,6 +2823,7 @@ fn finish_install(
         total_files: summary.downloaded_files + summary.skipped_files,
         downloaded_bytes: summary.downloaded_bytes,
         total_bytes: summary.downloaded_bytes,
+        percent: None,
     });
     Ok(summary.clone())
 }
@@ -2904,6 +2935,7 @@ fn write_profile_loader(
         total_files: summary.downloaded_files + summary.skipped_files,
         downloaded_bytes: summary.downloaded_bytes,
         total_bytes: summary.downloaded_bytes,
+        percent: None,
     });
     Ok(summary)
 }

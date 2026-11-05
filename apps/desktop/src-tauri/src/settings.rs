@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::portable::Paths;
 
 const SETTINGS_FILE: &str = "settings.json";
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 /// 默认堆内存：现代版本 2 GB 起，低于 1 GB 很多模组包会直接 OOM。
 pub const DEFAULT_MEMORY_MB: u32 = 4096;
 pub const MAX_MEMORY_MB: u32 = 32768;
@@ -34,8 +34,12 @@ pub struct Settings {
     pub download_strategy: Option<String>,
     /// 最大线程数：同时下载的线程上限，1..=256（PCL 同款，默认 64）。
     pub concurrent_downloads: u32,
-    /// 全局限速（KB/s，0 表示不限制）。所有连接、所有任务共用一个额度。
-    #[serde(default)]
+    /// 全局限速档位（0..=42，PCL 的 `ToolDownloadSpeed`）：42 表示不限速，
+    /// 0..=14 每档 0.1 MB/s，15..=31 每档 0.5 MB/s，32..=41 每档 1 MB/s。
+    #[serde(default = "default_speed_tier")]
+    pub download_speed: u32,
+    /// 旧字段：限速（KB/s，0 = 不限），仅用于读老配置；迁移到档位后不再保存。
+    #[serde(default, skip_serializing)]
     pub speed_limit: u32,
     /// 旧字段：下载源，仅用于读老配置（下次保存后消失）。
     #[serde(default, skip_serializing)]
@@ -106,6 +110,7 @@ impl Default for Settings {
             download_strategy: Some("race".into()),
             download_source: String::new(),
             concurrent_downloads: 64,
+            download_speed: launcher_core::download::SPEED_TIER_UNLIMITED,
             speed_limit: 0,
             mirror_race: true,
             home_rail_collapsed: false,
@@ -130,6 +135,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_speed_tier() -> u32 {
+    launcher_core::download::SPEED_TIER_UNLIMITED
+}
+
 fn default_name_format() -> u8 {
     4
 }
@@ -147,7 +156,12 @@ impl Settings {
         self.username = self.username.trim().chars().take(24).collect();
         self.memory_mb = self.memory_mb.clamp(512, MAX_MEMORY_MB);
         self.concurrent_downloads = self.concurrent_downloads.clamp(1, 256);
-        self.speed_limit = self.speed_limit.clamp(0, 1_048_576);
+        // 老配置（KB/s）迁到档位；新配置只认档位。
+        if self.schema_version < 3 && self.speed_limit > 0 {
+            self.download_speed = launcher_core::download::tier_for_limit(self.speed_limit as u64 * 1024);
+        }
+        self.speed_limit = 0;
+        self.download_speed = self.download_speed.min(launcher_core::download::SPEED_TIER_UNLIMITED);
         self.page_size = self.page_size.clamp(10, 50);
         self.split_ratio = self.split_ratio.clamp(25, 65);
         self.versions_split_ratio = self.versions_split_ratio.clamp(12, 30);

@@ -237,6 +237,8 @@ export type InstallProgress = {
   totalFiles: number;
   downloadedBytes: number;
   totalBytes: number;
+  /// 加权百分比（0–100）；后端没算时为 null，界面按字节估算。
+  percent: number | null;
 };
 
 export type InstallSummary = {
@@ -339,8 +341,8 @@ export type Settings = {
   downloadStrategy: DownloadStrategy;
   /** 最大线程数：同时下载的线程上限（1–256，PCL 同款，默认 64）。 */
   concurrentDownloads: number;
-  /** 全局限速（KB/s，0 = 不限）。所有连接、所有任务共用一个额度。 */
-  speedLimit: number;
+  /** 下载限速档位（0–42，PCL 同款）：42 不限速，每个任务单独一份额度。 */
+  downloadSpeed: number;
   homeRailCollapsed: boolean;
   /// 同时进行的下载任务数（1–8）。
   pageSize: number;

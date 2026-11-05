@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -58,76 +58,148 @@ const SLOW_WINDOW: Duration = Duration::from_secs(1);
 /// 但它同时受「实际限速」约束——限得比 256 KB/s 还低时，按限速本身算。
 const SLOW_CEILING_BYTES_PER_SEC: u64 = 256 * 1024;
 
-/// 慢速判定阈值：PCL 的做法是 min(256 KB/s, 限速)，不限速时就是 256 KB/s。
-fn slow_threshold() -> u64 {
-    let limit = speed_limit();
-    if limit == 0 {
-        SLOW_CEILING_BYTES_PER_SEC
-    } else {
-        limit.min(SLOW_CEILING_BYTES_PER_SEC)
+/// 限速档位总数：0..=42，和 PCL 的 `ToolDownloadSpeed` 一致。
+pub const SPEED_TIER_COUNT: u32 = 43;
+
+/// 「不限速」的档位。
+pub const SPEED_TIER_UNLIMITED: u32 = 42;
+
+/// 档位换算成字节/秒：0..=14 每档 0.1 MB/s（0.1–1.5），15..=31 每档 0.5 MB/s
+/// （2–10），32..=41 每档 1 MB/s（11–20），42 不限速。
+///
+/// 公式照抄 PCL `NetTaskSpeedLimitHigh`（`pcl_ModNet.vb:416-433`）。
+pub fn tier_limit(tier: u32) -> u64 {
+    match tier {
+        0..=14 => ((tier as f64 + 1.0) * 0.1 * 1024.0 * 1024.0).round() as u64,
+        15..=31 => (tier - 11) as u64 * 512 * 1024,
+        32..=41 => (tier - 21) as u64 * 1024 * 1024,
+        _ => 0,
     }
 }
-/// 全局限速（字节/秒，0 = 不限）：总和一个额度，所有连接、所有任务都从这儿扣。
-static SPEED_LIMIT_BPS: AtomicU64 = AtomicU64::new(0);
 
-/// 设置全局限速（KB/s，0 表示不限制）。启动器读设置和保存设置时都调它。
-pub fn set_speed_limit(kbps: u32) {
-    SPEED_LIMIT_BPS.store(kbps as u64 * 1024, Ordering::Relaxed);
-    rate::reset();
+/// 反查：字节/秒最接近哪个档位（老配置的 KB/s 迁过来时用）。
+pub fn tier_for_limit(bytes_per_sec: u64) -> u32 {
+    if bytes_per_sec == 0 {
+        return SPEED_TIER_UNLIMITED;
+    }
+    (0..SPEED_TIER_COUNT)
+        .min_by_key(|tier| {
+            let limit = tier_limit(*tier);
+            if limit == 0 {
+                u64::MAX
+            } else {
+                limit.abs_diff(bytes_per_sec)
+            }
+        })
+        .unwrap_or(SPEED_TIER_UNLIMITED)
 }
 
-/// 当前全局限速（字节/秒，0 = 不限）。
+/// 设置里的限速（字节/秒，0 = 不限）。每个下载任务创建 [`Rate`] 时读一次。
+static SPEED_LIMIT_BPS: AtomicU64 = AtomicU64::new(0);
+
+/// 保存限速设置（字节/秒，0 表示不限制）。启动器读设置和保存设置时都调它。
+pub fn set_speed_limit(bytes_per_sec: u64) {
+    SPEED_LIMIT_BPS.store(bytes_per_sec, Ordering::Relaxed);
+}
+
+/// 当前设置里的限速（字节/秒，0 = 不限）。
 pub fn speed_limit() -> u64 {
     SPEED_LIMIT_BPS.load(Ordering::Relaxed)
 }
 
-/// 全局令牌桶：所有线程共用一条虚拟时间线，于是「合计速度」被压到限速上。
+/// 一个下载任务（一次批量下载 / 一次安装）专用的限速桶。
 ///
-/// 每读到 `n` 字节就向桶里记账 `n / limit` 秒：账记满了就等到那个时刻再继续读。
-/// 睡在锁外面，多个连接可以并行排队；`limit == 0` 时整段跳过，零开销。
-pub(crate) mod rate {
-    use std::time::{Duration, Instant};
+/// PCL 的 `NetTaskSpeedLimitLeft` 挂在任务上：同一任务的所有连接共享额度，不同任务
+/// 各算各的（`pcl_ModNet.vb:438-440`、`1086-1092`）。这里同样让每个 `Http` 实例带一份，
+/// 整批下载共用一个桶，不会把别的任务的额度吃掉。
+pub(crate) struct Rate {
+    /// 字节/秒，0 = 不限。
+    limit: AtomicU64,
+    /// 下一次可以放行的时刻；多个连接并行排队，所以只是记账不占锁睡觉。
+    credit: Mutex<Instant>,
+    /// 动态速度下限（字节/秒），PCL 会把它抬到「近 1 秒平均速度的 85%」。
+    low: AtomicU64,
+    /// 最近一次测得的聚合速度（字节/秒），用来判断是否已经跑满。
+    speed: AtomicU64,
+}
 
-    use super::{Mutex, OnceLock};
-
-    /// 下一次可以放行的时刻。
-    struct Credit {
-        ready_at: Instant,
-    }
-
-    fn shared() -> &'static Mutex<Credit> {
-        static CELL: OnceLock<Mutex<Credit>> = OnceLock::new();
-        CELL.get_or_init(|| Mutex::new(Credit { ready_at: Instant::now() }))
-    }
-
-    /// 限速值变了以后丢掉旧账，免得上一档的额度把第一批数据卡住。
-    pub fn reset() {
-        if let Ok(mut credit) = shared().lock() {
-            credit.ready_at = Instant::now();
+impl Rate {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit: AtomicU64::new(limit),
+            credit: Mutex::new(Instant::now()),
+            low: AtomicU64::new(initial_low(limit)),
+            speed: AtomicU64::new(0),
         }
     }
 
-    /// 领 `bytes` 字节的额度：额度不够就睡到够为止。
-    pub fn throttle(bytes: u64) {
-        let limit = super::speed_limit();
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    /// 速度下限：低于它说明还没跑满，可以再开连接。
+    pub(crate) fn low(&self) -> u64 {
+        self.low.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn speed(&self) -> u64 {
+        self.speed.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_speed(&self, speed: u64) {
+        self.speed.store(speed, Ordering::Relaxed);
+    }
+
+    /// 已经跑到下限之上：不必再开新连接。
+    pub(crate) fn saturated(&self) -> bool {
+        self.speed() >= self.low()
+    }
+
+    /// 按「近 1 秒平均速度 × 0.85」抬高下限，只升不降（PCL `RefreshStat`）。
+    pub(crate) fn raise_low(&self, average_speed: f64) {
+        let target = (average_speed * 0.85).max(0.0) as u64;
+        let mut low = self.low.load(Ordering::Relaxed);
+        while target > low {
+            match self
+                .low
+                .compare_exchange_weak(low, target, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(actual) => low = actual,
+            }
+        }
+    }
+
+    /// 领 `bytes` 字节的额度：额度不够就睡到够为止。`limit == 0` 时零开销。
+    pub(crate) fn throttle(&self, bytes: u64) {
+        let limit = self.limit();
         if limit == 0 || bytes == 0 {
             return;
         }
         let wait_until = {
-            let Ok(mut credit) = shared().lock() else {
+            let Ok(mut credit) = self.credit.lock() else {
                 return;
             };
             let now = Instant::now();
-            let start = credit.ready_at.max(now);
+            let start = (*credit).max(now);
             let span = Duration::from_secs_f64(bytes as f64 / limit as f64);
             let ready_at = start + span;
-            credit.ready_at = ready_at;
+            *credit = ready_at;
             ready_at
         };
         let now = Instant::now();
         if wait_until > now {
-            std::thread::sleep(wait_until - now);
+            thread::sleep(wait_until - now);
         }
+    }
+}
+
+/// 起始下限：PCL 是 256 KB/s，但限速比它还低时按下限本身算，否则永不达标。
+fn initial_low(limit: u64) -> u64 {
+    if limit == 0 {
+        SLOW_CEILING_BYTES_PER_SEC
+    } else {
+        limit.min(SLOW_CEILING_BYTES_PER_SEC)
     }
 }
 
@@ -262,6 +334,11 @@ pub struct InstallProgress {
     pub downloaded_bytes: u64,
     /// Sum of known sizes discovered so far, excluding files without a size.
     pub total_bytes: u64,
+    /// 加权百分比（0–100）：PCL 把一次安装拆成「分析 / 支持库 / 资源」几段，
+    /// 按段内完成度折算，进度条不会因为后面才发现大文件而后退。
+    /// `None` 表示这条流程没算，界面按字节估算。
+    #[serde(default)]
+    pub percent: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -497,6 +574,18 @@ trait Source {
     fn note_slow(&self, url: &str) {
         let _ = url;
     }
+    /// 读到 `bytes` 字节后向「本任务」的限速桶记账。
+    fn throttle(&self, bytes: u64) {
+        let _ = bytes;
+    }
+    /// 本任务的速度下限（字节/秒）：低于它说明还没跑满。
+    fn low(&self) -> u64 {
+        SLOW_CEILING_BYTES_PER_SEC
+    }
+    /// 本任务已经跑满下限：不必再为同一个文件开新连接。
+    fn saturated(&self) -> bool {
+        false
+    }
 }
 /// 下载源策略。判定规则只有一条：某个地址**有镜像路由**才按策略分流，
 /// 没有镜像路由（版本清单、json 这类）永远只走官方，否则会直接 404。
@@ -583,6 +672,8 @@ pub fn strategy() -> DownloadStrategy {
 struct Http {
     client: Client,
     strategy: DownloadStrategy,
+    /// 本任务的限速桶：整批下载共用一份，任务之间互不影响。
+    rate: Rate,
     /// 正在安装的版本号（如 `1.20.5`）。原版 client/server jar 的镜像地址是
     /// `https://<mirror>/version/<id>/client`，光看文件 URL（`/v1/objects/<sha>/client.jar`）
     /// 是拿不到版本号的，所以由调用方在安装某个版本时把它放进来。
@@ -650,6 +741,7 @@ impl Http {
             .map(|client| Self {
                 client,
                 strategy,
+                rate: Rate::new(speed_limit()),
                 version: None,
                 rank: Mutex::new(HashMap::new()),
                 probing: Mutex::new(BTreeSet::new()),
@@ -1058,6 +1150,15 @@ impl Source for Http {
             entry.at = Instant::now();
         }
     }
+    fn throttle(&self, bytes: u64) {
+        self.rate.throttle(bytes);
+    }
+    fn low(&self) -> u64 {
+        self.rate.low()
+    }
+    fn saturated(&self) -> bool {
+        self.rate.saturated()
+    }
 }
 fn fetch_json(source: &impl Source, url: &str, cancel: &CancellationToken) -> Result<Vec<u8>> {
     fetch_limited(source, url, cancel, JSON_LIMIT)
@@ -1285,6 +1386,76 @@ fn drop_redirected_candidates(source: &Http, items: &[DownloadJob]) -> Vec<Downl
         .collect()
 }
 
+/// 一批下载里每条候选地址的健康状况，对应 PCL 的 `SourcesOnce` / `IsFailed`。
+///
+/// PCL 的做法（`pcl_ModNet.vb:1160-1190`）：一条源出硬错误（不支持分段 / 404 /
+/// 502 / 403 / 429）立刻停用；普通失败累计到 `clamp(线程数, 5, 30)` 次也停用，
+/// 免得每个文件都去撞一次死镜像。停用只作用于这一批，下一批重新试。
+struct Health {
+    /// 普通失败累计到这个次数就停用。
+    limit: usize,
+    fails: Mutex<HashMap<String, usize>>,
+    dead: Mutex<HashSet<String>>,
+}
+
+impl Health {
+    fn new(workers: usize) -> Self {
+        Self {
+            limit: workers.clamp(5, 30),
+            fails: Mutex::new(HashMap::new()),
+            dead: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn usable(&self, url: &str) -> bool {
+        self.dead
+            .lock()
+            .map(|dead| !dead.contains(url))
+            .unwrap_or(true)
+    }
+
+    fn stop_using(&self, url: &str) {
+        if let Ok(mut dead) = self.dead.lock() {
+            dead.insert(url.to_owned());
+        }
+    }
+
+    /// 记一次失败；到达阈值或命中硬错误就停用这条地址。
+    fn failed(&self, url: &str, error: &DownloadError) {
+        if !self.usable(url) {
+            return;
+        }
+        let message = error.to_string();
+        let hard = is_hard_failure(&message, url);
+        let Ok(mut fails) = self.fails.lock() else {
+            return;
+        };
+        let count = {
+            let entry = fails.entry(url.to_owned()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        drop(fails);
+        if hard || count >= self.limit {
+            self.stop_using(url);
+        }
+    }
+}
+
+/// 硬错误：重试再多次也没用，直接停用这条地址。
+fn is_hard_failure(message: &str, url: &str) -> bool {
+    if message.contains("不支持分段") {
+        return true;
+    }
+    // 404 / 416 / 502 对任何源都是「这个文件它没有」；403 / 429 在镜像上是限流，
+    // 官方源上则多半是地址失效，和 PCL 一样只对非 bmclapi 停用。
+    if ["404", "416", "502"].iter().any(|code| message.contains(code)) {
+        return true;
+    }
+    let throttled = ["403", "429"].iter().any(|code| message.contains(code));
+    throttled && !url.contains("bmclapi")
+}
+
 /// 把一批文件下到磁盘：复用同一个连接池、并行抓取，失败的文件只记下来不中断整批。
 ///
 /// 整合包动辄上百个文件，逐个 `fetch_file_bytes` 会为每个文件重建 client（重新
@@ -1322,6 +1493,7 @@ pub fn fetch_files_to(
     let total = jobs.len();
     // 线程数由设置决定（1–256，实际 2–257，默认 65）；比文件数多没意义。
     let workers = threads.clamp(1, 257).min(total).max(1);
+    let health = Health::new(workers);
 
     // 一个文件里每读 64 KB 都会回调一次，全量转发会把 IPC 打爆；
     // 按 300 ms 节流，界面仍能看到字节在涨。
@@ -1352,7 +1524,46 @@ pub fn fetch_files_to(
         // 「已完成个数」——补下轮不该让进度条从中间再走一遍。
         let run_pass = |order: &[usize], count: bool| {
             let next = AtomicUsize::new(0);
+            // 正在处理的文件数：统计线程靠它判断这一轮是不是真的空了。
+            let busy = AtomicUsize::new(0);
+            let health = &health;
             thread::scope(|scope| {
+                // 后台统计（PCL `RefreshStat`）：每 100 ms 采一次整批速度，
+                // 速度下限取近 1 秒平均的 85%，只升不降。
+                let counted = &bytes;
+                scope.spawn(|| {
+                    let mut samples: std::collections::VecDeque<u64> =
+                        std::collections::VecDeque::with_capacity(31);
+                    let mut last_bytes = counted.load(Ordering::Relaxed);
+                    let mut last_at = Instant::now();
+                    loop {
+                        thread::sleep(Duration::from_millis(100));
+                        if cancel.is_cancelled() {
+                            return;
+                        }
+                        let now = Instant::now();
+                        let current = counted.load(Ordering::Relaxed);
+                        let elapsed = now.duration_since(last_at).as_secs_f64().max(0.001);
+                        let speed = (current.saturating_sub(last_bytes) as f64 / elapsed) as u64;
+                        last_bytes = current;
+                        last_at = now;
+                        source.rate.set_speed(speed);
+                        samples.push_back(speed);
+                        if samples.len() > 30 {
+                            samples.pop_front();
+                        }
+                        if samples.len() >= 10 {
+                            let recent = samples.len().min(10);
+                            let sum: u64 = samples.iter().rev().take(recent).sum();
+                            source.rate.raise_low(sum as f64 / recent as f64);
+                        }
+                        if next.load(Ordering::Relaxed) >= order.len()
+                            && busy.load(Ordering::Relaxed) == 0
+                        {
+                            return;
+                        }
+                    }
+                });
                 for _ in 0..workers.min(order.len()) {
                     scope.spawn(|| loop {
                         if cancel.is_cancelled() {
@@ -1362,6 +1573,7 @@ pub fn fetch_files_to(
                         let Some(&index) = order.get(slot) else {
                             return;
                         };
+                        busy.fetch_add(1, Ordering::Relaxed);
                         let job = &jobs[index];
                         let name = job
                             .dest
@@ -1369,9 +1581,18 @@ pub fn fetch_files_to(
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
                         tick(&name);
-                        match fetch_job(job, cancel, &source, &bytes, &name, strategy, || {
-                            tick(&name)
-                        }) {
+                        let result = fetch_job(
+                            job,
+                            cancel,
+                            &source,
+                            &bytes,
+                            health,
+                            &name,
+                            strategy,
+                            || tick(&name),
+                        );
+                        busy.fetch_sub(1, Ordering::Relaxed);
+                        match result {
                             Ok(()) => {}
                             Err(DownloadError::Cancelled) => return,
                             Err(error) => {
@@ -1429,6 +1650,7 @@ fn race_job(
     cancel: &CancellationToken,
     source: &Http,
     bytes: &AtomicU64,
+    health: &Health,
     name: &str,
     tick: &(impl Fn() + Sync),
 ) -> Result<()> {
@@ -1461,6 +1683,12 @@ fn race_job(
                         },
                         None => Ok(()),
                     });
+                match &done {
+                    // 硬错误（404 / 不支持分段）说明这条地址对这个文件没戏了：整批停用。
+                    Err(DownloadError::Cancelled) => {}
+                    Err(error) => health.failed(url, error),
+                    Ok(()) => {}
+                }
                 if done.is_ok() {
                     // 第一个成功的人点名，其他人立刻停手
                     if let Ok(mut slot) = winner.lock() {
@@ -1506,6 +1734,7 @@ fn fetch_job(
     cancel: &CancellationToken,
     source: &Http,
     bytes: &AtomicU64,
+    health: &Health,
     name: &str,
     strategy: DownloadStrategy,
     tick: impl Fn() + Sync,
@@ -1527,8 +1756,9 @@ fn fetch_job(
     }
     // 竞速策略下，凡是有两条候选（官方 + 镜像）的文件都同时开下，谁先到用谁。
     // 只串行重试的话，遇到「不报错但很慢」的线路要等满超时。
-    if strategy == DownloadStrategy::Race && job.urls.len() >= 2 {
-        match race_job(job, cancel, source, bytes, name, &tick) {
+    let usable = job.urls.iter().filter(|url| health.usable(url)).count();
+    if strategy == DownloadStrategy::Race && usable >= 2 {
+        match race_job(job, cancel, source, bytes, health, name, &tick) {
             Ok(()) => return Ok(()),
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
             Err(_) => {} // 竞速没成功就退回串行，串行还有完整重试
@@ -1536,6 +1766,9 @@ fn fetch_job(
     }
     let mut last: Option<DownloadError> = None;
     for url in &job.urls {
+        if !health.usable(url) {
+            continue;
+        }
         match download_to(url, &job.dest, job.size, cancel, source, bytes, || tick()) {
             Ok(()) => {
                 if let Some(expected) = job.sha1.as_deref() {
@@ -1558,7 +1791,10 @@ fn fetch_job(
                 return Ok(());
             }
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
-            Err(error) => last = Some(error),
+            Err(error) => {
+                health.failed(url, &error);
+                last = Some(error);
+            }
         }
     }
     Err(last.unwrap_or_else(|| DownloadError::Network(format!("{name}: 没有可用的下载地址"))))
@@ -1578,12 +1814,15 @@ fn download_to(
     tick: impl Fn() + Sync,
 ) -> Result<()> {
     // 大文件先走 Range 分块（每块两条路竞速）；服务器不支持分段或失败就退回单流。
-    match fetch_chunked_to(url, dest, size, cancel, source, bytes, &tick) {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
-        Err(error) => {
-            let _ = error;
+    // 整批速度已经到下限（PCL 的 Low）时不再分块：多开连接只是抢同一条带宽。
+    if !source.saturated() {
+        match fetch_chunked_to(url, dest, size, cancel, source, bytes, &tick) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+            Err(error) => {
+                let _ = error;
+            }
         }
     }
     let timeout = transfer_timeout(size);
@@ -1666,7 +1905,7 @@ fn span_to(
         if read == 0 {
             break;
         }
-        rate::throttle(read as u64);
+        source.throttle(read as u64);
         written += read as u64;
         if written > want {
             return Err(DownloadError::Integrity(url.to_owned()));
@@ -1718,7 +1957,7 @@ fn span_bytes(
         if read == 0 {
             break;
         }
-        rate::throttle(read as u64);
+        source.throttle(read as u64);
         out.extend_from_slice(&chunk[..read]);
         if out.len() > want {
             return Err(DownloadError::Integrity(url.to_owned()));
@@ -1761,7 +2000,7 @@ fn span_bytes_counted(
         if read == 0 {
             break;
         }
-        rate::throttle(read as u64);
+        source.throttle(read as u64);
         out.extend_from_slice(&chunk[..read]);
         if out.len() > want {
             return Err(DownloadError::Integrity(url.to_owned()));
@@ -2149,7 +2388,7 @@ fn stream_to(
         if read == 0 {
             break;
         }
-        rate::throttle(read as u64);
+        source.throttle(read as u64);
         written += read as u64;
         if written > LIMIT {
             return Err(DownloadError::Integrity(url.to_owned()));
@@ -2232,7 +2471,7 @@ fn fetch_limited_once_counted(
         if n == 0 {
             break;
         }
-        rate::throttle(n as u64);
+        source.throttle(n as u64);
         if result.len() as u64 + n as u64 > limit {
             return Err(DownloadError::Invalid("response exceeds size limit".into()));
         }
@@ -2261,7 +2500,7 @@ fn fetch_limited_once(
         if n == 0 {
             break;
         }
-        rate::throttle(n as u64);
+        source.throttle(n as u64);
         if result.len() as u64 + n as u64 > limit {
             return Err(DownloadError::Invalid("response exceeds size limit".into()));
         }
@@ -2857,7 +3096,7 @@ fn stream_once<S: Source>(
         if n == 0 {
             break;
         }
-        rate::throttle(n as u64);
+        source.throttle(n as u64);
         size += n as u64;
         if size > a.limit || a.size.is_some_and(|expected| size > expected) {
             return Err(DownloadError::Integrity(a.path.clone()));
@@ -2870,7 +3109,7 @@ fn stream_once<S: Source>(
             let elapsed = window_start.elapsed();
             if elapsed >= SLOW_WINDOW {
                 let rate = window_bytes / elapsed.as_secs().max(1);
-                if rate < slow_threshold() {
+                if rate < source.low() {
                     return Err(DownloadError::Slow(format!("{} B/s", rate)));
                 }
                 window_start = Instant::now();
@@ -3011,7 +3250,7 @@ fn write_segment<S: Source>(
         if n == 0 {
             return Ok(false);
         }
-        rate::throttle(n as u64);
+        source.throttle(n as u64);
         file.write_all(&chunk[..n])
             .map_err(|e| io_error(target, e))?;
         read += n as u64;
@@ -3100,7 +3339,9 @@ fn transfer<S: Source + Sync>(
                     let _ = tx.send(WorkerMsg::Progress);
                 }
             };
-            if !fetch_chunked(source, a, &part, cancel, &notify)? {
+            // 速度已到下限就不再分块（PCL 只在 Speed < Low 时加连接）。
+            let chunked = !source.saturated() && fetch_chunked(source, a, &part, cancel, &notify)?;
+            if !chunked {
                 fetch_into_part(source, a, &part, cancel, &notify)?;
             }
         }
@@ -3108,6 +3349,17 @@ fn transfer<S: Source + Sync>(
     publish(root, &path, &part)?;
     Ok(!reused)
 }
+/// 加权进度：`total` 是这次安装的总权重，`done` 是已经走完的权重。
+///
+/// 权重照 PCL `pcl_ModDownload.vb:59-118` 的分段：分析 1、下载支持库 15、
+/// 资源索引 2、下载资源 25，合计 43；每个加载器阶段再占 6（profile 1 /
+/// 校验和 1 / 支持库 4）。
+#[derive(Debug, Clone, Copy, Default)]
+struct Progress {
+    total: f64,
+    done: f64,
+}
+
 struct Installer<'a, S, F> {
     source: &'a S,
     root: PathBuf,
@@ -3118,6 +3370,7 @@ struct Installer<'a, S, F> {
     legacy_fabric: Option<String>,
     progress: InstallProgress,
     summary: InstallSummary,
+    weights: Progress,
     emit: F,
 }
 impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
@@ -3125,6 +3378,19 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         self.progress.stage = stage.into();
         self.progress.path = path.into();
         (self.emit)(self.progress.clone());
+    }
+    /// 走完一段权重（PCL 的「分析 1 / 支持库 15 / 资源索引 2 / 资源 25」）。
+    fn advance(&mut self, weight: f64) {
+        self.weights.done += weight;
+        self.progress.percent = Some(self.percent(0.0));
+        (self.emit)(self.progress.clone());
+    }
+    /// 总进度百分比：`partial` 是当前这段里已经走完的比例（0..=1）。
+    fn percent(&self, partial: f64) -> f64 {
+        if self.weights.total <= 0.0 {
+            return 0.0;
+        }
+        ((self.weights.done + partial) / self.weights.total * 100.0).clamp(0.0, 100.0)
     }
     fn add(&mut self, jobs: &[Artifact]) {
         self.progress.total_files += jobs.len() as u64;
@@ -3185,11 +3451,15 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
     /// Fetches independent artifacts on a small worker pool. Each file is published only
     /// after its own SHA1/size check, so ordering between files is irrelevant; only the
     /// reported progress and the first error are observed by the caller.
-    fn download_many(&mut self, jobs: &[Artifact], stage: &str) -> Result<()> {
+    /// 下一组文件，`weight` 是这一组在总进度里占的权重（见 [`Progress`]）。
+    fn download_many(&mut self, jobs: &[Artifact], stage: &str, weight: f64) -> Result<()> {
         if jobs.len() <= 1 || self.threads <= 1 {
             for artifact in jobs {
                 self.download(artifact, stage)?;
+                self.progress.percent = Some(self.percent(0.0));
+                (self.emit)(self.progress.clone());
             }
+            self.weights.done += weight;
             return Ok(());
         }
         let Installer {
@@ -3202,8 +3472,14 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
             legacy_fabric: _,
             progress,
             summary,
+            weights,
             emit,
         } = self;
+        let weight_base = weights.done;
+        let weight_total = weights.total;
+        let start_bytes = progress.downloaded_bytes;
+        let expected_bytes: u64 = jobs.iter().filter_map(|a| a.size).sum();
+        let batch_len = jobs.len() as f64;
         let source: &S = source;
         let root: &Path = root.as_path();
         let cache_root: Option<&Path> = cache_root.as_deref();
@@ -3276,8 +3552,29 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
                 progress.stage = stage.into();
                 progress.downloaded_bytes = bytes.load(Ordering::Relaxed);
                 summary.downloaded_bytes = progress.downloaded_bytes;
+                // 段内完成度：有字节总数就按字节，没有就按文件个数。
+                let done_bytes = progress
+                    .downloaded_bytes
+                    .saturating_sub(start_bytes) as f64;
+                let fraction = if expected_bytes > 0 {
+                    (done_bytes / expected_bytes as f64).clamp(0.0, 1.0)
+                } else if batch_len > 0.0 {
+                    (progress.completed_files as f64 / batch_len).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if weight_total > 0.0 {
+                    progress.percent = Some(
+                        ((weight_base + weight * fraction) / weight_total * 100.0)
+                            .clamp(0.0, 100.0),
+                    );
+                }
                 (*emit)(progress.clone());
             }
+            *weights = Progress {
+                total: weight_total,
+                done: weight_base + weight,
+            };
         });
         if let Some(error) = failure {
             return Err(error);
@@ -3286,6 +3583,10 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         Ok(())
     }
     fn run_profile(&mut self, id: &str) -> Result<()> {
+        self.weights = Progress {
+            total: 43.0,
+            done: 0.0,
+        };
         let metadata_path = self.root.join(format!("versions/{id}/{id}.json"));
         inside(&self.root, &metadata_path)?;
         let metadata = crate::read_json(&metadata_path)?;
@@ -3303,9 +3604,12 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         )?;
         self.add(std::slice::from_ref(&index));
         let assets = crate::read_json(&self.download(&index, "asset-index")?)?;
-        let jobs = plan(id, &metadata, &assets)?;
-        self.add(&jobs);
-        self.download_many(&jobs, "downloading")?;
+        self.advance(3.0);
+        let (libraries, assets) = split_plan(plan(id, &metadata, &assets)?);
+        self.add(&libraries);
+        self.add(&assets);
+        self.download_many(&libraries, "downloading", 15.0)?;
+        self.download_many(&assets, "downloading", 25.0)?;
         self.cancel.check()?;
         self.summary.version_id = id.to_owned();
         Ok(())
@@ -3315,18 +3619,37 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
     /// 老安装器写出的 `inheritsFrom` 增量 profile 没有 `assetIndex`，客户端 jar
     /// 也在继承的原版里；`run_profile` 要求的 assetIndex 与资源对它都不适用。
     fn run_libraries(&mut self, id: &str) -> Result<()> {
+        self.weights = Progress {
+            total: 15.0,
+            done: 0.0,
+        };
         let metadata_path = self.root.join(format!("versions/{id}/{id}.json"));
         inside(&self.root, &metadata_path)?;
         let metadata = crate::read_json(&metadata_path)?;
         let assets = serde_json::json!({ "objects": {} });
-        let jobs = plan(id, &metadata, &assets)?;
-        self.add(&jobs);
-        self.download_many(&jobs, "downloading")?;
+        let (libraries, assets) = split_plan(plan(id, &metadata, &assets)?);
+        self.add(&libraries);
+        self.add(&assets);
+        self.download_many(&libraries, "downloading", 15.0)?;
         self.cancel.check()?;
         self.summary.version_id = id.to_owned();
         Ok(())
     }
     fn run(&mut self, game: &str, loader: Option<&str>) -> Result<InstallSummary> {
+        // 加权进度：分析 3 + 支持库 15 + 资源 25；每个加载器再加 6
+        // （profile 1 / 校验和 1 / 支持库 4），进度条不会在加载器阶段重走一遍。
+        let loaders = [
+            loader.is_some(),
+            self.quilt_loader.is_some(),
+            self.legacy_fabric.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count() as f64;
+        self.weights = Progress {
+            total: 43.0 + 6.0 * loaders,
+            done: 0.0,
+        };
         self.run_vanilla(game)?;
         if let Some(loader) = loader {
             self.install_profile_loader(game, loader, ProfileKind::Fabric)?;
@@ -3356,6 +3679,7 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         )?;
         self.add(std::slice::from_ref(&profile));
         let staged = self.download(&profile, &format!("{}-profile", kind.stage()))?;
+        self.advance(1.0);
         let metadata = crate::read_json(&staged)?;
         let (id, mut jobs) = loader_plan(game, &metadata, kind)?;
         self.progress.version_id = id.clone();
@@ -3381,7 +3705,8 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
                 job.hash = Some(hash.to_ascii_lowercase());
             }
         }
-        self.download_many(&jobs, &format!("{}-libraries", kind.stage()))?;
+        self.advance(1.0);
+        self.download_many(&jobs, &format!("{}-libraries", kind.stage()), 4.0)?;
         self.cancel.check()?;
         let destination = self.root.join(format!("versions/{id}/{id}.json"));
         inside(&self.root, &destination)?;
@@ -3411,6 +3736,7 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
             .ok_or_else(|| {
                 DownloadError::Invalid(format!("unknown official version: {version_id}"))
             })?;
+        self.advance(1.0);
         let meta = Artifact::new(
             format!("versions/{version_id}/{version_id}.json"),
             &serde_json::json!({"url":remote.url}),
@@ -3441,6 +3767,7 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
                 "metadata ID mismatch or inherited version".into(),
             ));
         }
+        self.advance(1.0);
         let index_id = metadata["assetIndex"]["id"]
             .as_str()
             .ok_or_else(|| DownloadError::Invalid("asset index ID missing".into()))?;
@@ -3455,9 +3782,12 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         )?;
         self.add(std::slice::from_ref(&index));
         let assets = crate::read_json(&self.download(&index, "asset-index")?)?;
-        let jobs = plan(version_id, &metadata, &assets)?;
-        self.add(&jobs);
-        self.download_many(&jobs, "downloading")?;
+        self.advance(1.0);
+        let (libraries, assets) = split_plan(plan(version_id, &metadata, &assets)?);
+        self.add(&libraries);
+        self.add(&assets);
+        self.download_many(&libraries, "downloading", 15.0)?;
+        self.download_many(&assets, "downloading", 25.0)?;
         self.cancel.check()?;
         if metadata_path != final_metadata {
             inside(&self.root, &final_metadata)?;
@@ -3662,6 +3992,24 @@ fn plan(id: &str, metadata: &Value, assets: &Value) -> Result<Vec<Artifact>> {
     jobs.retain(|a| paths.insert(a.path.clone()));
     Ok(jobs)
 }
+
+/// 按 PCL 的两段拆开：资源（资源对象 / 老版本 virtual 与 resources 布局）单独一段，
+/// 其余（客户端 jar、libraries、natives、log 配置）算作「支持库」。
+fn split_plan(jobs: Vec<Artifact>) -> (Vec<Artifact>, Vec<Artifact>) {
+    let mut libraries = Vec::new();
+    let mut assets = Vec::new();
+    for job in jobs {
+        let asset = job.path.starts_with("assets/objects/")
+            || job.path.starts_with("assets/virtual/")
+            || job.path.starts_with("resources/");
+        if asset {
+            assets.push(job);
+        } else {
+            libraries.push(job);
+        }
+    }
+    (libraries, assets)
+}
 /// Installs official vanilla files beneath `request.game_dir`; never chooses `.minecraft`.
 /// The caller supplies a token and receives owned, serializable progress snapshots.
 pub fn install_version(
@@ -3735,7 +4083,9 @@ pub fn install_legacy_fabric(
             total_files: 0,
             downloaded_bytes: 0,
             total_bytes: 0,
+            percent: None,
         },
+        weights: Progress::default(),
         summary: InstallSummary {
             version_id: game.to_owned(),
             path: tidy_path(&PathBuf::from(game_dir).join("versions").join(game)),
@@ -4005,7 +4355,9 @@ fn install_profile_part(
             total_files: 0,
             downloaded_bytes: 0,
             total_bytes: 0,
+            percent: None,
         },
+        weights: Progress::default(),
         summary: InstallSummary {
             version_id: version_id.to_owned(),
             path: tidy_path(&PathBuf::from(game_dir).join("versions").join(version_id)),
@@ -4083,7 +4435,9 @@ fn install_with_cache(
             total_files: 0,
             downloaded_bytes: 0,
             total_bytes: 0,
+            percent: None,
         },
+        weights: Progress::default(),
         summary: InstallSummary {
             version_id: request.version_id.clone(),
             path: tidy_path(
