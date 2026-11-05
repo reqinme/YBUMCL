@@ -83,6 +83,7 @@ pub fn run() {
             commands::rename_instance,
             commands::reset_instance,
             commands::repair_instance_files,
+            commands::diagnose_crash_report,
             commands::patch_instance_core,
             commands::backup_instance_core,
             commands::export_launch_script,

@@ -15,6 +15,8 @@ use std::{
 use thiserror::Error;
 
 pub mod cleanroom;
+/// 崩溃报告诊断：认识几类高置信度的原因，认不出来就返回空。
+pub mod crash;
 pub mod curseforge;
 pub mod dates;
 pub mod download;

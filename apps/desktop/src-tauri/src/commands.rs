@@ -1102,7 +1102,11 @@ pub fn reset_instance(
     crate::versions::reset_instance(&crate::game_folders::current(&paths), &id)
 }
 
-/// 补全文件：把基础版本缺的客户端、库、资源重新校验并下回来。
+/// 补全文件：把缺的客户端、库、资源重新校验并下回来。
+///
+/// 实例 json 是装好后合并过的自包含文件（客户端、加载器库、assetIndex 都在里面），
+/// 所以实例本身单独补一遍；加载器库就写在实例的 libraries 里，不补这一遍的话
+/// Forge/Fabric 的库丢了会一直启动失败。基础版本再补一遍，管两边共用的那些。
 #[tauri::command]
 pub async fn repair_instance_files(
     app: AppHandle,
@@ -1110,8 +1114,6 @@ pub async fn repair_instance_files(
     id: String,
 ) -> Result<launcher_core::download::InstallSummary, String> {
     let game_dir = crate::game_folders::current(&paths);
-    let base = crate::versions::load_instance(&game_dir, &id);
-    let _ = base;
     let meta = crate::version_meta::describe_all(&game_dir, std::slice::from_ref(&id))
         .remove(&id)
         .unwrap_or_default();
@@ -1121,18 +1123,87 @@ pub async fn repair_instance_files(
     let strategy = sync_global_strategy(&paths);
     let dir = game_dir.to_string_lossy().into_owned();
     tauri::async_runtime::spawn_blocking(move || {
-        let emitter = app.clone();
-        launcher_core::download::install_profile_assets(
-            &dir,
-            &base_version,
-            strategy,
-            None,
-            CancellationToken::default(),
-            move |progress: InstallProgress| {
-                let _ = emitter.emit("install-progress", &progress);
-            },
+        // 实例 json 有的字段决定能不能单独补：缺 assetIndex 的老增量 profile 只能补库。
+        let metadata = std::fs::read_to_string(
+            std::path::Path::new(&dir)
+                .join("versions")
+                .join(&id)
+                .join(format!("{id}.json")),
         )
-        .map_err(|e| e.to_string())
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let has_client = metadata
+            .as_ref()
+            .is_some_and(|value| value.pointer("/downloads/client").is_some());
+        let has_index = metadata
+            .as_ref()
+            .is_some_and(|value| value.pointer("/assetIndex/id").is_some());
+        let mut targets: Vec<(&str, bool)> = Vec::new();
+        if has_client && has_index {
+            targets.push((id.as_str(), false));
+        } else if metadata.is_some() {
+            targets.push((id.as_str(), true));
+        }
+        if base_version != id {
+            targets.push((base_version.as_str(), false));
+        }
+        let mut total: Option<launcher_core::download::InstallSummary> = None;
+        for (target, libraries_only) in targets {
+            let emitter = app.clone();
+            let emit = move |progress: InstallProgress| {
+                let _ = emitter.emit("install-progress", &progress);
+            };
+            let summary = if libraries_only {
+                launcher_core::download::install_profile_libraries(
+                    &dir,
+                    target,
+                    strategy,
+                    None,
+                    CancellationToken::default(),
+                    emit,
+                )
+            } else {
+                launcher_core::download::install_profile_assets(
+                    &dir,
+                    target,
+                    strategy,
+                    None,
+                    CancellationToken::default(),
+                    emit,
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            total = Some(match total {
+                None => summary,
+                Some(mut summed) => {
+                    summed.downloaded_files += summary.downloaded_files;
+                    summed.skipped_files += summary.skipped_files;
+                    summed.downloaded_bytes += summary.downloaded_bytes;
+                    summed
+                }
+            });
+        }
+        total.ok_or_else(|| "这个实例没有可补的文件".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 诊断一份崩溃报告：把原文里认得出来的原因翻成人话，认不出来就返回空。
+#[tauri::command]
+pub async fn diagnose_crash_report(
+    dir: String,
+    file: String,
+) -> Result<Vec<launcher_core::crash::Diagnosis>, String> {
+    // 只收文件名：面板传进来的就是列表里那一项，别让它顺手读到外面去。
+    if file.is_empty() || file.contains(['/', '\\']) || file == "." || file == ".." {
+        return Err("文件名不合法".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::Path::new(&dir).join(&file);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(launcher_core::crash::diagnose(&text))
     })
     .await
     .map_err(|e| e.to_string())?

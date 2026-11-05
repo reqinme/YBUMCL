@@ -26,6 +26,7 @@
   import {
     api,
     type CategorySnapshot,
+    type CrashDiagnosis,
     type EntryInfo,
     type JavaInstallation,
     type ModEntry,
@@ -71,6 +72,9 @@
   let servers = $state<ServerEntry[]>([]);
   /// 点开的文本文件内容（日志、崩溃报告）。
   let textView = $state<{ title: string; body: string } | null>(null);
+  /// 崩溃报告 tab 顶部那份诊断：看的是哪份文件、认出了什么。
+  let crashDiag = $state<{ file: string; items: CrashDiagnosis[] } | null>(null);
+  let diagBusy = $state(false);
   let shots = $state<Record<string, string>>({});
   let exporting = $state(false);
 
@@ -1142,6 +1146,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     try {
       const body = await api.readTextFile(path);
       textView = { title: name, body };
+      if (tab === "crashes") void diagnoseCrash(name);
     } catch (error) {
       showError("打开文件失败", path, String(error));
     }
@@ -1164,6 +1169,34 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     textView = null;
     if (next === "servers") await loadServers();
     if (next in SUB_DIRS) await loadEntries(next);
+    if (next === "crashes") await diagnoseNewest();
+  }
+
+  /// 崩溃报告目录里最新的一份，装完崩溃后点进来就能看到结论。
+  async function diagnoseNewest() {
+    const list = (entries.crashes ?? []).filter((item) => !item.dir);
+    if (list.length === 0) {
+      crashDiag = null;
+      return;
+    }
+    const newest = list.reduce((a, b) => (b.modifiedMs > a.modifiedMs ? b : a));
+    await diagnoseCrash(newest.name);
+  }
+
+  /// 让后端看一份报告。认不出原因就只显示原文，不硬编一个结论。
+  async function diagnoseCrash(name: string) {
+    const dir = subPath("crashes");
+    if (!dir) return;
+    diagBusy = true;
+    crashDiag = { file: name, items: [] };
+    try {
+      crashDiag = { file: name, items: await api.diagnoseCrashReport(dir, name) };
+    } catch (error) {
+      crashDiag = null;
+      showError("诊断失败", name, String(error));
+    } finally {
+      diagBusy = false;
+    }
   }
 
   async function exportZip() {
@@ -1934,6 +1967,28 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       {#if (entries[tab] ?? []).length === 0}
         <p class="dim">{tab === "logs" ? "还没有日志。" : "还没有崩溃报告。"}</p>
       {:else}
+        {#if tab === "crashes" && crashDiag}
+          <div class="diag">
+            <p class="diag-file mono">{crashDiag.file}</p>
+            {#if diagBusy}
+              <p class="dim">正在看这份报告…</p>
+            {:else if crashDiag.items.length === 0}
+              <p class="dim">这份报告里没有认出常见原因，原文在下面。</p>
+            {:else}
+              {#each crashDiag.items as item (item.key)}
+                <div class="diag-item">
+                  <strong>{item.title}</strong>
+                  <p>{item.detail}</p>
+                  <ul>
+                    {#each item.advice as line}
+                      <li>{line}</li>
+                    {/each}
+                  </ul>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        {/if}
         <div class="files">
           {#each entries[tab] ?? [] as file (file.name)}
             <button class="file" onclick={() => void openText(file.name)}>
@@ -2144,6 +2199,35 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     display: flex;
     flex-direction: column;
     gap: 4px;
+  }
+  .diag {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(8, 10, 14, 0.35);
+    font-size: 13px;
+  }
+  .diag-file {
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .diag-item strong {
+    font-weight: 600;
+  }
+  .diag-item p {
+    margin: 4px 0 6px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+  .diag-item ul {
+    margin: 0;
+    padding-left: 18px;
+    color: var(--text-dim);
+    line-height: 1.7;
   }
   .file {
     display: flex;

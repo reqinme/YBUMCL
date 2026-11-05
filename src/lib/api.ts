@@ -250,6 +250,18 @@ export type InstallSummary = {
   downloadedBytes: number;
 };
 
+/// 崩溃报告里认出的一条原因。
+export type CrashDiagnosis = {
+  /// 规则标识（同一份报告里不重复）。
+  key: string;
+  /// 一句话结论。
+  title: string;
+  /// 依据。
+  detail: string;
+  /// 建议。
+  advice: string[];
+};
+
 export type InstallRequest = {
   gameDir: string;
   versionId: string;
@@ -433,6 +445,9 @@ export const api = {
     invoke<VersionSettings>("reset_instance", { id }),
   repairInstanceFiles: (id: string) =>
     invoke<InstallSummary>("repair_instance_files", { id }),
+  /// 诊断一份崩溃报告；认不出原因时返回空数组。
+  diagnoseCrashReport: (dir: string, file: string) =>
+    invoke<CrashDiagnosis[]>("diagnose_crash_report", { dir, file }),
   /// 选一个 jar/zip，把里面的文件合并进实例的客户端核心；返回合并的条目数。
   patchInstanceCore: (id: string) => invoke<number>("patch_instance_core", { id }),
   /// 重置前把 `<实例>.json` / `<实例>.jar` 备份到 versions\install-backups，返回备份目录。
