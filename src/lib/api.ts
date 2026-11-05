@@ -162,6 +162,22 @@ export type JavaInstallation = {
   path: string;
   version: string;
   major: number;
+  /// 64 位还是 32 位（读 java.exe 的 PE 头）。
+  is64: boolean;
+  /// 只有运行时没有 javac。
+  isJre: boolean;
+  /// `java -version` 里 `(build 17.0.20+8-LTS)` 的括号内容。
+  revision: string | null;
+};
+
+export type JavaCheck = {
+  required: string;
+  accepted: boolean;
+  ignored: boolean;
+  currentPath: string | null;
+  currentMajor: number | null;
+  suggestedPath: string | null;
+  suggestedMajor: number | null;
 };
 
 export type JavaPlan = {
@@ -428,7 +444,16 @@ export const api = {
     invoke<void>("delete_version", { id, permanent }),
   openVersionFolder: (id: string, which: "root" | "mods" | "saves" = "root") =>
     invoke<void>("open_version_folder", { id, which }),
-  launchVersion: (id: string) => invoke<number>("launch_version", { id }),
+  /// `java` 是一次性指定的 Java 路径（弹窗里选「改用 Java 21」时用），
+  /// `ignoreJava` 为真时照旧用当前这套启动、不做兼容性检查。
+  launchVersion: (id: string, options?: { java?: string | null; ignoreJava?: boolean }) =>
+    invoke<number>("launch_version", {
+      id,
+      java: options?.java ?? null,
+      ignoreJava: options?.ignoreJava ?? null,
+    }),
+  /// 启动前的 Java 兼容性检查，结果交给界面弹窗。
+  checkJava: (id: string) => invoke<JavaCheck>("check_java", { id }),
   defaultGameDir: () => invoke<string>("default_game_dir"),
   versionIcon: (id: string) => invoke<string | null>("version_icon", { id }),
   setVersionIcon: (id: string, icon: string) =>
@@ -488,7 +513,8 @@ export const api = {
   /// 把旧版存在 localStorage 里的星标并进 categories.json。
   importStarred: (versions: string[]) =>
     invoke<CategorySnapshot>("import_starred", { versions }),
-  detectJava: () => invoke<JavaInstallation[]>("detect_java"),
+  detectJava: (force = false) =>
+    invoke<JavaInstallation[]>("detect_java", { force }),
   planJava: (
     gameVersion: string,
     loader?: string,

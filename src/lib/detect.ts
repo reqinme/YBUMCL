@@ -110,7 +110,7 @@ export async function cachedJava(force = false): Promise<Cached<JavaInstallation
     const cached = hit(javaCache, JAVA_TTL);
     if (cached) return cached;
   }
-  const value = await api.detectJava();
+  const value = await api.detectJava(force);
   javaCache = { at: Date.now(), value };
   return { value, ageMs: 0, fromCache: false };
 }

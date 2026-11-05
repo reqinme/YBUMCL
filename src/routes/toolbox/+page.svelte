@@ -89,8 +89,12 @@
     return Math.max(2, Math.round((bytes / maxBytes) * 100));
   }
 
+  /// `Java 17 · 17.0.20 · 64 位 · JRE`：位数和 JRE 是给选 Java 的人看的，
+  /// 32 位或 JRE 都可能让整合包装不上/起不来。
   function javaLabel(java: JavaInstallation): string {
-    return `Java ${java.major} · ${java.version}`;
+    const bits = java.is64 ? "64 位" : "32 位";
+    const kind = java.isJre ? "JRE" : "JDK";
+    return `Java ${java.major} · ${java.version} · ${bits} · ${kind}`;
   }
 
   function cleanPath(path: string): string {

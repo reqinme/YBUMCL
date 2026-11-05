@@ -833,6 +833,8 @@ fn launch_request(
     paths: &crate::portable::Paths,
     game_dir: &Path,
     id: &str,
+    java_override: Option<&str>,
+    ignore_override: Option<bool>,
 ) -> Result<launcher_core::LaunchRequest, String> {
     let version = crate::versions::load_instance(game_dir, id);
     let global = crate::settings::load(paths);
@@ -843,7 +845,9 @@ fn launch_request(
         1 => version.memory_custom_mb.max(crate::versions::MIN_MEMORY_MB),
         _ => global.memory_mb,
     };
-    let java_path = if !version.java_path.is_empty() {
+    let java_path = if let Some(path) = java_override.filter(|path| !path.trim().is_empty()) {
+        path.to_owned()
+    } else if !version.java_path.is_empty() {
         version.java_path.clone()
     } else if version.java_auto {
         pick_java(id, None, game_dir)?
@@ -870,7 +874,8 @@ fn launch_request(
         }
         _ => {}
     }
-    if !version.ignore_java_warning {
+    let ignore_java = ignore_override.unwrap_or(version.ignore_java_warning);
+    if !ignore_java {
         let major = launcher_core::detect_java()
             .into_iter()
             .find(|java| java.path.replace('/', "\\").eq_ignore_ascii_case(&java_path))
@@ -974,7 +979,7 @@ fn plan_for(
     id: &str,
 ) -> Result<(launcher_core::LaunchPlan, String), String> {
     let game_dir = crate::game_folders::current(paths);
-    let request = launch_request(paths, &game_dir, id)?;
+    let request = launch_request(paths, &game_dir, id, None, None)?;
     let plan = launcher_core::build_launch_plan(request).map_err(|e| e.to_string())?;
     Ok((plan, game_dir.to_string_lossy().into_owned()))
 }
@@ -1361,8 +1366,10 @@ pub fn import_starred(
 }
 
 #[tauri::command]
-pub async fn detect_java() -> Result<Vec<JavaInstallation>, String> {
-    tauri::async_runtime::spawn_blocking(launcher_core::detect_java)
+pub async fn detect_java(force: Option<bool>) -> Result<Vec<JavaInstallation>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::detect_java_cached(force.unwrap_or(false))
+    })
         .await
         .map_err(|e| e.to_string())
 }
@@ -1659,6 +1666,68 @@ fn java_requirement(
     })
 }
 
+/// 启动前的 Java 兼容性检查。以前后端直接悄悄换一套，用户看不到「换过」；
+/// 现在把结论交给界面，由用户决定换还是照旧启动。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JavaCheck {
+    /// 「Java 21+」这种给人看的区间。
+    pub required: String,
+    pub accepted: bool,
+    /// 这个实例本来就勾了「忽略兼容性警告」。
+    pub ignored: bool,
+    pub current_path: Option<String>,
+    pub current_major: Option<u32>,
+    pub suggested_path: Option<String>,
+    pub suggested_major: Option<u32>,
+}
+
+#[tauri::command]
+pub async fn check_java(
+    paths: State<'_, crate::portable::Paths>,
+    id: String,
+) -> Result<JavaCheck, String> {
+    let paths = paths.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let game_dir = crate::game_folders::current(&paths);
+        let version = crate::versions::load_instance(&game_dir, &id);
+        let global = crate::settings::load(&paths);
+        let current = if !version.java_path.is_empty() {
+            Some(version.java_path.replace('/', "\\"))
+        } else if version.java_auto || global.java_path.is_empty() {
+            pick_java(&id, None, &game_dir).ok()
+        } else {
+            Some(global.java_path.replace('/', "\\"))
+        };
+        let requirement = java_requirement(&game_dir, &id);
+        let found = launcher_core::detect_java();
+        let major_of = |path: &str| -> Option<u32> {
+            found
+                .iter()
+                .find(|java| java.path.eq_ignore_ascii_case(path))
+                .map(|java| java.major)
+        };
+        let current_major = current.as_deref().and_then(major_of);
+        let accepted = version.ignore_java_warning
+            || current_major
+                .map(|major| requirement.accepts(major))
+                .unwrap_or(false);
+        let suggested = pick_java_for(requirement.clone()).ok();
+        let suggested_major = suggested.as_deref().and_then(major_of);
+        Ok(JavaCheck {
+            required: requirement.describe(),
+            accepted,
+            ignored: version.ignore_java_warning,
+            current_path: current,
+            current_major,
+            suggested_path: suggested,
+            suggested_major,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 没配 Java 时自动挑一个：区间内取最小的大版本，避免拿 Java 25 跑只支持 17 的版本。
 fn pick_java(
     version_id: &str,
@@ -1775,6 +1844,8 @@ fn repair_before_launch(
 #[tauri::command]
 pub async fn launch_version(
     id: String,
+    java: Option<String>,
+    ignore_java: Option<bool>,
     app: AppHandle,
     runtime: State<'_, GameRuntime>,
     paths: State<'_, crate::portable::Paths>,
@@ -1783,7 +1854,7 @@ pub async fn launch_version(
     let log_dir = paths.log_dir();
     let game_dir = crate::game_folders::current(&paths);
     let (request, strategy) = {
-        let request = launch_request(&paths, &game_dir, &id)?;
+        let request = launch_request(&paths, &game_dir, &id, java.as_deref(), ignore_java)?;
         let global = crate::settings::load(&paths);
         (
             request,

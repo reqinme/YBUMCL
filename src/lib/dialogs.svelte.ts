@@ -1,6 +1,8 @@
 // 全站只有一种「出错了」的展示：居中的错误弹窗。
 // 页面里的报错别再写行内小字，统一调 showError()。
 
+import type { JavaCheck } from "$lib/api";
+
 export type ErrorSource = "launcher" | "game";
 
 export type ErrorInfo = {
@@ -29,4 +31,27 @@ export function showError(title: string, message?: string, detail?: string, sour
 /** 关掉错误弹窗。 */
 export function closeError() {
   errorDialog.value = null;
+}
+
+/// Java 对不上时用户的选择：换用建议的一套、照旧用当前这套、或者不启动。
+export type JavaChoice = "suggested" | "ignore";
+
+export const javaPrompt = $state<{
+  value: { check: JavaCheck; resolve: (choice: JavaChoice | null) => void } | null;
+}>({ value: null });
+
+/** 问用户「这个实例要 Java 21，现在这套是 17，怎么启动」。 */
+export function askJava(check: JavaCheck): Promise<JavaChoice | null> {
+  // 同一时间只留一个：前一个当作取消，免得 Promise 永远挂着。
+  javaPrompt.value?.resolve(null);
+  return new Promise((resolve) => {
+    javaPrompt.value = { check, resolve };
+  });
+}
+
+/** 弹窗给出答案后调用；`null` 表示取消启动。 */
+export function answerJava(choice: JavaChoice | null) {
+  const current = javaPrompt.value;
+  javaPrompt.value = null;
+  current?.resolve(choice);
 }

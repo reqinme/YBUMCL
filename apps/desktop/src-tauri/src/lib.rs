@@ -95,6 +95,7 @@ pub fn run() {
             commands::set_version_categories,
             commands::set_starred,
             commands::import_starred,
+            commands::check_java,
             commands::detect_java,
             commands::plan_java,
             commands::memory_info,

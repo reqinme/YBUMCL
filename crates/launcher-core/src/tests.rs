@@ -1717,3 +1717,13 @@ fn modlauncher_entry_points_are_allowed() {
     assert!(supported_main("net.minecraft.launchwrapper.Launch"));
     assert!(!supported_main("com.example.Evil"));
 }
+
+#[test]
+fn build_revision_comes_from_the_parentheses() {
+    let text = "openjdk version \"17.0.20\" 2025-01-21\nOpenJDK Runtime Environment (build 17.0.20+8-LTS)";
+    assert_eq!(build_revision(text), Some("17.0.20+8-LTS".to_owned()));
+    // 老 8 的版本串没有 build 括号，别硬编一个出来。
+    let old = "java version \"1.8.0_503\"\nJava(TM) SE Runtime Environment (build 1.8.0_503-b09)";
+    assert_eq!(build_revision(old), Some("1.8.0_503-b09".to_owned()));
+    assert_eq!(build_revision("java version \"1.8.0_503\""), None);
+}

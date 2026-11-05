@@ -6,6 +6,7 @@
   import Island from "./Island.svelte";
   import TaskRing from "./TaskRing.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
+  import JavaChoiceDialog from "./JavaChoiceDialog.svelte";
   import avatarOffline from "$lib/assets/avatar-offline.png";
   import { settingsLive } from "$lib/settings-live.svelte";
   import { canGoBackPage, goBackPage, rememberPage } from "$lib/page-history.svelte";
@@ -152,6 +153,7 @@
 
 
 <ErrorDialog />
+<JavaChoiceDialog />
 
 <style>
   .nav {

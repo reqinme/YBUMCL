@@ -11,6 +11,7 @@ use std::{
     io::{self, Write},
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::Mutex,
 };
 use thiserror::Error;
 
@@ -95,6 +96,15 @@ pub struct JavaInstallation {
     pub path: String,
     pub version: String,
     pub major: u32,
+    /// 64 位还是 32 位：32 位 Java 只能给 2 GB 内存，装整合包容易直接 OOM。
+    #[serde(default)]
+    pub is_64: bool,
+    /// 只有运行时没有 javac。PCL 安装 Forge 时会要求 JDK，这里用来提前说清楚。
+    #[serde(default)]
+    pub is_jre: bool,
+    /// `java -version` 里 `(build 17.0.20+8-LTS)` 的括号内容，没有就是 None。
+    #[serde(default)]
+    pub revision: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -477,6 +487,52 @@ pub fn scan_versions(game_dir: &Path) -> Result<Vec<VersionSummary>> {
     Ok(result)
 }
 
+/// `java -version` 里的 `(build 8.0.503)` / `(build 17.0.20+8-LTS)`。
+fn build_revision(text: &str) -> Option<String> {
+    let start = text.find("(build ")? + "(build ".len();
+    let rest = &text[start..];
+    let end = rest.find(')')?;
+    let value = rest[..end].trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// 读 PE 头判断位数：`java.exe` 是 PE 文件，Machine 字段 0x8664/0xAA64 是 64 位。
+/// 直接读文件比再跑一次 `java -XshowSettings` 便宜得多，也不用多等一个进程。
+fn is_64_bit(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = fs::File::open(path) else {
+            return false;
+        };
+        let mut dos = [0u8; 0x40];
+        if file.read_exact(&mut dos).is_err() {
+            return false;
+        }
+        let offset = u32::from_le_bytes([dos[0x3c], dos[0x3d], dos[0x3e], dos[0x3f]]) as u64;
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return false;
+        }
+        let mut pe = [0u8; 6];
+        if file.read_exact(&mut pe).is_err() || &pe[..4] != b"PE\0\0" {
+            return false;
+        }
+        let machine = u16::from_le_bytes([pe[4], pe[5]]);
+        matches!(machine, 0x8664 | 0xAA64)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// JDK 的 `bin` 里有 `javac`，JRE 没有。老版本 8 的 JRE 也是这么分的。
+fn javac_beside(path: &Path) -> bool {
+    let name = if cfg!(windows) { "javac.exe" } else { "javac" };
+    path.parent().map(|dir| dir.join(name).is_file()).unwrap_or(false)
+}
+
 /// 单个 Java 探测的超时：JVM 正常启动不到 1 秒，卡住的多半是坏安装或网络盘。
 const JAVA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
@@ -538,10 +594,36 @@ fn java_version(path: &Path) -> Option<JavaInstallation> {
         first
     };
     Some(JavaInstallation {
-        path: path.to_string_lossy().into(),
+        // 候选路径是拼字符串出来的（`bin/java.exe`），可能是混着 `/` 的形式；
+        // 设置里存的、界面上显示的都得是同一个写法，否则按路径查大版本永远对不上。
+        path: path
+            .to_string_lossy()
+            .replace('/', std::path::MAIN_SEPARATOR_STR)
+            .into(),
+        revision: build_revision(&text),
+        is_64: is_64_bit(path),
+        is_jre: !javac_beside(path),
         version,
         major,
     })
+}
+
+/// 目录联接（junction）和符号链接会让「逐层下钻」绕回自己；Windows 的 junction
+/// 不是 symlink，得看 FILE_ATTRIBUTE_REPARSE_POINT。
+fn is_reparse_point(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return fs::symlink_metadata(path)
+            .map(|meta| meta.file_attributes() & 0x400 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    {
+        fs::symlink_metadata(path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+    }
 }
 
 /// 常见的 JRE/JDK 安装位置。用户机器上往往装了 Zulu / Temurin / Oracle 好几套，
@@ -592,6 +674,9 @@ fn java_candidates() -> Vec<PathBuf> {
             };
             for entry in entries.flatten() {
                 let dir = entry.path();
+                if is_reparse_point(&dir) {
+                    continue;
+                }
                 paths.insert(dir.join(java_exe));
                 paths.insert(dir.join("bin/java.exe"));
             }
@@ -611,6 +696,9 @@ fn java_candidates() -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
+            if is_reparse_point(&dir) {
+                continue;
+            }
             paths.insert(dir.join(java_exe));
             if let Ok(platforms) = fs::read_dir(&dir) {
                 for platform in platforms.flatten() {
@@ -627,8 +715,35 @@ fn java_candidates() -> Vec<PathBuf> {
     paths.into_iter().filter(|p| p.is_file()).collect()
 }
 
-/// 并行探测候选，避免一串 `java -version` 把界面堵住。
+/// 探测结果缓存：一次探测要起十几个进程、每个最多 1.5 秒，而启动一个实例
+/// 内部会连着问三四次。60 秒足够挡掉重复劳动，又不会让「刚装完 JDK」看起来没生效。
+static JAVA_CACHE: Mutex<Option<(std::time::Instant, Vec<JavaInstallation>)>> = Mutex::new(None);
+const JAVA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub fn detect_java() -> Vec<JavaInstallation> {
+    detect_java_cached(false)
+}
+
+/// `force` 为真时跳过缓存（工具页的「重新检测」用）。
+pub fn detect_java_cached(force: bool) -> Vec<JavaInstallation> {
+    let mut guard = match JAVA_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !force {
+        if let Some((stamp, found)) = guard.as_ref() {
+            if stamp.elapsed() < JAVA_CACHE_TTL {
+                return found.clone();
+            }
+        }
+    }
+    let found = scan_java();
+    *guard = Some((std::time::Instant::now(), found.clone()));
+    found
+}
+
+/// 并行探测候选，避免一串 `java -version` 把界面堵住。
+fn scan_java() -> Vec<JavaInstallation> {
     let candidates = java_candidates();
     // 一起开：每个探测都有 1.5 秒上限，最坏也就等一轮，不会因为某个坏 Java 拖成串行。
     let probes: Vec<_> = candidates
