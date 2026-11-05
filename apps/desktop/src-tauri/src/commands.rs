@@ -835,11 +835,38 @@ fn launch_request(
     id: &str,
     java_override: Option<&str>,
     ignore_override: Option<bool>,
+    with_account: bool,
 ) -> Result<launcher_core::LaunchRequest, String> {
     let version = crate::versions::load_instance(game_dir, id);
     let global = crate::settings::load(paths);
-    // 实例里的玩家名已取消，统一用全局设置里那个。
-    let username = global.username.clone();
+    // 账户页里选中的那个人；没选账户时退回设置里的玩家名（老行为）。
+    let mut store = launcher_core::auth::Store::load(paths.data_dir());
+    let mut account = if with_account {
+        store.current().cloned()
+    } else {
+        None
+    };
+    if let Some(player) = account.as_mut() {
+        if player.kind == launcher_core::auth::AccountKind::Microsoft {
+            launcher_core::auth::ensure_fresh(player)
+                .map_err(|error| format!("微软账户「{}」的登录状态不能用了：{error}", player.name))?;
+            // 续期换来的新令牌要写回账户表，否则下次还得再续一遍。
+            if let Some(saved) = store.players.iter_mut().find(|saved| saved.id == player.id) {
+                saved.access = player.access.clone();
+                saved.access_expires = player.access_expires;
+                saved.refresh = player.refresh.clone();
+                saved.avatar = player.avatar.clone();
+                let _ = store.save(paths.data_dir());
+            }
+        }
+    }
+    let microsoft = account
+        .as_ref()
+        .is_some_and(|player| player.kind == launcher_core::auth::AccountKind::Microsoft);
+    let username = account
+        .as_ref()
+        .map(|player| player.name.clone())
+        .unwrap_or_else(|| global.username.clone());
     let memory = match version.memory_type {
         0 => auto_memory_mb(game_dir, id, version.isolated, memory_info_now()),
         1 => version.memory_custom_mb.max(crate::versions::MIN_MEMORY_MB),
@@ -860,15 +887,15 @@ fn launch_request(
     // 后面按路径找 Java 大版本时就会找不到、跳过区间校验。
     let mut java_path = java_path.replace('/', "\\");
     match version.login_require {
-        1 => {
+        1 if !microsoft => {
             return Err(
-                "这个实例限了「仅正版」，启动器现在只有离线身份，把「限制验证方式」改成不限制或仅离线模式才能启动。"
+                "这个实例限了「仅正版」：先去「账户」页登录一个微软账户并选中它，再启动。"
                     .into(),
             )
         }
         3 => {
             return Err(
-                "这个实例限了「仅第三方登录」，现在还没有第三方登录账户，把「限制验证方式」改成不限制或仅离线模式才能启动。"
+                "这个实例限了「仅第三方登录」，第三方认证服务器（authlib-injector）还没接，暂时只能把它改成不限制或仅离线模式。"
                     .into(),
             )
         }
@@ -946,8 +973,11 @@ fn launch_request(
         } else {
             0
         },
-        access_token: None,
-        uuid: None,
+        access_token: account
+            .as_ref()
+            .filter(|player| player.kind == launcher_core::auth::AccountKind::Microsoft)
+            .and_then(|player| player.access.clone()),
+        uuid: account.as_ref().map(|player| player.uuid.clone()),
         version_type: Some(version.version_type.clone()).filter(|text| !text.trim().is_empty()),
         jvm_args: split_args(&version.jvm_args),
         game_args,
@@ -979,7 +1009,8 @@ fn plan_for(
     id: &str,
 ) -> Result<(launcher_core::LaunchPlan, String), String> {
     let game_dir = crate::game_folders::current(paths);
-    let request = launch_request(paths, &game_dir, id, None, None)?;
+    // 导出的 .bat 不写访问令牌：脚本会留在磁盘上，令牌只该留在启动器里。
+    let request = launch_request(paths, &game_dir, id, None, None, false)?;
     let plan = launcher_core::build_launch_plan(request).map_err(|e| e.to_string())?;
     Ok((plan, game_dir.to_string_lossy().into_owned()))
 }
@@ -1853,18 +1884,26 @@ pub async fn launch_version(
     let runtime = runtime.inner().clone();
     let log_dir = paths.log_dir();
     let game_dir = crate::game_folders::current(&paths);
-    let (request, strategy) = {
-        let request = launch_request(&paths, &game_dir, &id, java.as_deref(), ignore_java)?;
-        let global = crate::settings::load(&paths);
-        (
-            request,
-            strategy_of(global.download_strategy.as_deref()),
-        )
-    };
+    // 拼启动请求要读账户、必要时联网续期令牌，放进阻塞线程里做，别卡界面。
+    let paths_for_request = (*paths).clone();
+    let request_id = id.clone();
     let launch_dir = game_dir.clone();
     let pre_dir = launch_dir.clone();
     let launch_id = id.clone();
     let launched = tauri::async_runtime::spawn_blocking(move || {
+        let request = launch_request(
+            &paths_for_request,
+            &game_dir,
+            &request_id,
+            java.as_deref(),
+            ignore_java,
+            true,
+        )?;
+        let strategy = strategy_of(
+            crate::settings::load(&paths_for_request)
+                .download_strategy
+                .as_deref(),
+        );
         let version_id = request.version_id.clone();
         let repair_request = request.clone();
         let plan = match launcher_core::build_launch_plan(request) {
@@ -3240,6 +3279,163 @@ pub fn save_settings(
         saved.download_speed,
     ));
     Ok(saved)
+}
+
+// ---------------------------------------------------------------- 账户
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsView {
+    pub players: Vec<launcher_core::auth::Account>,
+    pub current: Option<String>,
+}
+
+/// 读账户表；空表时把老设置里那个玩家名转成一个离线账户，避免升级后「一个账户都没有」。
+fn accounts_store(paths: &crate::portable::Paths) -> launcher_core::auth::Store {
+    let mut store = launcher_core::auth::Store::load(paths.data_dir());
+    if store.players.is_empty() {
+        let name = crate::settings::load(paths).username;
+        if store.add_offline(&name).is_ok() {
+            let _ = store.save(paths.data_dir());
+        }
+    }
+    store
+}
+
+fn accounts_view(store: &launcher_core::auth::Store) -> AccountsView {
+    AccountsView {
+        players: store.players.clone(),
+        current: store.current.clone(),
+    }
+}
+
+#[tauri::command]
+pub fn list_accounts(paths: State<'_, Paths>) -> Result<AccountsView, String> {
+    Ok(accounts_view(&accounts_store(&paths)))
+}
+
+#[tauri::command]
+pub fn add_offline_account(paths: State<'_, Paths>, name: String) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    let id = store.add_offline(&name)?;
+    store
+        .select(&id)
+        .map_err(|error| error.to_string())?;
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
+#[tauri::command]
+pub fn rename_account(
+    paths: State<'_, Paths>,
+    id: String,
+    name: String,
+) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    store.rename(&id, &name)?;
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
+#[tauri::command]
+pub fn remove_account(paths: State<'_, Paths>, id: String) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    store.remove(&id);
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
+#[tauri::command]
+pub fn select_account(paths: State<'_, Paths>, id: String) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    store.select(&id)?;
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
+/// 微软登录一轮的结果：界面按 `state` 决定继续轮询还是收工。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsLogin {
+    pub state: String,
+    pub error: Option<String>,
+    pub accounts: Option<AccountsView>,
+}
+
+#[tauri::command]
+pub async fn ms_login_start() -> Result<launcher_core::auth::DeviceCode, String> {
+    tauri::async_runtime::spawn_blocking(launcher_core::auth::start_device_code)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn ms_login_poll(
+    paths: State<'_, Paths>,
+    device_code: String,
+) -> Result<MsLogin, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let polled = launcher_core::auth::poll_device_code(&device_code)?;
+        Ok::<_, String>(match polled {
+            launcher_core::auth::Poll::Pending => MsLogin {
+                state: "pending".into(),
+                error: None,
+                accounts: None,
+            },
+            launcher_core::auth::Poll::Failed(error) => MsLogin {
+                state: "failed".into(),
+                error: Some(error),
+                accounts: None,
+            },
+            launcher_core::auth::Poll::Done(account) => {
+                let mut store = launcher_core::auth::Store::load(&data_dir);
+                store.absorb(*account);
+                store
+                    .save(&data_dir)
+                    .map_err(|error| format!("账户表写不进去：{error}"))?;
+                MsLogin {
+                    state: "done".into(),
+                    error: None,
+                    accounts: Some(accounts_view(&store)),
+                }
+            }
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 手动续期当前账户（比如启动器开着放了一夜）。
+#[tauri::command]
+pub async fn refresh_account(
+    paths: State<'_, Paths>,
+    id: String,
+) -> Result<AccountsView, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = launcher_core::auth::Store::load(&data_dir);
+        let account = store
+            .players
+            .iter_mut()
+            .find(|player| player.id == id)
+            .ok_or_else(|| "找不到这个账户。".to_string())?;
+        launcher_core::auth::refresh(account)?;
+        store
+            .save(&data_dir)
+            .map_err(|error| format!("账户表写不进去：{error}"))?;
+        Ok::<_, String>(accounts_view(&store))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ---------------------------------------------------------------- 模组

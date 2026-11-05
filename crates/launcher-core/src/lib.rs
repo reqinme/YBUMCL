@@ -15,6 +15,8 @@ use std::{
 };
 use thiserror::Error;
 
+/// 账户：离线档案与微软（设备代码）登录。
+pub mod auth;
 pub mod cleanroom;
 /// 崩溃报告诊断：认识几类高置信度的原因，认不出来就返回空。
 pub mod crash;

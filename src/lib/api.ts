@@ -432,6 +432,40 @@ export type ModUpdate = {
   canUpdate: boolean;
 };
 
+
+/// 账户：离线档案（名字即身份）和微软账户（登录后拿到的档案）。
+export type AccountKind = "offline" | "microsoft";
+
+export type Account = {
+  id: string;
+  name: string;
+  uuid: string;
+  kind: AccountKind;
+  /// `data:image/png;base64,…`，离线账户没有。
+  avatar: string | null;
+};
+
+export type AccountsView = {
+  players: Account[];
+  current: string | null;
+};
+
+/// 设备代码登录：把 userCode + verificationUri 显示给用户。
+export type DeviceCode = {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  interval: number;
+  expiresIn: number;
+  message: string;
+};
+
+export type MsLogin = {
+  state: "pending" | "done" | "failed";
+  error: string | null;
+  accounts: AccountsView | null;
+};
+
 export const api = {
   info: () => invoke<LauncherInfo>("launcher_info"),
   listVersions: () => invoke<VersionView[]>("list_versions"),
@@ -896,6 +930,17 @@ export const api = {
   /// 删掉某条任务的产出；后端只认它自己这次产出过的路径。
   deleteOutput: (path: string) => invoke<void>("delete_output", { path }),
   pathExists: (path: string) => invoke<boolean>("path_exists", { path }),
+  listAccounts: () => invoke<AccountsView>("list_accounts"),
+  addOfflineAccount: (name: string) =>
+    invoke<AccountsView>("add_offline_account", { name }),
+  renameAccount: (id: string, name: string) =>
+    invoke<AccountsView>("rename_account", { id, name }),
+  removeAccount: (id: string) => invoke<AccountsView>("remove_account", { id }),
+  selectAccount: (id: string) => invoke<AccountsView>("select_account", { id }),
+  refreshAccount: (id: string) => invoke<AccountsView>("refresh_account", { id }),
+  msLoginStart: () => invoke<DeviceCode>("ms_login_start"),
+  msLoginPoll: (deviceCode: string) =>
+    invoke<MsLogin>("ms_login_poll", { deviceCode }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   /// 整合包一键安装：下载 → 读 manifest → 建实例 → 铺 mods/overrides。
   installModpack: (request: {

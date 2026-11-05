@@ -65,10 +65,6 @@
       <h2>游戏</h2>
       <div class="grid">
         <label>
-          <span>默认玩家名</span>
-          <input bind:value={settings.username} maxlength="16" />
-        </label>
-        <label>
           <span>默认内存 (MB)</span>
           <input type="number" min="512" max="32768" step="256" bind:value={settings.memoryMb} />
         </label>

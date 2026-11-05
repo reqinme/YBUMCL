@@ -14,7 +14,7 @@ md5 = "0.7"
 regex = "1"
 # 开 gzip/brotli：资源站（尤其 Modrinth/CurseForge）返回的 JSON 能小到四分之一，
 # 下载 CDN 上的压缩响应也省带宽。PCL 的 HttpClient 同样开了 AutomaticDecompression。
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls", "gzip", "brotli", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls", "gzip", "brotli", "deflate"] }
 sha1 = "0.10"
 sha2 = "0.10"
 flate2 = "1"
@@ -23,4 +23,4 @@ base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 # 删除模组时丢进回收站；非 Windows 直接删文件。
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_Security_Cryptography"] }
