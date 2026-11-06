@@ -10,11 +10,13 @@
     title?: string;
     /// 底部按钮区；不传就只有一个「关闭」。
     footer?: Snippet;
+    /// 宽弹窗：大图预览、光影配置这种要横向空间的。
+    wide?: boolean;
     onclose: () => void;
     children?: Snippet;
   }
 
-  let { open = false, title = "", footer, onclose, children }: Props = $props();
+  let { open = false, title = "", footer, wide = false, onclose, children }: Props = $props();
 </script>
 
 <svelte:window
@@ -30,6 +32,7 @@
   <div class="mask" role="presentation" onclick={onclose} onkeydown={() => {}}>
     <div
       class="dialog"
+      class:wide
       role="dialog"
       aria-modal="true"
       tabindex="-1"
@@ -58,6 +61,9 @@
     align-items: center;
     justify-content: center;
     background: rgba(0, 0, 0, 0.62);
+  }
+  .dialog.wide {
+    width: min(1040px, 94vw);
   }
   .dialog {
     display: flex;

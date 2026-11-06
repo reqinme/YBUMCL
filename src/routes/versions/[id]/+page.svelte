@@ -1311,17 +1311,25 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     for (const [name, info] of Object.entries(infos)) next[`${kind}:${name}`] = info;
     packInfo = next;
     packTick += 1;
-    for (const [name, info] of Object.entries(infos)) {
-      if (!info.url) continue;
-      const key = `${kind}:${name}`;
-      if (packIcons[key]) continue;
-      try {
-        const icon = await api.fetchIcon(info.url);
-        if (icon) packIcons = { ...packIcons, [key]: icon };
-      } catch {
-        // 拉不到就留首字母占位。
+    // 图标并发拉（6 个一批）：串行时 14 个包要等十几秒，看起来像是「图标很慢才出来」。
+    const queue = Object.entries(infos).filter(
+      ([name, info]) => info.url && !packIcons[`${kind}:${name}`]
+    );
+    const worker = async () => {
+      for (;;) {
+        const next = queue.shift();
+        if (!next) return;
+        const [name, info] = next;
+        const key = `${kind}:${name}`;
+        try {
+          const icon = await api.fetchIcon(info.url ?? "");
+          if (icon) packIcons = { ...packIcons, [key]: icon };
+        } catch {
+          // 拉不到就用 logo 占位。
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(6, queue.length) }, () => worker()));
   }
 
   function packInfoOf(kind: string, name: string): ModProjectInfo | undefined {
@@ -2767,7 +2775,12 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   }}
 />
 
-<Modal open={shotView !== null} title={shotView?.name ?? "截图"} onclose={() => (shotView = null)}>
+<Modal
+  open={shotView !== null}
+  wide
+  title={shotView?.name ?? "截图"}
+  onclose={() => (shotView = null)}
+>
   {#if shotView}
     <img class="shot-full" src={shotView.data} alt={shotView.name} />
   {/if}
@@ -2779,6 +2792,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 
 <Modal
   open={shaderConfig !== null}
+  wide
   title={shaderConfig ? `光影配置：${shaderConfig.pack}` : "光影配置"}
   onclose={() => (shaderConfig = null)}
 >
@@ -3730,7 +3744,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 10px 12px;
+    padding: 12px 14px;
     border-radius: 10px;
     border: 1px solid var(--border);
     background: rgb(255 255 255 / 0.04);
@@ -3761,7 +3775,13 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 6px;
+  }
+  .pack-text strong {
+    line-height: 1.35;
+  }
+  .pack-text small {
+    line-height: 1.35;
   }
   .pack-text strong,
   .pack-text small {
@@ -3819,7 +3839,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   }
   .shot-full {
     max-width: 100%;
-    max-height: 70vh;
+    max-height: 78vh;
     border-radius: 8px;
     display: block;
     margin: 0 auto;
