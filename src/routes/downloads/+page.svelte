@@ -2888,20 +2888,23 @@
 
     finishRestore();
     stateRestored = true;
-    // 实例页的模组「详情 / 下载 Mod」带着搜索词过来：落到模组分类直接搜，然后把参数抹掉。
+    // 实例页的「详情 / 下载」带着搜索词过来：落到对应分类直接搜，然后把参数抹掉。
     const preset = page.url.searchParams.get("mod");
     if (preset !== null) {
-      cat = "mods";
+      const wanted = page.url.searchParams.get("kind") ?? "";
+      const kindCat: Category =
+        wanted === "resourcepacks" ? "resourcepacks" : wanted === "shaders" ? "shaders" : "mods";
+      cat = kindCat;
       // 实例页带过来的上下文：游戏版本 / 加载器只用来收窄筛选，搜索词永远是显示名。
       const presetGame = page.url.searchParams.get("mc") ?? "";
       const presetLoader = page.url.searchParams.get("loader") ?? "";
-      mrFilters.mods = {
-        ...defaultFilters("mods"),
+      mrFilters[kindCat] = {
+        ...defaultFilters(kindCat),
         query: preset,
         game: presetGame,
-        loader: presetLoader
+        loader: kindCat === "mods" ? presetLoader : ""
       };
-      applyFiltersFor("mods");
+      applyFiltersFor(kindCat);
       await mrSearch();
       // 认领到项目时直接把详情打开（PCL 的 ResourceDetail）；认不到就停在搜索结果。
       const presetProject = page.url.searchParams.get("project") ?? "";
@@ -2925,7 +2928,7 @@
             downloads: 0,
             author: "",
             categories: [],
-            projectType: "mod",
+            projectType: MR_TYPES[kindCat] ?? "mod",
             loaders: [],
             gameVersions: [],
             chineseTitle: null

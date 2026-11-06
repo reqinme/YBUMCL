@@ -326,6 +326,8 @@ export type SaveEntry = {
   modifiedMs: number;
   size: number;
   icon: string | null;
+  seed: number | null;
+  playSeconds: number | null;
 };
 
 export type EntryInfo = {
@@ -587,6 +589,8 @@ export const api = {
   /// 把文件放进剪贴板（截图页「复制」）。
   copyFile: (gameDir: string, gameDirectory: string | null, subdir: string, name: string) =>
     invoke<void>("copy_file", { gameDir, gameDirectory, subdir, name }),
+  importFiles: (gameDir: string, gameDirectory: string | null, subdir: string, sources: string[]) =>
+    invoke<[number, number]>("import_files", { gameDir, gameDirectory, subdir, sources }),
   copySave: (gameDir: string, gameDirectory: string | null, name: string) =>
     invoke<void>("copy_save", { gameDir, gameDirectory, name }),
   pasteSave: (gameDir: string, gameDirectory: string | null) =>

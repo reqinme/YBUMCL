@@ -27,6 +27,10 @@ pub struct SaveEntry {
     pub size: u64,
     /// `icon.png` 的 data URL（存档预览图）。
     pub icon: Option<String>,
+    /// `Data.RandomSeed`，单机存档的世界种子。
+    pub seed: Option<i64>,
+    /// 游玩时长（秒），取 `stats/*.json` 里 `minecraft:play_time` 的最大值。
+    pub play_seconds: Option<u64>,
 }
 
 fn millis(time: std::io::Result<SystemTime>) -> u64 {
@@ -64,6 +68,36 @@ fn icon_data_url(save: &Path) -> Option<String> {
     Some(format!("data:image/png;base64,{encoded}"))
 }
 
+/// 游玩时长（秒）：`stats/*.json` 里 `minecraft:play_time` 的最大值，20 ticks = 1 秒。
+fn play_seconds(save: &Path) -> Option<u64> {
+    let dir = save.join("stats");
+    let entries = fs::read_dir(dir).ok()?;
+    let mut best = 0_u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(stats) = value.get("stats").and_then(|stats| stats.get("minecraft:custom")) else {
+            continue;
+        };
+        if let Some(ticks) = stats.get("minecraft:play_time").and_then(|ticks| ticks.as_u64()) {
+            best = best.max(ticks);
+        }
+    }
+    if best == 0 {
+        None
+    } else {
+        Some(best / 20)
+    }
+}
+
 /// 列 `saves/` 下的存档，按最后修改时间从新到旧。
 pub fn list(root: &Path) -> Vec<SaveEntry> {
     let mut items = Vec::new();
@@ -79,7 +113,7 @@ pub fn list(root: &Path) -> Vec<SaveEntry> {
         }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let (version, level_name) = read_level_dat(&path.join("level.dat"));
+        let (version, level_name, seed) = read_level_dat(&path.join("level.dat"));
         let modified = meta.modified().ok();
         items.push(SaveEntry {
             name,
@@ -89,6 +123,8 @@ pub fn list(root: &Path) -> Vec<SaveEntry> {
             modified_ms: millis(modified.ok_or(std::io::Error::other("no mtime"))),
             size: dir_size(&path),
             icon: icon_data_url(&path),
+            seed,
+            play_seconds: play_seconds(&path),
         });
     }
     items.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
@@ -96,21 +132,22 @@ pub fn list(root: &Path) -> Vec<SaveEntry> {
 }
 
 /// 从 `level.dat` 里抠 `Data.Version.Name` 和 `Data.LevelName`。
-fn read_level_dat(path: &PathBuf) -> (Option<String>, Option<String>) {
+fn read_level_dat(path: &PathBuf) -> (Option<String>, Option<String>, Option<i64>) {
     let Ok(bytes) = fs::read(path) else {
-        return (None, None);
+        return (None, None, None);
     };
     let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
     let mut data = Vec::new();
     if decoder.read_to_end(&mut data).is_err() {
-        return (None, None);
+        return (None, None, None);
     }
     let mut cursor = Cursor { data: &data, pos: 0 };
     let mut level_name = None;
     let mut version = None;
+    let mut seed = None;
     // 根节点：TAG_Compound(10) + 名字 + 载荷。
     if cursor.u8() != Some(10) {
-        return (None, None);
+        return (None, None, None);
     }
     cursor.skip_string();
     while let Some(kind) = cursor.u8() {
@@ -131,6 +168,23 @@ fn read_level_dat(path: &PathBuf) -> (Option<String>, Option<String>) {
                 };
                 match (inner, name.as_str()) {
                     (8, "LevelName") => level_name = cursor.string(),
+                    (4, "RandomSeed") => seed = cursor.i64(),
+                    (10, "WorldGenSettings") => {
+                        // 新版存档把种子放在 Data.WorldGenSettings.seed。
+                        while let Some(field) = cursor.u8() {
+                            if field == 0 {
+                                break;
+                            }
+                            let Some(field_name) = cursor.string() else {
+                                break;
+                            };
+                            if field == 4 && field_name == "seed" {
+                                seed = cursor.i64().or(seed);
+                            } else {
+                                cursor.skip_payload(field);
+                            }
+                        }
+                    }
                     (10, "Version") => {
                         while let Some(field) = cursor.u8() {
                             if field == 0 {
@@ -153,7 +207,7 @@ fn read_level_dat(path: &PathBuf) -> (Option<String>, Option<String>) {
             cursor.skip_payload(kind);
         }
     }
-    (version, level_name)
+    (version, level_name, seed)
 }
 
 struct Cursor<'a> {
@@ -180,6 +234,12 @@ impl Cursor<'_> {
     fn u32(&mut self) -> Option<u32> {
         self.take(4)
             .map(|slice| u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    }
+
+    fn i64(&mut self) -> Option<i64> {
+        self.take(8).map(|slice| {
+            i64::from_be_bytes([slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7]])
+        })
     }
 
     fn string(&mut self) -> Option<String> {
@@ -283,8 +343,9 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("level.dat");
         fs::write(&path, sample()).unwrap();
-        let (version, name) = read_level_dat(&path);
+        let (version, name, seed) = read_level_dat(&path);
         assert_eq!(version.as_deref(), Some("1.21.1"));
+        assert_eq!(seed, None);
         assert_eq!(name.as_deref(), Some("test"));
         let _ = fs::remove_dir_all(&dir);
     }

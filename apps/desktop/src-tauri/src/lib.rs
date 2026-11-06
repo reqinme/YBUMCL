@@ -1,4 +1,5 @@
 mod categories;
+mod clipboard_files;
 mod commands;
 mod favorites;
 mod game_folders;
@@ -91,6 +92,7 @@ pub fn run() {
             commands::quick_play_supported,
             commands::copy_save,
             commands::paste_save,
+            commands::import_files,
             commands::delete_entry,
             commands::copy_file,
             commands::list_accounts,

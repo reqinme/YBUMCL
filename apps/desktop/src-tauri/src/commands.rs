@@ -4331,19 +4331,42 @@ pub fn copy_save(game_dir: String, game_directory: Option<String>, name: String)
     if !path.is_dir() {
         return Err(format!("{} 已经不在了", path.display()));
     }
-    let script = format!(
-        "Set-Clipboard -Path '{}'",
-        path.to_string_lossy().replace('\'', "''")
-    );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .status()
-        .map_err(|error| format!("调用剪贴板失败：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("剪贴板没写进去".into())
+    crate::clipboard_files::set_files(&[path])
+}
+
+/// 把外部文件（资源包/光影包）拷进实例目录；同名文件跳过，返回 (导入数, 跳过数)。
+#[tauri::command]
+pub fn import_files(
+    game_dir: String,
+    game_directory: Option<String>,
+    subdir: String,
+    sources: Vec<String>,
+) -> Result<(usize, usize), String> {
+    if subdir != "resourcepacks" && subdir != "shaderpacks" {
+        return Err("这个目录不支持从文件安装".into());
     }
+    let runtime = runtime_of(game_dir, game_directory)?;
+    let target = runtime.join(&subdir);
+    std::fs::create_dir_all(&target).map_err(|error| format!("建目录失败：{error}"))?;
+    let mut imported = 0_usize;
+    let mut skipped = 0_usize;
+    for source in sources {
+        let path = std::path::PathBuf::from(&source);
+        let Some(name) = path.file_name().map(|value| value.to_string_lossy().into_owned()) else {
+            skipped += 1;
+            continue;
+        };
+        let dest = target.join(&name);
+        if dest.exists() {
+            skipped += 1;
+            continue;
+        }
+        match std::fs::copy(&path, &dest) {
+            Ok(_) => imported += 1,
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((imported, skipped))
 }
 
 /// 把剪贴板里的文件夹复制进 `saves/`，返回新存档的文件夹名。
@@ -4352,17 +4375,11 @@ pub fn paste_save(
     game_dir: String,
     game_directory: Option<String>,
 ) -> Result<Vec<String>, String> {
-    let script = "Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }";
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .map_err(|error| format!("读剪贴板失败：{error}"))?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let files = crate::clipboard_files::get_files()?;
     let runtime = runtime_of(game_dir, game_directory)?;
     let saves = runtime.join("saves");
     let mut imported = Vec::new();
-    for line in text.lines() {
-        let source = std::path::PathBuf::from(line.trim());
+    for source in files {
         if !source.is_dir() {
             continue;
         }
@@ -4447,19 +4464,7 @@ pub fn copy_file(game_dir: String, game_directory: Option<String>, subdir: Strin
     if !path.exists() {
         return Err(format!("{} 已经不在了", path.display()));
     }
-    let script = format!(
-        "Set-Clipboard -Path '{}'",
-        path.to_string_lossy().replace('\'', "''")
-    );
-    let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .status()
-        .map_err(|error| format!("调用剪贴板失败：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("剪贴板没写进去".into())
-    }
+    crate::clipboard_files::set_files(&[path])
 }
 
 fn instance_root_of(paths: &Paths, id: &str) -> Result<PathBuf, String> {

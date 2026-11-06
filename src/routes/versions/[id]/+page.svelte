@@ -124,8 +124,14 @@
   let packDetail = $state<{ kind: string; name: string; size: number } | null>(null);
   /// 存档详情弹窗。
   let saveDetail = $state<SaveEntry | null>(null);
+  let packQuery = $state("");
+  let packSelected = $state(new Set<string>());
+  let pendingPackDelete = $state<{ tab: string; name: string } | null>(null);
+  let pendingSaveDelete = $state<string | null>(null);
+  let shotView = $state<{ name: string; data: string } | null>(null);
   /// 光影配置弹窗：配置表 + 改过的值。
   let shaderConfig = $state<ShaderConfig | null>(null);
+  let shaderChoices = $state<Record<string, { value: string; label: string }[]>>({});
   let shaderBusy = $state(false);
   let shaderTab = $state(0);
   let shaderDraft = $state<Record<string, string>>({});
@@ -1296,7 +1302,8 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     if (unmet.length === 0) return;
     let infos: Record<string, ModProjectInfo> = {};
     try {
-      infos = await api.packProjects(gameDir, gameDirectory, kind, unmet);
+      const sub = kind === "shaders" ? "shaderpacks" : kind;
+      infos = await api.packProjects(gameDir, gameDirectory, sub, unmet);
     } catch {
       return;
     }
@@ -1350,6 +1357,72 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     void goto(`/downloads?${params.toString()}`);
   }
 
+  /// 游玩时长：秒 → 「12 小时 3 分」。
+  function playTimeText(seconds: number) {
+    if (seconds < 60) return `${Math.max(1, Math.round(seconds))} 秒`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes} 分钟`;
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest > 0 ? `${hours} 小时 ${rest} 分` : `${hours} 小时`;
+  }
+
+  /// 资源包/光影包列表：按搜索框过滤。
+  function packList(tab: string) {
+    const list = entries[tab] ?? [];
+    const query = packQuery.trim().toLowerCase();
+    if (!query) return list;
+    return list.filter((item) => item.name.toLowerCase().includes(query));
+  }
+
+  function togglePackPicked(key: string) {
+    const next = new Set(packSelected);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    packSelected = next;
+  }
+
+  function allPacksPicked(tab: string) {
+    const list = packList(tab);
+    return list.length > 0 && list.every((item) => packSelected.has(`${tab}:${item.name}`));
+  }
+
+  function toggleAllPacks(tab: string) {
+    if (allPacksPicked(tab)) {
+      packSelected = new Set();
+      return;
+    }
+    packSelected = new Set(packList(tab).map((item) => `${tab}:${item.name}`));
+  }
+
+  /// 从文件安装资源包/光影包；同名文件跳过（重复检测）。
+  async function installPackFiles(tab: string) {
+    if (!version) return;
+    const picked = await openFileDialog({
+      multiple: true,
+      filters: [{ name: tab === "shaders" ? "光影包" : "资源包", extensions: ["zip"] }]
+    });
+    const paths = (Array.isArray(picked) ? picked : picked ? [picked] : []).filter(
+      (item): item is string => typeof item === "string"
+    );
+    if (paths.length === 0) return;
+    busy = "import";
+    try {
+      const [imported, skipped] = await api.importFiles(
+        gameDir,
+        gameDirectory,
+        subPath(tab),
+        paths
+      );
+      announce(`安装 ${imported} 个${skipped ? `，${skipped} 个同名或失败被跳过` : ""}`);
+      await loadEntries(tab);
+    } catch (error) {
+      showError("从文件安装失败", "文件没有拷进目录。", String(error));
+    } finally {
+      busy = "";
+    }
+  }
+
   /// 打开一个光影的配置：没有 shaders.properties 就提示，不给编辑。
   async function openShaderConfig(pack: string) {
     if (!root) return;
@@ -1362,9 +1435,21 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       shaderConfig = config;
       shaderTab = 0;
       shaderDraft = {};
+      const choices: Record<string, { value: string; label: string }[]> = {};
       for (const screen of config.screens) {
-        for (const option of screen.options) shaderDraft[option.name] = option.current;
+        for (const option of screen.options) {
+          shaderDraft[option.name] = option.current;
+          const seen = new Set<string>();
+          const list: { value: string; label: string }[] = [];
+          for (const value of option.values) {
+            if (!value.id || seen.has(value.id)) continue;
+            seen.add(value.id);
+            list.push({ value: value.id, label: value.label });
+          }
+          choices[option.name] = list;
+        }
       }
+      shaderChoices = choices;
     } catch (error) {
       showError("读不到这个光影的配置", "包可能损坏，或者格式不受支持。", String(error));
     }
@@ -2368,7 +2453,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
               >
                 <button
                   class="shot-image"
-                  onclick={() => void api.revealPath(subPath("screenshots") + SEP + shot.name)}
+                  onclick={() => (shotView = { name: shot.name, data: shots[shot.name] })}
                 >
                   <img src={shots[shot.name]} alt={shot.name} />
                 </button>
@@ -2391,17 +2476,45 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           没装光影前置模组（Iris / Oculus / OptiFine / OptiFabric），光影包装了也用不了。
         </div>
       {/if}
+      <div class="mods-head">
+        <input class="mods-search" placeholder="搜索名称、描述或标签" bind:value={packQuery} />
+        <div class="mods-tools">
+          <button class="btn" onclick={() => void openSub(tab)}>打开文件夹</button>
+          <button
+            class="btn"
+            disabled={busy !== ""}
+            onclick={() => void installPackFiles(tab)}>从文件安装</button
+          >
+          <button class="btn" onclick={() => goto(`/downloads?kind=${tab}&mod=`)}>
+            下载{tab === "shaders" ? "光影包" : "资源包"}
+          </button>
+          <button class="btn" onclick={() => toggleAllPacks(tab)}>
+            {allPacksPicked(tab) ? "取消全选" : "全选"}
+          </button>
+        </div>
+      </div>
       {#if (entries[tab] ?? []).length === 0}
         <p class="dim">{tab === "shaders" ? "还没有光影包。" : "还没有资源包。"}</p>
+      {:else if packList(tab).length === 0}
+        <p class="dim">没有匹配的{tab === "shaders" ? "光影包" : "资源包"}。</p>
       {:else}
         <div class="pack-list">
-          {#each (entries[tab] ?? []) as item (`${item.name}:${packTick}`)}
-            <div class="pack-row">
+          {#each packList(tab) as item (`${item.name}:${packTick}`)}
+            <div
+              class="pack-row"
+              class:picked={packSelected.has(`${tab}:${item.name}`)}
+              role="presentation"
+              onclick={(event) => {
+                if ((event.target as HTMLElement).closest("button")) return;
+                togglePackPicked(`${tab}:${item.name}`);
+              }}
+              onkeydown={() => {}}
+            >
               <span class="pack-icon">
                 {#if packIcons[`${tab}:${item.name}`]}
                   <img src={packIcons[`${tab}:${item.name}`]} alt="" />
                 {:else}
-                  <span class="pack-letter">{packLetter(item.name)}</span>
+                  <img class="pack-logo" src="/logo.png" alt="" />
                 {/if}
               </span>
               <div class="pack-text">
@@ -2415,16 +2528,23 @@ function loaderKey(name: string): InstanceLoader["loader"] {
                   <button class="btn tiny" onclick={() => void openShaderConfig(item.name)}>配置</button>
                 {/if}
                 <button class="btn tiny" onclick={() => void api.revealPath(subPath(tab) + SEP + item.name)}>打开位置</button>
-                <button class="btn tiny danger" onclick={() => void deletePack(tab, item.name, false)}>删除</button>
+                <button class="btn tiny" onclick={() => void api.copyFile(gameDir, gameDirectory, subPath(tab), item.name)}>复制</button>
+                <button class="btn tiny danger" onclick={() => (pendingPackDelete = { tab, name: item.name })}>删除</button>
               </div>
             </div>
           {/each}
         </div>
       {/if}
-      <div class="row"><button class="btn" onclick={() => void openSub(tab)}>打开目录</button></div>
     </section>
   {:else if tab === "saves"}
     <section class="panel">
+      <div class="mods-head">
+        <input class="mods-search" placeholder="搜索存档名" bind:value={packQuery} />
+        <div class="mods-tools">
+          <button class="btn" onclick={() => void openSub("saves")}>打开文件夹</button>
+          <button class="btn" onclick={() => void pasteSaves()}>粘贴文件</button>
+        </div>
+      </div>
       {#if savesBusy}
         <p class="dim">正在读存档…</p>
       {:else if saves.length === 0}
@@ -2451,7 +2571,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
                 <button class="btn tiny" onclick={() => (saveDetail = save)}>详情</button>
                 <button class="btn tiny" onclick={() => void api.revealPath(subPath("saves") + SEP + save.name)}>打开位置</button>
                 <button class="btn tiny" onclick={() => void copySave(save.name)}>复制</button>
-                <button class="btn tiny danger" onclick={() => void deleteSave(save.name, false)}>删除</button>
+                <button class="btn tiny danger" onclick={() => (pendingSaveDelete = save.name)}>删除</button>
                 <button
                   class="btn tiny"
                   disabled={!quickPlayOk}
@@ -2465,10 +2585,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           {/each}
         </div>
       {/if}
-      <div class="row">
-        <button class="btn" onclick={() => void pasteSaves()}>粘贴文件</button>
-        <button class="btn" onclick={() => void openSub("saves")}>打开目录</button>
-      </div>
+
     </section>
   {:else if tab === "logs" || tab === "crashes"}
     <section class="panel">
@@ -2620,6 +2737,46 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   {/snippet}
 </Modal>
 
+<ConfirmDialog
+  open={pendingPackDelete !== null}
+  message={pendingPackDelete === null
+    ? ""
+    : `删除${pendingPackDelete.tab === "shaders" ? "光影包" : "资源包"}「${pendingPackDelete.name}」？
+
+不按 Shift 会进回收站，还能捞回来；按住 Shift 点击是永久删除。`}
+  oncancel={() => (pendingPackDelete = null)}
+  onconfirm={(event) => {
+    const target = pendingPackDelete;
+    pendingPackDelete = null;
+    if (target) void deletePack(subPath(target.tab), target.name, event.shiftKey);
+  }}
+/>
+
+<ConfirmDialog
+  open={pendingSaveDelete !== null}
+  message={pendingSaveDelete === null
+    ? ""
+    : `删除存档「${pendingSaveDelete}」？
+
+不按 Shift 会进回收站，还能捞回来；按住 Shift 点击是永久删除。`}
+  oncancel={() => (pendingSaveDelete = null)}
+  onconfirm={(event) => {
+    const name = pendingSaveDelete;
+    pendingSaveDelete = null;
+    if (name) void deleteSave(name, event.shiftKey);
+  }}
+/>
+
+<Modal open={shotView !== null} title={shotView?.name ?? "截图"} onclose={() => (shotView = null)}>
+  {#if shotView}
+    <img class="shot-full" src={shotView.data} alt={shotView.name} />
+  {/if}
+  {#snippet footer()}
+    <button class="btn" onclick={() => void api.revealPath(subPath("screenshots") + SEP + (shotView?.name ?? ""))}>用系统程序打开</button>
+    <button class="btn ghost" onclick={() => (shotView = null)}>关闭</button>
+  {/snippet}
+</Modal>
+
 <Modal
   open={shaderConfig !== null}
   title={shaderConfig ? `光影配置：${shaderConfig.pack}` : "光影配置"}
@@ -2636,23 +2793,22 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       {/each}
     </div>
     {#if shaderConfig.screens[shaderTab]}
-      <div
-        class="shader-grid"
-        style="grid-template-columns: repeat({shaderConfig.screens[shaderTab].columns}, minmax(0, 1fr));"
-      >
-        {#each shaderConfig.screens[shaderTab].options as option (option.name)}
-          <label class="shader-field">
-            <span class="shader-label" title={option.comment ?? option.name}>{option.label}</span>
-            <select
-              value={shaderValue(option)}
-              onchange={(event) => setShaderValue(option, event.currentTarget.value)}
-            >
-              {#each option.values as value (value.id)}
-                <option value={value.id}>{value.label}</option>
-              {/each}
-            </select>
-          </label>
-        {/each}
+      <div class="shader-body">
+        <div
+          class="shader-grid"
+          style="grid-template-columns: repeat({shaderConfig.screens[shaderTab].columns}, minmax(0, 1fr));"
+        >
+          {#each shaderConfig.screens[shaderTab].options as option (option.name)}
+            <label class="shader-field">
+              <span class="shader-label" title={option.comment ?? option.name}>{option.label}</span>
+              <Dropdown
+                options={shaderChoices[option.name] ?? []}
+                value={shaderValue(option)}
+                onchange={(value) => setShaderValue(option, value)}
+              />
+            </label>
+          {/each}
+        </div>
       </div>
     {/if}
     <p class="hint mono">写到 {shaderConfig.valuesFile}</p>
@@ -2692,6 +2848,13 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     </p>
     <p class="hint">
       最后修改：{dateText(saveDetail.modifiedMs)}
+    </p>
+    <p class="hint">
+      种子：{saveDetail.seed ?? "未知"}
+    </p>
+    <p class="hint">
+      游玩时间：{#if saveDetail.playSeconds != null}
+        {playTimeText(saveDetail.playSeconds)}{:else}未知{/if}
     </p>
   {/if}
   {#snippet footer()}
@@ -3645,6 +3808,23 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     padding: 8px;
   }
 
+  .pack-logo {
+    width: 28px;
+    height: 28px;
+    opacity: 0.55;
+  }
+  .pack-row.picked {
+    border-color: rgba(140, 220, 140, 0.65);
+    background: rgba(140, 220, 140, 0.1);
+  }
+  .shot-full {
+    max-width: 100%;
+    max-height: 70vh;
+    border-radius: 8px;
+    display: block;
+    margin: 0 auto;
+  }
+
   /* 光影配置 */
   .shader-tabs {
     display: flex;
@@ -3652,9 +3832,16 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     gap: 6px;
     margin-bottom: 12px;
   }
+  .shader-body {
+    max-height: min(58vh, 560px);
+    overflow-y: auto;
+    padding-right: 6px;
+  }
   .shader-grid {
     display: grid;
     gap: 10px 14px;
+    min-height: 320px;
+    align-content: start;
   }
   .shader-field {
     display: flex;
