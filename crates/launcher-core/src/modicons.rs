@@ -44,8 +44,16 @@ pub fn local_pack_icon(path: &Path) -> Option<String> {
 /// 2. 自己解析中央目录（开头多字节、条目名大写、中央目录尺寸写错）；
 /// 3. 整文件里直接搜图片数据（流式 zip 记录 `csize=0`、尾部 descriptor、非 zip 容器等）。
 fn read_pack_icon_image(path: &Path) -> Option<PackImage> {
-    if let Some(image) = read_via_zip_lib(path) {
-        return Some(image);
+    // zip 能正常打开，就只认里面的 `pack.png`：包里那些压缩过的贴图里
+    // 偶尔会残留 PNG 魔数，硬切出来是半张图，`<img>` 只会显示空白。
+    let opens_as_zip = fs::File::open(path)
+        .ok()
+        .map(|file| zip::ZipArchive::new(file).is_ok())
+        .unwrap_or(false);
+    if opens_as_zip {
+        // 能打开但读不到条目（流式 zip 之类）时还可以按中央目录扫，
+        // 但不再硬切文件——那是「半张图」的来源。
+        return read_via_zip_lib(path).or_else(|| scan_pack_png(path));
     }
     if let Some(image) = scan_pack_png(path) {
         return Some(image);
@@ -73,11 +81,31 @@ fn is_image(bytes: &[u8]) -> bool {
 }
 
 fn wrap(bytes: Vec<u8>) -> Option<PackImage> {
-    if bytes.is_empty() || !is_image(&bytes) {
+    if bytes.is_empty() || !is_image(&bytes) || !looks_complete(&bytes) {
         return None;
     }
     let mime = mime_of(&bytes);
     Some(PackImage { bytes, mime })
+}
+
+/// 光有魔数不够：从压缩流里硬切出来的片段经常是「头对、身子断」，
+/// 这种图 `<img>` 会静默失败，表现成空白方块。这里按格式再验一遍。
+fn looks_complete(bytes: &[u8]) -> bool {
+    // PNG：IHDR 紧跟签名，宽高必须像话。
+    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47]) {
+        if bytes.len() < 33 || &bytes[12..16] != b"IHDR" {
+            return false;
+        }
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        return width > 0 && height > 0 && width <= 4096 && height <= 4096;
+    }
+    // WebP：RIFF 后面必须是 VP8/VP8L/VP8X 之一。
+    if bytes.len() >= 16 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return matches!(&bytes[12..16], b"VP8 " | b"VP8L" | b"VP8X");
+    }
+    // JPEG：必须以 EOI 收尾。
+    bytes.ends_with(&[0xff, 0xd9])
 }
 
 #[cfg(test)]
@@ -262,7 +290,11 @@ fn carve_image(path: &Path) -> Option<PackImage> {
                 data[start + 7],
             ]) as usize
                 + 8;
-            let end = (start + size).min(data.len());
+            let end = start + size;
+            if end > data.len() {
+                at = start + 4;
+                continue;
+            }
             if let Some(image) = wrap(data[start..end].to_vec()) {
                 return Some(image);
             }
@@ -381,6 +413,138 @@ pub fn key_of(path: &Path, file_name: &str) -> Result<ModKey, std::io::Error> {
     })
 }
 
+/// 文件名 + 大小 + 修改时间没变，就不用重算整包 SHA1。
+///
+/// 光影包动辄几十 MB，串行算哈希是「图标慢」的第一段。
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HashCache {
+    #[serde(default)]
+    version: u32,
+    /// `<目录>/<文件名>|<大小>|<修改时间毫秒>` → 哈希
+    #[serde(default)]
+    entries: std::collections::HashMap<String, HashEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HashEntry {
+    sha1: String,
+    fingerprint: u32,
+    at: u64,
+}
+
+fn hash_cache_path(data_dir: &Path, cache_name: &str) -> PathBuf {
+    data_dir.join(cache_name)
+}
+
+fn load_hash_cache(data_dir: &Path, cache_name: &str) -> HashCache {
+    let path = hash_cache_path(data_dir, cache_name);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return HashCache::default();
+    };
+    let mut cache: HashCache = serde_json::from_str(&text).unwrap_or_default();
+    cache.version = 1;
+    cache
+}
+
+fn save_hash_cache(data_dir: &Path, cache_name: &str, cache: &HashCache) {
+    let path = hash_cache_path(data_dir, cache_name);
+    if let Ok(text) = serde_json::to_string(cache) {
+        let _ = fs::write(path, text);
+    }
+}
+
+/// 给一批包算 SHA1/指纹：命中缓存的直接复用，剩下的 8 线程并行算。
+pub fn keys_of(
+    data_dir: &Path,
+    cache_name: &str,
+    dir: &Path,
+    files: &[String],
+) -> Vec<ModKey> {
+    let mut cache = load_hash_cache(data_dir, cache_name);
+    let mut out: Vec<Option<ModKey>> = Vec::with_capacity(files.len());
+    let mut pending: Vec<(usize, PathBuf, String, String)> = Vec::new();
+    let at = now();
+
+    for (index, file_name) in files.iter().enumerate() {
+        if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+            out.push(None);
+            continue;
+        }
+        let path = dir.join(file_name);
+        let Ok(meta) = fs::metadata(&path) else {
+            out.push(None);
+            continue;
+        };
+        if !meta.is_file() {
+            out.push(None);
+            continue;
+        }
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let key = format!("{file_name}|{}|{modified}", meta.len());
+        match cache.entries.get(&key) {
+            Some(entry) if at.saturating_sub(entry.at) < 30 * 24 * 60 * 60 => {
+                out.push(Some(ModKey {
+                    file_name: file_name.clone(),
+                    sha1: entry.sha1.clone(),
+                    fingerprint: entry.fingerprint,
+                }));
+            }
+            _ => {
+                out.push(None);
+                pending.push((index, path, file_name.clone(), key));
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        let workers = pending.len().min(8);
+        let queue = std::sync::Mutex::new(pending);
+        let results = std::sync::Mutex::new(Vec::<(usize, ModKey, String)>::new());
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let task = {
+                        let mut guard = queue.lock().unwrap();
+                        guard.pop()
+                    };
+                    let Some((index, path, file_name, key)) = task else {
+                        break;
+                    };
+                    if let Ok(key_of) = key_of(&path, &file_name) {
+                        results.lock().unwrap().push((index, key_of, key));
+                    }
+                });
+            }
+        });
+        for (index, mod_key, key) in results.into_inner().unwrap() {
+            cache.entries.insert(
+                key,
+                HashEntry {
+                    sha1: mod_key.sha1.clone(),
+                    fingerprint: mod_key.fingerprint,
+                    at,
+                },
+            );
+            out[index] = Some(mod_key);
+        }
+    }
+
+    // 太老的条目清掉，别让文件无限长。
+    if cache.entries.len() > 8192 {
+        cache
+            .entries
+            .retain(|_, entry| at.saturating_sub(entry.at) < 30 * 24 * 60 * 60);
+    }
+    save_hash_cache(data_dir, cache_name, &cache);
+
+    out.into_iter().flatten().collect()
+}
+
 /// 按哈希查项目信息（图标、原名、中文名）：先 Modrinth，剩下的再问 CurseForge。
 ///
 /// 返回「文件名 → 项目信息」，查不到的不会出现在结果里。
@@ -410,12 +574,31 @@ pub fn icons_for_kind(
         return out;
     }
 
+    // 两个平台并行问：Modrinth 与 CurseForge 都是网络往返，串行要等两次。
     // SHA1 → (url, title, slug, source, project_id)
-    let mut found: HashMap<String, (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
-        HashMap::new();
+    let mut found: HashMap<
+        String,
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    > = HashMap::new();
 
     let sha1s: Vec<String> = stale.iter().map(|key| key.sha1.clone()).collect();
-    if let Ok(hits) = crate::modrinth::lookup_sha1(&sha1s) {
+    let fingerprints: Vec<u32> = stale.iter().map(|key| key.fingerprint).collect();
+    let (modrinth_hits, curseforge_hits) = std::thread::scope(|scope| {
+        let mr = scope.spawn(|| crate::modrinth::lookup_sha1(&sha1s));
+        let cf = scope.spawn(|| crate::curseforge::fingerprint_details(&fingerprints));
+        (
+            mr.join().unwrap_or_else(|_| Ok(Vec::new())),
+            cf.join().unwrap_or_else(|_| Ok(Vec::new())),
+        )
+    });
+
+    if let Ok(hits) = modrinth_hits {
         let mut projects: Vec<String> = hits.iter().map(|hit| hit.project_id.clone()).collect();
         projects.sort();
         projects.dedup();
@@ -437,41 +620,37 @@ pub fn icons_for_kind(
         }
     }
 
-    let left: Vec<&ModKey> = stale
-        .iter()
-        .copied()
-        .filter(|key| !found.contains_key(&key.sha1))
-        .collect();
-    if !left.is_empty() {
-        let fingerprints: Vec<u32> = left.iter().map(|key| key.fingerprint).collect();
-        if let Ok(hits) = crate::curseforge::fingerprint_details(&fingerprints) {
-            let mut by_fingerprint: HashMap<u32, u64> = HashMap::new();
-            let mut mod_ids: Vec<u64> = Vec::new();
-            for (fingerprint, mod_id, _file_id) in hits {
-                by_fingerprint.insert(fingerprint, mod_id);
-                mod_ids.push(mod_id);
-            }
-            mod_ids.sort();
-            mod_ids.dedup();
-            if let Ok(meta) = crate::curseforge::project_meta(&mod_ids) {
-                for key in &left {
-                    let Some(mod_id) = by_fingerprint.get(&key.fingerprint) else {
-                        continue;
-                    };
-                    let Some(project) = meta.get(mod_id) else {
-                        continue;
-                    };
-                    found.insert(
-                        key.sha1.clone(),
-                        (
-                            project.icon.clone(),
-                            Some(project.name.clone()).filter(|t| !t.is_empty()),
-                            Some(project.slug.clone()).filter(|t| !t.is_empty()),
-                            Some("curseforge".to_owned()),
-                            Some(mod_id.to_string()),
-                        ),
-                    );
+    // CurseForge 只补 Modrinth 没命中的，避免同一文件被两个平台的结果打架。
+    if let Ok(hits) = curseforge_hits {
+        let mut by_fingerprint: HashMap<u32, u64> = HashMap::new();
+        let mut mod_ids: Vec<u64> = Vec::new();
+        for (fingerprint, mod_id, _file_id) in hits {
+            by_fingerprint.insert(fingerprint, mod_id);
+            mod_ids.push(mod_id);
+        }
+        mod_ids.sort();
+        mod_ids.dedup();
+        if let Ok(meta) = crate::curseforge::project_meta(&mod_ids) {
+            for key in stale.iter() {
+                if found.contains_key(&key.sha1) {
+                    continue;
                 }
+                let Some(mod_id) = by_fingerprint.get(&key.fingerprint) else {
+                    continue;
+                };
+                let Some(project) = meta.get(mod_id) else {
+                    continue;
+                };
+                found.insert(
+                    key.sha1.clone(),
+                    (
+                        project.icon.clone(),
+                        Some(project.name.clone()).filter(|t| !t.is_empty()),
+                        Some(project.slug.clone()).filter(|t| !t.is_empty()),
+                        Some("curseforge".to_owned()),
+                        Some(mod_id.to_string()),
+                    ),
+                );
             }
         }
     }

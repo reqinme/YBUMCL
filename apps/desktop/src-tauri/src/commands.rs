@@ -4274,20 +4274,10 @@ pub async fn pack_projects(
         };
         let runtime = runtime_of(game_dir, game_directory)?;
         let dir = runtime.join(sub);
-        let mut keys = Vec::new();
-        for file_name in files {
-            if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
-                continue;
-            }
-            let path = dir.join(&file_name);
-            if !path.is_file() {
-                continue;
-            }
-            if let Ok(key) = launcher_core::modicons::key_of(&path, &file_name) {
-                keys.push(key);
-            }
-        }
         let cache = format!("{sub}-icons.json");
+        // 文件名 + 大小 + 修改时间没变就不重算整包哈希；剩下的 8 线程并行算。
+        let hashes = format!("{sub}-hashes.json");
+        let keys = launcher_core::modicons::keys_of(&data_dir, &hashes, &dir, &files);
         Ok(launcher_core::modicons::icons_for_kind(
             &data_dir, &cache, &keys,
         ))
