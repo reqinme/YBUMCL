@@ -288,6 +288,46 @@ export type InstallRequest = {
 };
 
 /** 目录里的一项（实例详情页的列表用）。 */
+/// 光影包的一个选项取值。
+export type ShaderValue = { id: string; label: string };
+
+/// 光影包的一个选项。
+export type ShaderOption = {
+  name: string;
+  label: string;
+  comment: string | null;
+  values: ShaderValue[];
+  current: string;
+  default: string;
+};
+
+/// 光影配置的一页。
+export type ShaderScreen = {
+  name: string;
+  label: string;
+  columns: number;
+  options: ShaderOption[];
+};
+
+/// 整个光影包的配置。
+export type ShaderConfig = {
+  pack: string;
+  source: string | null;
+  valuesFile: string;
+  screens: ShaderScreen[];
+};
+
+/// 存档页的一条：图标、显示名、游戏版本都是后端从磁盘上读出来的。
+export type SaveEntry = {
+  name: string;
+  levelName: string | null;
+  version: string | null;
+  createdMs: number;
+  modifiedMs: number;
+  size: number;
+  icon: string | null;
+};
+
 export type EntryInfo = {
   name: string;
   dir: boolean;
@@ -408,6 +448,9 @@ export type ModProjectInfo = {
   title: string | null;
   slug: string | null;
   chinese: string | null;
+  /// `modrinth` / `curseforge`；没匹配到项目时是 null。
+  source: string | null;
+  projectId: string | null;
 };
 
 export type ModEntry = {
@@ -505,12 +548,59 @@ export const api = {
     invoke<void>("open_version_folder", { id, which }),
   /// `java` 是一次性指定的 Java 路径（弹窗里选「改用 Java 21」时用），
   /// `ignoreJava` 为真时照旧用当前这套启动、不做兼容性检查。
-  launchVersion: (id: string, options?: { java?: string | null; ignoreJava?: boolean }) =>
+  launchVersion: (
+    id: string,
+    options?: { java?: string | null; ignoreJava?: boolean; quickPlay?: string | null },
+  ) =>
     invoke<number>("launch_version", {
       id,
       java: options?.java ?? null,
       ignoreJava: options?.ignoreJava ?? null,
+      quickPlay: options?.quickPlay ?? null,
     }),
+  /// 这个实例支不支持 `--quickPlaySingleplayer`（1.20+）。
+  quickPlaySupported: (gameDir: string, id: string) =>
+    invoke<boolean>("quick_play_supported", { gameDir, id }),
+  /// 资源包 / 光影包的项目信息（名字、中文名、图标）。
+  packProjects: (
+    gameDir: string,
+    gameDirectory: string | null,
+    subdir: string,
+    files: string[],
+  ) =>
+    invoke<Record<string, ModProjectInfo>>("pack_projects", {
+      gameDir,
+      gameDirectory,
+      subdir,
+      files,
+    }),
+  listSaves: (gameDir: string, gameDirectory: string | null) =>
+    invoke<SaveEntry[]>("list_saves", { gameDir, gameDirectory }),
+  /// 删掉实例子目录里的一个文件/文件夹（默认进回收站）。
+  deleteEntry: (
+    gameDir: string,
+    gameDirectory: string | null,
+    subdir: string,
+    name: string,
+    permanent = false,
+  ) => invoke<void>("delete_entry", { gameDir, gameDirectory, subdir, name, permanent }),
+  /// 把文件放进剪贴板（截图页「复制」）。
+  copyFile: (gameDir: string, gameDirectory: string | null, subdir: string, name: string) =>
+    invoke<void>("copy_file", { gameDir, gameDirectory, subdir, name }),
+  copySave: (gameDir: string, gameDirectory: string | null, name: string) =>
+    invoke<void>("copy_save", { gameDir, gameDirectory, name }),
+  pasteSave: (gameDir: string, gameDirectory: string | null) =>
+    invoke<string[]>("paste_save", { gameDir, gameDirectory }),
+  /// 读一个光影包的配置项（`shaders/shaders.properties`）。
+  shaderConfig: (gameDir: string, gameDirectory: string | null, pack: string) =>
+    invoke<ShaderConfig>("shader_config", { gameDir, gameDirectory, pack }),
+  /// 保存光影配置：只写改过的值。
+  saveShaderConfig: (
+    gameDir: string,
+    gameDirectory: string | null,
+    pack: string,
+    values: Record<string, string>,
+  ) => invoke<void>("save_shader_config", { gameDir, gameDirectory, pack, values }),
   /// 启动前的 Java 兼容性检查，结果交给界面弹窗。
   checkJava: (id: string) => invoke<JavaCheck>("check_java", { id }),
   defaultGameDir: () => invoke<string>("default_game_dir"),

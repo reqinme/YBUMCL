@@ -7,7 +7,11 @@ import { askJava } from "$lib/dialogs.svelte";
  *
  * Java 版本对不上时不直接换、也不硬拦：弹窗让用户挑「换一套」还是「照旧启动」。
  */
-export async function startVersion(version: VersionView): Promise<void> {
+export async function startVersion(
+  version: VersionView,
+  options?: { quickPlay?: string | null },
+): Promise<void> {
+  const quickPlay = options?.quickPlay ?? null;
   const check = await api.checkJava(version.id);
   if (!check.accepted) {
     const choice = await askJava(check);
@@ -15,9 +19,10 @@ export async function startVersion(version: VersionView): Promise<void> {
     await api.launchVersion(version.id, {
       java: choice === "suggested" ? check.suggestedPath : null,
       ignoreJava: choice === "ignore",
+      quickPlay,
     });
   } else {
-    await api.launchVersion(version.id);
+    await api.launchVersion(version.id, { quickPlay });
   }
   await goto(`/launch?version=${encodeURIComponent(version.id)}`);
 }

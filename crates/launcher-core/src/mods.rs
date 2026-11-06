@@ -268,6 +268,11 @@ pub fn delete_mod(runtime_dir: &Path, file_name: &str, permanent: bool) -> Resul
     }
 }
 
+/// 把任意路径（文件或文件夹）丢进回收站，给资源包/光影包/存档/截图删除用。
+pub fn recycle_path(path: &Path) -> Result<(), CoreError> {
+    recycle_file(path)
+}
+
 /// Put a file in the recycle bin. Non-Windows targets fall back to deleting it.
 fn recycle_file(path: &Path) -> Result<(), CoreError> {
     #[cfg(windows)]

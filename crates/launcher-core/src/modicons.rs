@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 const CACHE_FILE: &str = "mod-icons.json";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 /// 一个模组文件的两种身份：Modrinth 认 SHA1，CurseForge 认指纹。
 #[derive(Debug, Clone)]
@@ -45,6 +45,11 @@ struct Entry {
     /// 项目 slug，用来查内置中文名表。
     #[serde(default)]
     slug: Option<String>,
+    /// 项目来自哪个站（modrinth / curseforge）与它的 id，界面拿去跳详情页。
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
     at: u64,
 }
 
@@ -56,6 +61,9 @@ pub struct ProjectInfo {
     pub title: Option<String>,
     pub slug: Option<String>,
     pub chinese: Option<String>,
+    /// `modrinth` / `curseforge`，没匹配到项目时是 None。
+    pub source: Option<String>,
+    pub project_id: Option<String>,
 }
 
 fn now() -> u64 {
@@ -65,12 +73,12 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-fn cache_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(CACHE_FILE)
+fn cache_path(data_dir: &Path, cache_name: &str) -> PathBuf {
+    data_dir.join(cache_name)
 }
 
-fn load_cache(data_dir: &Path) -> Cache {
-    let Ok(text) = fs::read_to_string(cache_path(data_dir)) else {
+fn load_cache(data_dir: &Path, cache_name: &str) -> Cache {
+    let Ok(text) = fs::read_to_string(cache_path(data_dir, cache_name)) else {
         return Cache::default();
     };
     let cache: Cache = serde_json::from_str(&text).unwrap_or_default();
@@ -80,8 +88,8 @@ fn load_cache(data_dir: &Path) -> Cache {
     cache
 }
 
-fn save_cache(data_dir: &Path, cache: &Cache) {
-    let path = cache_path(data_dir);
+fn save_cache(data_dir: &Path, cache_name: &str, cache: &Cache) {
+    let path = cache_path(data_dir, cache_name);
     if fs::create_dir_all(data_dir).is_err() {
         return;
     }
@@ -124,7 +132,16 @@ pub fn key_of(path: &Path, file_name: &str) -> Result<ModKey, std::io::Error> {
 ///
 /// 返回「文件名 → 项目信息」，查不到的不会出现在结果里。
 pub fn icons_for(data_dir: &Path, keys: &[ModKey]) -> HashMap<String, ProjectInfo> {
-    let mut cache = load_cache(data_dir);
+    icons_for_kind(data_dir, CACHE_FILE, keys)
+}
+
+/// 和 [`icons_for`] 一样，但缓存文件名可换（资源包、光影包各自一份）。
+pub fn icons_for_kind(
+    data_dir: &Path,
+    cache_name: &str,
+    keys: &[ModKey],
+) -> HashMap<String, ProjectInfo> {
+    let mut cache = load_cache(data_dir, cache_name);
     let mut out: HashMap<String, ProjectInfo> = HashMap::new();
     let mut stale: Vec<&ModKey> = Vec::new();
 
@@ -140,7 +157,9 @@ pub fn icons_for(data_dir: &Path, keys: &[ModKey]) -> HashMap<String, ProjectInf
         return out;
     }
 
-    let mut found: HashMap<String, (Option<String>, Option<String>, Option<String>)> = HashMap::new(); // SHA1 → (url, title, slug)
+    // SHA1 → (url, title, slug, source, project_id)
+    let mut found: HashMap<String, (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+        HashMap::new();
 
     let sha1s: Vec<String> = stale.iter().map(|key| key.sha1.clone()).collect();
     if let Ok(hits) = crate::modrinth::lookup_sha1(&sha1s) {
@@ -156,6 +175,8 @@ pub fn icons_for(data_dir: &Path, keys: &[ModKey]) -> HashMap<String, ProjectInf
                             project.icon.clone(),
                             Some(project.title.clone()).filter(|t| !t.is_empty()),
                             Some(project.slug.clone()).filter(|t| !t.is_empty()),
+                            Some("modrinth".to_owned()),
+                            Some(hit.project_id.clone()),
                         ),
                     );
                 }
@@ -193,6 +214,8 @@ pub fn icons_for(data_dir: &Path, keys: &[ModKey]) -> HashMap<String, ProjectInf
                             project.icon.clone(),
                             Some(project.name.clone()).filter(|t| !t.is_empty()),
                             Some(project.slug.clone()).filter(|t| !t.is_empty()),
+                            Some("curseforge".to_owned()),
+                            Some(mod_id.to_string()),
                         ),
                     );
                 }
@@ -207,6 +230,8 @@ pub fn icons_for(data_dir: &Path, keys: &[ModKey]) -> HashMap<String, ProjectInf
             url: hit.0.clone(),
             title: hit.1,
             slug: hit.2,
+            source: hit.3,
+            project_id: hit.4,
             at,
         };
         out.insert(key.file_name.clone(), info_of(&entry));
@@ -221,6 +246,7 @@ pub fn icons_for(data_dir: &Path, keys: &[ModKey]) -> HashMap<String, ProjectInf
     }
     save_cache(
         data_dir,
+        cache_name,
         &Cache {
             version: CACHE_VERSION,
             entries: cache.entries,
@@ -240,5 +266,7 @@ fn info_of(entry: &Entry) -> ProjectInfo {
             .as_deref()
             .and_then(crate::names::chinese_name)
             .map(str::to_owned),
+        source: entry.source.clone(),
+        project_id: entry.project_id.clone(),
     }
 }

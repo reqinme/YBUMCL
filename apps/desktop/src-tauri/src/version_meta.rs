@@ -172,6 +172,11 @@ fn probe(instance_dir: &Path, id: &str) -> Option<Probe> {
         .get("_ybmcl")
         .and_then(|value| value.get("gameVersion"))
         .and_then(|value| value.as_str())
+        // 整合包导入的实例没有 _ybmcl，但原版客户端版本写在 clientVersion 里。
+        .or_else(|| {
+            json.get("clientVersion")
+                .and_then(|value| value.as_str())
+        })
         .map(str::to_owned);
     Some(Probe {
         main_class,

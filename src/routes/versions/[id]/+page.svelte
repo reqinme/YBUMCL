@@ -32,6 +32,9 @@
     type ModEntry,
     type ModProjectInfo,
     type ModUpdate,
+    type SaveEntry,
+  type ShaderConfig,
+  type ShaderOption,
     type UpdateReport,
     onModUpdatesProgress,
     type ServerEntry,
@@ -104,6 +107,28 @@
   let nameLayout = $state(0);
   /// 平台信息是后到的：加个版本号当 key，让列表行重建一次，别留旧名字。
   let modProjectsTick = $state(0);
+  /// 资源包 / 光影包的项目信息，键是 `<标签>:<文件名>`。
+  let packInfo = $state<Record<string, ModProjectInfo>>({});
+  let packIcons = $state<Record<string, string>>({});
+  let packTick = $state(0);
+  /// 存档列表（后端读 level.dat，带版本号）。
+  let saves = $state<SaveEntry[]>([]);
+  let savesBusy = $state(false);
+  /// 这个实例支不支持 `--quickPlaySingleplayer`（1.20+）。
+  let quickPlayOk = $state(false);
+  /// 光影前置：装了 Iris / Oculus / OptiFine 才算 ok。
+  let shaderGate = $state<"checking" | "ok" | "missing">("checking");
+  /// 鼠标悬浮在截图上时显示的悬浮层（自绘，不用系统 tooltip）。
+  let shotTip = $state<{ name: string; x: number; y: number } | null>(null);
+  /// 资源包 / 光影包没匹配到项目时的本地详情。
+  let packDetail = $state<{ kind: string; name: string; size: number } | null>(null);
+  /// 存档详情弹窗。
+  let saveDetail = $state<SaveEntry | null>(null);
+  /// 光影配置弹窗：配置表 + 改过的值。
+  let shaderConfig = $state<ShaderConfig | null>(null);
+  let shaderBusy = $state(false);
+  let shaderTab = $state(0);
+  let shaderDraft = $state<Record<string, string>>({});
   let modUpdates = $state<Record<string, ModUpdate>>({});
   let checkingUpdates = $state(false);
   let updateChecked = $state(false);
@@ -1233,7 +1258,12 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     if (!path) return;
     entryBusy = kind;
     try {
-      const list = await api.listEntries(path);
+      const list = (await api.listEntries(path)).filter((item) => {
+        // 资源包/光影包只认目录和 .zip；shaderpacks 里还有 Iris 写的 <包名>.txt 配置，不能当成包。
+        if (kind !== "resourcepacks" && kind !== "shaders") return true;
+        if (item.dir) return true;
+        return item.name.toLowerCase().endsWith(".zip");
+      });
       entries = { ...entries, [kind]: list };
       if (kind === "screenshots") await loadShots(list);
       if (kind === "servers") await loadServers();
@@ -1257,6 +1287,224 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         })
     );
     shots = next;
+  }
+
+  /// 资源包 / 光影包：按哈希去平台认领项目（名字、中文名、图标）。
+  async function loadPackInfo(kind: "resourcepacks" | "shaders") {
+    const list = (entries[kind] ?? []).filter((item) => !item.dir).map((item) => item.name);
+    const unmet = list.filter((name) => !(`${kind}:${name}` in packInfo));
+    if (unmet.length === 0) return;
+    let infos: Record<string, ModProjectInfo> = {};
+    try {
+      infos = await api.packProjects(gameDir, gameDirectory, kind, unmet);
+    } catch {
+      return;
+    }
+    const next = { ...packInfo };
+    for (const [name, info] of Object.entries(infos)) next[`${kind}:${name}`] = info;
+    packInfo = next;
+    packTick += 1;
+    for (const [name, info] of Object.entries(infos)) {
+      if (!info.url) continue;
+      const key = `${kind}:${name}`;
+      if (packIcons[key]) continue;
+      try {
+        const icon = await api.fetchIcon(info.url);
+        if (icon) packIcons = { ...packIcons, [key]: icon };
+      } catch {
+        // 拉不到就留首字母占位。
+      }
+    }
+  }
+
+  function packInfoOf(kind: string, name: string): ModProjectInfo | undefined {
+    return packInfo[`${kind}:${name}`];
+  }
+
+  /// 两行排版的第一行：认领到项目就用「中文名 | 英文名」，否则文件名去掉扩展名。
+  function packName(kind: string, name: string): string {
+    const info = packInfoOf(kind, name);
+    const base = name.replace(/\.(zip|jar)$/i, "");
+    const english = info?.title?.trim() || base;
+    const chinese = info?.chinese?.trim();
+    return chinese && chinese !== english ? `${chinese} | ${english}` : english;
+  }
+
+  function packLetter(name: string): string {
+    return (name.replace(/\.(zip|jar)$/i, "").trim().slice(0, 1) || "?").toUpperCase();
+  }
+
+  /// 详情：认领到项目就跳下载页详情（PCL 的 ResourceDetail）；认不到才弹本地信息。
+  function openPackDetail(kind: string, item: EntryInfo) {
+    const info = packInfoOf(kind, item.name);
+    const project =
+      info?.source && info.projectId ? `${info.source}:${info.projectId}` : "";
+    if (!project) {
+      packDetail = { kind, name: item.name, size: item.size };
+      return;
+    }
+    const query = info?.title?.trim() || item.name.replace(/\.(zip|jar)$/i, "");
+    const mc = version?.gameVersion?.trim() ?? "";
+    const params = new URLSearchParams({ kind, mod: query, project });
+    if (mc) params.set("mc", mc);
+    void goto(`/downloads?${params.toString()}`);
+  }
+
+  /// 打开一个光影的配置：没有 shaders.properties 就提示，不给编辑。
+  async function openShaderConfig(pack: string) {
+    if (!root) return;
+    try {
+      const config = await api.shaderConfig(gameDir, gameDirectory, pack);
+      if (!config.source || config.screens.length === 0) {
+        showError("这个光影没有可调选项", "它没有 shaders.properties，或者里面没有声明选项。");
+        return;
+      }
+      shaderConfig = config;
+      shaderTab = 0;
+      shaderDraft = {};
+      for (const screen of config.screens) {
+        for (const option of screen.options) shaderDraft[option.name] = option.current;
+      }
+    } catch (error) {
+      showError("读不到这个光影的配置", "包可能损坏，或者格式不受支持。", String(error));
+    }
+  }
+
+  function shaderValue(option: ShaderOption): string {
+    return shaderDraft[option.name] ?? option.current;
+  }
+
+  function setShaderValue(option: ShaderOption, value: string) {
+    shaderDraft = { ...shaderDraft, [option.name]: value };
+  }
+
+  async function saveShaderConfig() {
+    const config = shaderConfig;
+    if (!config || shaderBusy) return;
+    const changed: Record<string, string> = {};
+    for (const screen of config.screens) {
+      for (const option of screen.options) {
+        const value = shaderDraft[option.name];
+        if (value !== undefined && value !== option.current) changed[option.name] = value;
+      }
+    }
+    if (Object.keys(changed).length === 0) {
+      shaderConfig = null;
+      return;
+    }
+    shaderBusy = true;
+    try {
+      await api.saveShaderConfig(gameDir, gameDirectory, config.pack, changed);
+      announce(`已保存「${config.pack}」的 ${Object.keys(changed).length} 项改动`);
+      shaderConfig = null;
+    } catch (error) {
+      showError("保存光影配置失败", "写不进 shaderpacks 里的配置文件。", String(error));
+    } finally {
+      shaderBusy = false;
+    }
+  }
+
+  async function deletePack(kind: string, name: string, permanent: boolean) {
+    try {
+      await api.deleteEntry(gameDir, gameDirectory, kind, name, permanent);
+      announce(`已删除「${name}」`);
+      entries = { ...entries, [kind]: (entries[kind] ?? []).filter((item) => item.name !== name) };
+      const next = { ...packInfo };
+      delete next[`${kind}:${name}`];
+      packInfo = next;
+    } catch (error) {
+      showError("删除失败", "文件可能正被别的程序占用。", String(error));
+    }
+  }
+
+  /// 扫一眼模组列表里有没有光影前置（Iris / Oculus / OptiFine）。
+  async function checkShaderLoader() {
+    shaderGate = "checking";
+    if (mods.length === 0) await loadMods();
+    const found = mods.some((mod) => {
+      const name = mod.fileName.toLowerCase();
+      return (
+        name.includes("iris") ||
+        name.includes("oculus") ||
+        name.includes("optifine") ||
+        name.includes("optifabric")
+      );
+    });
+    shaderGate = found ? "ok" : "missing";
+  }
+
+  async function loadSaves() {
+    if (!root) return;
+    savesBusy = true;
+    try {
+      saves = await api.listSaves(gameDir, gameDirectory);
+    } catch (error) {
+      saves = [];
+      showError("读取存档失败", subPath("saves"), String(error));
+    } finally {
+      savesBusy = false;
+    }
+  }
+
+  function dateText(ms: number): string {
+    if (!ms) return "未知";
+    const date = new Date(ms);
+    const pad = (value: number) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())}`;
+  }
+
+  async function playSave(name: string) {
+    if (!version) return;
+    try {
+      await startVersion(version, { quickPlay: name });
+    } catch (error) {
+      showError("启动存档失败", name, String(error));
+    }
+  }
+
+  async function copySave(name: string) {
+    try {
+      await api.copySave(gameDir, gameDirectory, name);
+      announce("存档文件夹已放进剪贴板");
+    } catch (error) {
+      showError("复制存档失败", name, String(error));
+    }
+  }
+
+  async function pasteSaves() {
+    try {
+      const added = await api.pasteSave(gameDir, gameDirectory);
+      announce(`已粘贴 ${added.length} 个存档`);
+      await loadSaves();
+    } catch (error) {
+      showError("粘贴存档失败", "剪贴板里没有能粘贴的存档文件夹。", String(error));
+    }
+  }
+
+  async function deleteShot(name: string, permanent: boolean) {
+    try {
+      await api.deleteEntry(gameDir, gameDirectory, "screenshots", name, permanent);
+      announce(`已删除截图「${name}」`);
+      entries = {
+        ...entries,
+        screenshots: (entries.screenshots ?? []).filter((item) => item.name !== name)
+      };
+      const next = { ...shots };
+      delete next[name];
+      shots = next;
+    } catch (error) {
+      showError("删除截图失败", name, String(error));
+    }
+  }
+
+  async function deleteSave(name: string, permanent: boolean) {
+    try {
+      await api.deleteEntry(gameDir, gameDirectory, "saves", name, permanent);
+      announce(`已删除存档「${name}」`);
+      await loadSaves();
+    } catch (error) {
+      showError("删除存档失败", "存档可能正被游戏占用。", String(error));
+    }
   }
 
   async function loadServers() {
@@ -1291,7 +1539,15 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     tab = next;
     textView = null;
     if (next === "servers") await loadServers();
-    if (next in SUB_DIRS) await loadEntries(next);
+    if (next in SUB_DIRS && next !== "saves") await loadEntries(next);
+    if (next === "resourcepacks" || next === "shaders") {
+      await loadPackInfo(next);
+      if (next === "shaders") await checkShaderLoader();
+    }
+    if (next === "saves") {
+      quickPlayOk = await api.quickPlaySupported(gameDir, id).catch(() => false);
+      await loadSaves();
+    }
     if (next === "crashes") await diagnoseNewest();
   }
 
@@ -2093,20 +2349,126 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     </section>
   {:else if tab === "screenshots"}
     <section class="panel">
-      {#if (entries.screenshots ?? []).length === 0}
+      {#if (entries.screenshots ?? []).filter((shot) => !shot.dir).length === 0}
         <p class="dim">还没有截图。</p>
       {:else}
         <div class="shots">
-          {#each entries.screenshots ?? [] as shot (shot.name)}
-            {#if !shot.dir && shots[shot.name]}
-              <button class="shot" onclick={() => void api.revealPath(subPath("screenshots") + SEP + shot.name)}>
-                <img src={shots[shot.name]} alt={shot.name} />
-              </button>
+          {#each (entries.screenshots ?? []).filter((shot) => !shot.dir) as shot (shot.name)}
+            {#if shots[shot.name]}
+              <div
+                class="shot-card"
+                role="group"
+                onmousemove={(event) =>
+                  (shotTip = {
+                    name: shot.name,
+                    x: event.clientX + 12,
+                    y: event.clientY + 12
+                  })}
+                onmouseleave={() => (shotTip = null)}
+              >
+                <button
+                  class="shot-image"
+                  onclick={() => void api.revealPath(subPath("screenshots") + SEP + shot.name)}
+                >
+                  <img src={shots[shot.name]} alt={shot.name} />
+                </button>
+                <div class="shot-actions">
+                  <button class="btn tiny" onclick={() => void api.revealPath(subPath("screenshots") + SEP + shot.name)}>打开</button>
+                  <button class="btn tiny danger" onclick={() => void deleteShot(shot.name, false)}>删除</button>
+                  <button class="btn tiny" onclick={() => void api.copyFile(gameDir, gameDirectory, "screenshots", shot.name)}>复制</button>
+                </div>
+              </div>
             {/if}
           {/each}
         </div>
       {/if}
       <div class="row"><button class="btn" onclick={() => void openSub("screenshots")}>打开目录</button></div>
+    </section>
+  {:else if tab === "resourcepacks" || tab === "shaders"}
+    <section class="panel">
+      {#if tab === "shaders" && shaderGate === "missing"}
+        <div class="gate">
+          没装光影前置模组（Iris / Oculus / OptiFine / OptiFabric），光影包装了也用不了。
+        </div>
+      {/if}
+      {#if (entries[tab] ?? []).length === 0}
+        <p class="dim">{tab === "shaders" ? "还没有光影包。" : "还没有资源包。"}</p>
+      {:else}
+        <div class="pack-list">
+          {#each (entries[tab] ?? []) as item (`${item.name}:${packTick}`)}
+            <div class="pack-row">
+              <span class="pack-icon">
+                {#if packIcons[`${tab}:${item.name}`]}
+                  <img src={packIcons[`${tab}:${item.name}`]} alt="" />
+                {:else}
+                  <span class="pack-letter">{packLetter(item.name)}</span>
+                {/if}
+              </span>
+              <div class="pack-text">
+                <strong>{packName(tab, item.name)}</strong>
+                <small class="mono">{item.name}</small>
+              </div>
+              <span class="dim">{sizeText(item.size)}</span>
+              <div class="pack-actions">
+                <button class="btn tiny" onclick={() => openPackDetail(tab, item)}>详情</button>
+                {#if tab === "shaders"}
+                  <button class="btn tiny" onclick={() => void openShaderConfig(item.name)}>配置</button>
+                {/if}
+                <button class="btn tiny" onclick={() => void api.revealPath(subPath(tab) + SEP + item.name)}>打开位置</button>
+                <button class="btn tiny danger" onclick={() => void deletePack(tab, item.name, false)}>删除</button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      <div class="row"><button class="btn" onclick={() => void openSub(tab)}>打开目录</button></div>
+    </section>
+  {:else if tab === "saves"}
+    <section class="panel">
+      {#if savesBusy}
+        <p class="dim">正在读存档…</p>
+      {:else if saves.length === 0}
+        <p class="dim">还没有存档。</p>
+      {:else}
+        <div class="save-list">
+          {#each saves as save (save.name)}
+            <div class="pack-row">
+              <span class="pack-icon save-icon">
+                {#if save.icon}
+                  <img src={save.icon} alt="" />
+                {:else}
+                  <span class="pack-letter">{packLetter(save.name)}</span>
+                {/if}
+              </span>
+              <div class="pack-text">
+                <strong>{save.levelName ?? save.name}</strong>
+                <small class="dim">
+                  创建时间：{dateText(save.createdMs)}，最后修改时间：{dateText(save.modifiedMs)} ·
+                  {save.version ?? "版本未知"}
+                </small>
+              </div>
+              <div class="pack-actions">
+                <button class="btn tiny" onclick={() => (saveDetail = save)}>详情</button>
+                <button class="btn tiny" onclick={() => void api.revealPath(subPath("saves") + SEP + save.name)}>打开位置</button>
+                <button class="btn tiny" onclick={() => void copySave(save.name)}>复制</button>
+                <button class="btn tiny danger" onclick={() => void deleteSave(save.name, false)}>删除</button>
+                <button
+                  class="btn tiny"
+                  disabled={!quickPlayOk}
+                  title={quickPlayOk ? "" : "这个版本不支持直接进存档（要 1.20 以上）"}
+                  onclick={() => void playSave(save.name)}
+                >
+                  启动
+                </button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      <div class="row">
+        <button class="btn" onclick={() => void pasteSaves()}>粘贴文件</button>
+        <button class="btn" onclick={() => void openSub("saves")}>打开目录</button>
+      </div>
     </section>
   {:else if tab === "logs" || tab === "crashes"}
     <section class="panel">
@@ -2217,6 +2579,12 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   }}
 />
 
+{#if shotTip}
+  <div class="float-tip" use:float style="left: {shotTip.x + 12}px; top: {shotTip.y + 12}px;">
+    文件名：{shotTip.name}
+  </div>
+{/if}
+
 <Modal open={modDetail !== null} title="模组详情" onclose={() => (modDetail = null)}>
   {#if modDetail}
     <div class="mod-head">
@@ -2249,6 +2617,85 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       }}>下载页搜索</button
     >
     <button class="btn ghost" onclick={() => (modDetail = null)}>关闭</button>
+  {/snippet}
+</Modal>
+
+<Modal
+  open={shaderConfig !== null}
+  title={shaderConfig ? `光影配置：${shaderConfig.pack}` : "光影配置"}
+  onclose={() => (shaderConfig = null)}
+>
+  {#if shaderConfig}
+    <div class="shader-tabs">
+      {#each shaderConfig.screens as screen, index (screen.name)}
+        <button
+          class="tab"
+          class:active={shaderTab === index}
+          onclick={() => (shaderTab = index)}>{screen.label}</button
+        >
+      {/each}
+    </div>
+    {#if shaderConfig.screens[shaderTab]}
+      <div
+        class="shader-grid"
+        style="grid-template-columns: repeat({shaderConfig.screens[shaderTab].columns}, minmax(0, 1fr));"
+      >
+        {#each shaderConfig.screens[shaderTab].options as option (option.name)}
+          <label class="shader-field">
+            <span class="shader-label" title={option.comment ?? option.name}>{option.label}</span>
+            <select
+              value={shaderValue(option)}
+              onchange={(event) => setShaderValue(option, event.currentTarget.value)}
+            >
+              {#each option.values as value (value.id)}
+                <option value={value.id}>{value.label}</option>
+              {/each}
+            </select>
+          </label>
+        {/each}
+      </div>
+    {/if}
+    <p class="hint mono">写到 {shaderConfig.valuesFile}</p>
+  {/if}
+  {#snippet footer()}
+    <button class="btn" disabled={shaderBusy} onclick={() => void saveShaderConfig()}>
+      {shaderBusy ? "保存中…" : "保存"}
+    </button>
+    <button class="btn ghost" onclick={() => (shaderConfig = null)}>取消</button>
+  {/snippet}
+</Modal>
+
+<Modal
+  open={packDetail !== null}
+  title={packDetail?.kind === "shaders" ? "光影包信息" : "资源包信息"}
+  onclose={() => (packDetail = null)}
+>
+  {#if packDetail}
+    <p><strong>{packDetail.name}</strong></p>
+    <p class="hint">{sizeText(packDetail.size)}</p>
+    <p class="hint">没在 Modrinth / CurseForge 上找到这个文件，只能显示本地信息。</p>
+  {/if}
+  {#snippet footer()}
+    <button class="btn ghost" onclick={() => (packDetail = null)}>关闭</button>
+  {/snippet}
+</Modal>
+
+<Modal open={saveDetail !== null} title="存档信息" onclose={() => (saveDetail = null)}>
+  {#if saveDetail}
+    <p><strong>{saveDetail.levelName ?? saveDetail.name}</strong></p>
+    <p class="hint mono">{saveDetail.name}</p>
+    <p class="hint">
+      游戏版本 {saveDetail.version ?? "版本未知"} · {sizeText(saveDetail.size)}
+    </p>
+    <p class="hint">
+      创建时间：{dateText(saveDetail.createdMs)}
+    </p>
+    <p class="hint">
+      最后修改：{dateText(saveDetail.modifiedMs)}
+    </p>
+  {/if}
+  {#snippet footer()}
+    <button class="btn ghost" onclick={() => (saveDetail = null)}>关闭</button>
   {/snippet}
 </Modal>
 
@@ -2409,25 +2856,6 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   }
   button.file:hover {
     background: rgba(255, 255, 255, 0.06);
-  }
-  .shots {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 10px;
-  }
-  .shot {
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    background: rgba(8, 10, 14, 0.35);
-    padding: 0;
-    cursor: pointer;
-  }
-  .shot img {
-    display: block;
-    width: 100%;
-    height: 120px;
-    object-fit: cover;
   }
   .textview {
     position: fixed;
@@ -3118,5 +3546,127 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   }
   .cat-new input {
     flex: 1;
+  }
+
+  /* 资源包 / 光影包 / 存档：一行一条 */
+  .gate {
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid rgb(220 90 90 / 0.5);
+    background: rgb(220 90 90 / 0.12);
+    color: rgb(255 196 196);
+    font-size: 13px;
+  }
+  .pack-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .pack-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: rgb(255 255 255 / 0.04);
+  }
+  .pack-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    overflow: hidden;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgb(255 255 255 / 0.06);
+  }
+  .pack-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .pack-letter {
+    font-weight: 700;
+    font-size: 16px;
+    color: var(--text-dim);
+  }
+  .pack-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .pack-text strong,
+  .pack-text small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pack-actions {
+    display: flex;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+
+
+  /* 截图卡片 */
+  .shots {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 14px;
+  }
+  .shot-card {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: rgb(255 255 255 / 0.04);
+  }
+  .shot-image {
+    padding: 0;
+    border: 0;
+    background: rgb(0 0 0 / 0.25);
+    cursor: zoom-in;
+  }
+  .shot-image img {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    display: block;
+  }
+  .shot-actions {
+    display: flex;
+    gap: 6px;
+    padding: 8px;
+  }
+
+  /* 光影配置 */
+  .shader-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .shader-grid {
+    display: grid;
+    gap: 10px 14px;
+  }
+  .shader-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .shader-label {
+    font-size: 12px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

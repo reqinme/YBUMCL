@@ -44,6 +44,9 @@ pub mod names;
 pub mod packages;
 /// 读 `servers.dat`（服务器列表标签页用）。
 pub mod servers;
+/// 存档目录：图标、时间、游戏版本。
+pub mod saves;
+pub mod shaders;
 /// 世界整包解压到 `saves`。
 pub mod world;
 pub mod ftb;
@@ -153,6 +156,9 @@ pub struct LaunchRequest {
     /// 第三方认证服务器：非空时给 JVM 加 authlib-injector 的 agent 参数。
     #[serde(default)]
     pub authlib: Option<AuthlibInject>,
+    /// 直接进存档：加 `--quickPlaySingleplayer <存档文件夹名>`（1.20+ 才有这个开关）。
+    #[serde(default)]
+    pub quick_play: Option<String>,
 }
 
 /// authlib-injector 的启动参数（由界面按当前账户的认证服务器算好传进来）。
@@ -2171,6 +2177,12 @@ fn prepare(
         jvm.push(format!("-javaagent:{}={}", authlib.jar, authlib.server));
         jvm.push("-Dauthlibinjector.side=client".into());
         jvm.push(format!("-Dauthlibinjector.yggdrasil.prefetched={prefetched}"));
+    }
+    if let Some(save) = request.quick_play.as_deref() {
+        if !save.is_empty() {
+            game.push("--quickPlaySingleplayer".into());
+            game.push(save.to_owned());
+        }
     }
     args.extend(jvm);
     args.push(v["mainClass"].as_str().unwrap().into());

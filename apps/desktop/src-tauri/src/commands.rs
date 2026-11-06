@@ -836,6 +836,7 @@ fn launch_request(
     java_override: Option<&str>,
     ignore_override: Option<bool>,
     with_account: bool,
+    quick_play: Option<String>,
 ) -> Result<launcher_core::LaunchRequest, String> {
     let version = crate::versions::load_instance(game_dir, id);
     let global = crate::settings::load(paths);
@@ -1034,6 +1035,7 @@ fn launch_request(
         allow_java_upgrade: true,
         log4j_debug: version.debug_log4j,
         authlib,
+        quick_play,
     })
 }
 
@@ -1059,7 +1061,7 @@ fn plan_for(
 ) -> Result<(launcher_core::LaunchPlan, String), String> {
     let game_dir = crate::game_folders::current(paths);
     // 导出的 .bat 不写访问令牌：脚本会留在磁盘上，令牌只该留在启动器里。
-    let request = launch_request(paths, &game_dir, id, None, None, false)?;
+    let request = launch_request(paths, &game_dir, id, None, None, false, None)?;
     let plan = launcher_core::build_launch_plan(request).map_err(|e| e.to_string())?;
     Ok((plan, game_dir.to_string_lossy().into_owned()))
 }
@@ -1926,6 +1928,7 @@ pub async fn launch_version(
     id: String,
     java: Option<String>,
     ignore_java: Option<bool>,
+    quick_play: Option<String>,
     app: AppHandle,
     runtime: State<'_, GameRuntime>,
     paths: State<'_, crate::portable::Paths>,
@@ -1947,6 +1950,7 @@ pub async fn launch_version(
             java.as_deref(),
             ignore_java,
             true,
+            quick_play,
         )?;
         let strategy = strategy_of(
             crate::settings::load(&paths_for_request)
@@ -4213,6 +4217,249 @@ pub struct EntryInfo {
     pub dir: bool,
     pub size: u64,
     pub modified_ms: u64,
+}
+
+/// 按哈希查资源包 / 光影包对应的平台项目（名字与图标）。
+#[tauri::command]
+pub async fn pack_projects(
+    paths: State<'_, Paths>,
+    game_dir: String,
+    game_directory: Option<String>,
+    subdir: String,
+    files: Vec<String>,
+) -> Result<std::collections::HashMap<String, launcher_core::modicons::ProjectInfo>, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sub = match subdir.as_str() {
+            "resourcepacks" => "resourcepacks",
+            "shaderpacks" => "shaderpacks",
+            _ => return Err("这个目录没有对应的项目信息".to_owned()),
+        };
+        let runtime = runtime_of(game_dir, game_directory)?;
+        let dir = runtime.join(sub);
+        let mut keys = Vec::new();
+        for file_name in files {
+            if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+                continue;
+            }
+            let path = dir.join(&file_name);
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(key) = launcher_core::modicons::key_of(&path, &file_name) {
+                keys.push(key);
+            }
+        }
+        let cache = format!("{sub}-icons.json");
+        Ok(launcher_core::modicons::icons_for_kind(
+            &data_dir, &cache, &keys,
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 读一个光影包的配置项（`shaders/shaders.properties` + 当前值文件）。
+#[tauri::command]
+pub async fn shader_config(
+    game_dir: String,
+    game_directory: Option<String>,
+    pack: String,
+) -> Result<launcher_core::shaders::ShaderConfig, String> {
+    if pack.contains('/') || pack.contains('\\') || pack.contains("..") {
+        return Err("光影包名字不合法".to_owned());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::shaders::load(&runtime.join("shaderpacks"), &pack)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 保存光影配置：只写用户改过的值，其余原来的键保留。
+#[tauri::command]
+pub async fn save_shader_config(
+    game_dir: String,
+    game_directory: Option<String>,
+    pack: String,
+    values: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    if pack.contains('/') || pack.contains('\\') || pack.contains("..") {
+        return Err("光影包名字不合法".to_owned());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::shaders::save(&runtime.join("shaderpacks"), &pack, values)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 存档列表：图标、时间、游戏版本。
+#[tauri::command]
+pub async fn list_saves(
+    game_dir: String,
+    game_directory: Option<String>,
+) -> Result<Vec<launcher_core::saves::SaveEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        Ok(launcher_core::saves::list(&runtime.join("saves")))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 这个实例能不能用 `--quickPlaySingleplayer`（1.20+）。
+#[tauri::command]
+pub fn quick_play_supported(game_dir: String, id: String) -> bool {
+    let meta = crate::version_meta::describe_all(std::path::Path::new(&game_dir), &[id]);
+    let version = meta.values().next().and_then(|meta| meta.game_version.clone());
+    wants_quick_play(version.as_deref())
+}
+
+/// 把存档文件夹放进剪贴板（资源管理器里能直接 Ctrl+V）。
+#[tauri::command]
+pub fn copy_save(game_dir: String, game_directory: Option<String>, name: String) -> Result<(), String> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("存档名不合法".into());
+    }
+    let runtime = runtime_of(game_dir, game_directory)?;
+    let path = runtime.join("saves").join(&name);
+    if !path.is_dir() {
+        return Err(format!("{} 已经不在了", path.display()));
+    }
+    let script = format!(
+        "Set-Clipboard -Path '{}'",
+        path.to_string_lossy().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .map_err(|error| format!("调用剪贴板失败：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("剪贴板没写进去".into())
+    }
+}
+
+/// 把剪贴板里的文件夹复制进 `saves/`，返回新存档的文件夹名。
+#[tauri::command]
+pub fn paste_save(
+    game_dir: String,
+    game_directory: Option<String>,
+) -> Result<Vec<String>, String> {
+    let script = "Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }";
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|error| format!("读剪贴板失败：{error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let runtime = runtime_of(game_dir, game_directory)?;
+    let saves = runtime.join("saves");
+    let mut imported = Vec::new();
+    for line in text.lines() {
+        let source = std::path::PathBuf::from(line.trim());
+        if !source.is_dir() {
+            continue;
+        }
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let name = name.to_string_lossy().into_owned();
+        let mut target = saves.join(&name);
+        let mut index = 2;
+        while target.exists() {
+            target = saves.join(format!("{name} ({index})"));
+            index += 1;
+        }
+        copy_dir(&source, &target)?;
+        imported.push(
+            target
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or(name),
+        );
+    }
+    if imported.is_empty() {
+        return Err("剪贴板里没有存档文件夹".into());
+    }
+    Ok(imported)
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|error| format!("{}: {error}", to.display()))?;
+    for entry in std::fs::read_dir(from).map_err(|error| format!("{}: {error}", from.display()))? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 删掉实例子目录里的一个文件/文件夹（资源包、光影包、存档、截图共用）。
+#[tauri::command]
+pub fn delete_entry(
+    game_dir: String,
+    game_directory: Option<String>,
+    subdir: String,
+    name: String,
+    permanent: bool,
+) -> Result<(), String> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("文件名不合法".into());
+    }
+    let sub = match subdir.as_str() {
+        "resourcepacks" | "shaderpacks" | "saves" | "screenshots" | "mods" => subdir.as_str(),
+        _ => return Err("这个目录不支持删除".to_owned()),
+    };
+    let runtime = runtime_of(game_dir, game_directory)?;
+    let path = runtime.join(sub).join(&name);
+    if !path.exists() {
+        return Err(format!("{} 已经不在了", path.display()));
+    }
+    if permanent {
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|error| error.to_string())
+        } else {
+            std::fs::remove_file(&path).map_err(|error| error.to_string())
+        }
+    } else {
+        launcher_core::mods::recycle_path(&path).map_err(|error| error.to_string())
+    }
+}
+
+/// 把任意文件放进剪贴板（资源管理器里能粘贴）。
+#[tauri::command]
+pub fn copy_file(game_dir: String, game_directory: Option<String>, subdir: String, name: String) -> Result<(), String> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("文件名不合法".into());
+    }
+    let runtime = runtime_of(game_dir, game_directory)?;
+    let path = runtime.join(&subdir).join(&name);
+    if !path.exists() {
+        return Err(format!("{} 已经不在了", path.display()));
+    }
+    let script = format!(
+        "Set-Clipboard -Path '{}'",
+        path.to_string_lossy().replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .map_err(|error| format!("调用剪贴板失败：{error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("剪贴板没写进去".into())
+    }
 }
 
 fn instance_root_of(paths: &Paths, id: &str) -> Result<PathBuf, String> {
