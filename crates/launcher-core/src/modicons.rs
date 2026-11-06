@@ -20,52 +20,101 @@ const CACHE_FILE: &str = "mod-icons.json";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const CACHE_VERSION: u32 = 3;
 
+/// 一张从包里抠出来的图标：字节 + MIME。
+struct PackImage {
+    bytes: Vec<u8>,
+    mime: &'static str,
+}
+
 /// 资源包/光影包里自带的图标（`pack.png`）读成 data URL。
 ///
 /// PCL 就是这条路：本地文件加载时直接 `jar.GetEntry("pack.png")`，不联网。
 /// 这里只解压一个几百字节的 entry，比「整包 SHA1 + 查平台 + 下载图标」快得多。
 pub fn local_pack_icon(path: &Path) -> Option<String> {
-    let bytes = read_pack_png(path)?;
-    if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
+    let image = read_pack_icon_image(path)?;
+    if image.bytes.is_empty() || image.bytes.len() > 4 * 1024 * 1024 {
         return None;
     }
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Some(format!("data:image/png;base64,{encoded}"))
+    let encoded = base64::engine::general_purpose::STANDARD.encode(image.bytes);
+    Some(format!("data:{};base64,{}", image.mime, encoded))
 }
 
-fn read_pack_png(path: &Path) -> Option<Vec<u8>> {
-    // 正常路径：交给 zip 库按中央目录找。
-    if let Ok(file) = fs::File::open(path) {
-        if let Ok(mut archive) = zip::ZipArchive::new(file) {
-            for index in 0..archive.len() {
-                let Ok(mut entry) = archive.by_index(index) else {
-                    continue;
-                };
-                // 有的整合包把条目名写成大写（`PACK.PNG`），按字节比会漏掉。
-                if !entry.name().eq_ignore_ascii_case("pack.png") || entry.is_dir() {
-                    continue;
-                }
-                let mut data = Vec::new();
-                if entry.read_to_end(&mut data).is_ok() && !data.is_empty() {
-                    return Some(data);
-                }
+/// 按顺序找图标，前一步拿到了就不走后面：
+/// 1. `zip` 库按中央目录读（正常包）；
+/// 2. 自己解析中央目录（开头多字节、条目名大写、中央目录尺寸写错）；
+/// 3. 整文件里直接搜图片数据（流式 zip 记录 `csize=0`、尾部 descriptor、非 zip 容器等）。
+fn read_pack_icon_image(path: &Path) -> Option<PackImage> {
+    if let Some(image) = read_via_zip_lib(path) {
+        return Some(image);
+    }
+    if let Some(image) = scan_pack_png(path) {
+        return Some(image);
+    }
+    carve_image(path)
+}
+
+/// PNG / WebP / JPEG 按魔数认，其余当 PNG 处理。
+fn mime_of(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47]) {
+        "image/png"
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else {
+        "image/png"
+    }
+}
+
+fn is_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47])
+        || bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || (bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+}
+
+fn wrap(bytes: Vec<u8>) -> Option<PackImage> {
+    if bytes.is_empty() || !is_image(&bytes) {
+        return None;
+    }
+    let mime = mime_of(&bytes);
+    Some(PackImage { bytes, mime })
+}
+
+#[cfg(test)]
+fn read_pack_png_bytes(path: &Path) -> Option<Vec<u8>> {
+    read_pack_icon_image(path).map(|image| image.bytes)
+}
+
+fn read_via_zip_lib(path: &Path) -> Option<PackImage> {
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    for index in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(index) else {
+            continue;
+        };
+        // 有的整合包把条目名写成大写（`PACK.PNG`），按字节比会漏掉。
+        if !entry.name().eq_ignore_ascii_case("pack.png") || entry.is_dir() {
+            continue;
+        }
+        let mut data = Vec::new();
+        if entry.read_to_end(&mut data).is_ok() {
+            if let Some(image) = wrap(data) {
+                return Some(image);
             }
         }
     }
-    // 兜底：有些工具生成的 zip 前面多了几个字节（`PKPK`），
-    // 中央目录偏移整体错位，zip 库直接打不开。这时自己扫本地文件头。
-    scan_pack_png(path)
+    None
 }
 
-fn scan_pack_png(path: &Path) -> Option<Vec<u8>> {
+fn scan_pack_png(path: &Path) -> Option<PackImage> {
     // 走中央目录而不是扫本地头：有些整合包里的 zip 开头多塞了 4 个字节
-    // （文件以 PK 起头），本地头字段会跟着错位，中央目录才是准的。
+    // （文件以 PK 05 06 起头），本地头字段会跟着错位，中央目录才是准的。
     let data = fs::read(path).ok()?;
     let eocd = (0..data.len().saturating_sub(3))
         .rev()
         .find(|&i| data[i..i + 4] == [0x50, 0x4b, 0x05, 0x06])?;
     let count = u16::from_le_bytes([data[eocd + 10], data[eocd + 11]]) as usize;
-    let cd = u32::from_le_bytes([
+    let mut cd = u32::from_le_bytes([
         data[eocd + 16],
         data[eocd + 17],
         data[eocd + 18],
@@ -73,10 +122,10 @@ fn scan_pack_png(path: &Path) -> Option<Vec<u8>> {
     ]) as usize;
     // 有些包在文件开头塞了 4 个字节，EOCD 里记的偏移就整体偏小了，按签名找一下真实位置。
     let mut shift = 0_usize;
-    let mut cd = cd;
     if cd + 4 <= data.len() && data[cd..cd + 4] != [0x50, 0x4b, 0x01, 0x02] {
         if let Some(delta) = (1..=16).find(|&delta| {
-            cd + delta + 4 <= data.len() && data[cd + delta..cd + delta + 4] == [0x50, 0x4b, 0x01, 0x02]
+            cd + delta + 4 <= data.len()
+                && data[cd + delta..cd + delta + 4] == [0x50, 0x4b, 0x01, 0x02]
         }) {
             cd += delta;
             shift = delta;
@@ -87,7 +136,6 @@ fn scan_pack_png(path: &Path) -> Option<Vec<u8>> {
         if offset + 46 > data.len() || data[offset..offset + 4] != [0x50, 0x4b, 0x01, 0x02] {
             break;
         }
-        let flags = u16::from_le_bytes([data[offset + 8], data[offset + 9]]);
         let method = u16::from_le_bytes([data[offset + 10], data[offset + 11]]);
         let compressed = u32::from_le_bytes([
             data[offset + 20],
@@ -116,67 +164,110 @@ fn scan_pack_png(path: &Path) -> Option<Vec<u8>> {
         if name_end > data.len() {
             break;
         }
-        let name = &data[name_start..name_end];
-        if name.eq_ignore_ascii_case(b"pack.png") {
-        }
-        if name.eq_ignore_ascii_case(b"pack.png") && local + 30 <= data.len() {
-            let local_extra = u16::from_le_bytes([data[local + 28], data[local + 29]]) as usize;
-            // 这张表里以本地头为准：个别包的中央目录记的 csize/psz 是错的。
-            let local_method = u16::from_le_bytes([data[local + 8], data[local + 9]]);
-            let local_csize = u32::from_le_bytes([
-                data[local + 18],
-                data[local + 19],
-                data[local + 20],
-                data[local + 21],
-            ]) as usize;
-            let local_usize = u32::from_le_bytes([
-                data[local + 22],
-                data[local + 23],
-                data[local + 24],
-                data[local + 25],
-            ]) as usize;
-            let method = if local_method == 0 { method } else { local_method };
-            let compressed = if local_csize > 0 { local_csize } else { compressed };
-            let plain = if local_usize > 0 { local_usize } else { plain };
-            let local_name_len = u16::from_le_bytes([data[local + 26], data[local + 27]]) as usize;
-            let body_start = local + 30 + local_name_len + local_extra;
-            let limit = if compressed > 0 || flags & 0x08 == 0 {
-                (body_start + compressed).min(data.len())
-            } else {
-                data.len()
-            };
-            if body_start < limit {
-                let body = &data[body_start..limit];
-                let is_png = |bytes: &[u8]| bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47]);
-                let mut candidates: Vec<Vec<u8>> = Vec::new();
-                if method == 8 {
-                    for slice in [body, &data[body_start..]] {
-                        let mut out = Vec::new();
-                        if flate2::read::DeflateDecoder::new(slice)
-                            .read_to_end(&mut out)
-                            .is_ok()
-                            && is_png(&out)
-                        {
-                            candidates.push(out);
-                            break;
-                        }
-                    }
-                }
-                if candidates.is_empty() {
-                    for slice in [body, &data[body_start..]] {
-                        if !slice.is_empty() && is_png(slice) {
-                            candidates.push(slice[..plain.min(slice.len())].to_vec());
-                            break;
-                        }
-                    }
-                }
-                let decoded = candidates.into_iter().next();
-                if decoded.is_some() {
-                    return decoded;
-                }
+        if data[name_start..name_end].eq_ignore_ascii_case(b"pack.png") && local + 30 <= data.len() {
+            if let Some(image) = read_local_entry(&data, local, method, compressed, plain) {
+                return Some(image);
             }
         }
         offset = name_end + extra_len + comment_len;
+    }
+    None
+}
+
+/// 从本地文件头解一个 entry：尺寸以本地头为准，流式 zip（`csize=0`）解到流结束。
+fn read_local_entry(
+    data: &[u8],
+    local: usize,
+    method_hint: u16,
+    compressed_hint: usize,
+    plain_hint: usize,
+) -> Option<PackImage> {
+    let local_method = u16::from_le_bytes([data[local + 8], data[local + 9]]);
+    let local_csize = u32::from_le_bytes([
+        data[local + 18],
+        data[local + 19],
+        data[local + 20],
+        data[local + 21],
+    ]) as usize;
+    let local_usize = u32::from_le_bytes([
+        data[local + 22],
+        data[local + 23],
+        data[local + 24],
+        data[local + 25],
+    ]) as usize;
+    let name_len = u16::from_le_bytes([data[local + 26], data[local + 27]]) as usize;
+    let extra_len = u16::from_le_bytes([data[local + 28], data[local + 29]]) as usize;
+    let method = if local_method == 0 { method_hint } else { local_method };
+    let compressed = if local_csize > 0 { local_csize } else { compressed_hint };
+    let plain = if local_usize > 0 { local_usize } else { plain_hint };
+    let body_start = local + 30 + name_len + extra_len;
+    if body_start >= data.len() {
+        return None;
+    }
+    let tail = &data[body_start..];
+    if method == 8 {
+        // 先按记录的长度解；解不开或不像图片，就当成流式压缩一路解到结束。
+        if compressed > 0 {
+            let end = (body_start + compressed).min(data.len());
+            if let Some(image) = inflate(&data[body_start..end]) {
+                return Some(image);
+            }
+        }
+        return inflate(tail);
+    }
+    // stored：优先按记录的明文长度切，长度不可信时整段试。
+    if plain > 0 {
+        let end = (body_start + plain).min(data.len());
+        if let Some(image) = wrap(data[body_start..end].to_vec()) {
+            return Some(image);
+        }
+    }
+    wrap(tail.to_vec())
+}
+
+/// deflate 解压；自带结束标记，尾部多余字节导致的错误忽略。
+fn inflate(slice: &[u8]) -> Option<PackImage> {
+    let mut out = Vec::new();
+    let _ = flate2::read::DeflateDecoder::new(slice).read_to_end(&mut out);
+    wrap(out)
+}
+
+/// 最后一步：不管容器，直接在文件里找图片本体。
+fn carve_image(path: &Path) -> Option<PackImage> {
+    let data = fs::read(path).ok()?;
+    // PNG：从 89 50 4E 47 起，到 IEND + CRC 结束。
+    const PNG: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut at = 0_usize;
+    while let Some(pos) = data[at..].windows(8).position(|w| w == PNG) {
+        let start = at + pos;
+        if let Some(iend) = data[start..].windows(4).position(|w| w == b"IEND") {
+            let end = start + iend + 8;
+            if end <= data.len() {
+                if let Some(image) = wrap(data[start..end].to_vec()) {
+                    return Some(image);
+                }
+            }
+        }
+        at = start + 8;
+    }
+    // WebP：RIFF + 4 字节长度 + WEBP。
+    let mut at = 0_usize;
+    while let Some(pos) = data[at..].windows(4).position(|w| w == b"RIFF") {
+        let start = at + pos;
+        if start + 12 <= data.len() && &data[start + 8..start + 12] == b"WEBP" {
+            let size = u32::from_le_bytes([
+                data[start + 4],
+                data[start + 5],
+                data[start + 6],
+                data[start + 7],
+            ]) as usize
+                + 8;
+            let end = (start + size).min(data.len());
+            if let Some(image) = wrap(data[start..end].to_vec()) {
+                return Some(image);
+            }
+        }
+        at = start + 4;
     }
     None
 }
@@ -457,26 +548,124 @@ mod tests {
         path
     }
 
+
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend_from_slice(b"\x00\x00\x00\x0dIHDR");
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(b"\x00\x00\x00\x00IEND\xaeB`\x82");
+        bytes
+    }
+
+    #[test]
+    fn reads_webp_pack_png() {
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&12u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBPVP8 ");
+        let path = write_temp("webp.zip", &zip_with("pack.png", &webp));
+        let url = local_pack_icon(&path).unwrap();
+        assert!(url.starts_with("data:image/webp;base64,"), "{url}");
+    }
+
+    #[test]
+    fn carves_png_outside_zip() {
+        let mut raw = b"not a zip at all".to_vec();
+        raw.extend_from_slice(&png_bytes());
+        raw.extend_from_slice(b"trailing junk");
+        let path = write_temp("notzip.zip", &raw);
+        let url = local_pack_icon(&path).unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    fn streamed_zip(name: &str, payload: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::DeflateEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut out = Vec::new();
+        // 本地头：flag 0x08（尾部 descriptor）、csize/usize 都写 0。
+        out.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0x0008u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&compressed);
+        out.extend_from_slice(&[0x50, 0x4b, 0x07, 0x08]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let cd_offset = out.len() as u32;
+        // 中央目录：同样 flag 0x08、csize/usize 0，指向偏移 0。
+        out.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0x0008u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        let cd_size = out.len() as u32 - cd_offset;
+        // EOCD
+        out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn reads_streamed_zip_entry() {
+        // 流式写入的 zip：本地头 csize=0，真正长度在尾部 descriptor 里。
+        let raw = streamed_zip("pack.png", &png_bytes());
+        let path = write_temp("streamed.zip", &raw);
+        let url = local_pack_icon(&path).expect("streamed zip should still yield an icon");
+        assert!(url.starts_with("data:image/png;base64,"));
+    }
+
     #[test]
     fn reads_lowercase_pack_png() {
-        let bytes = zip_with("pack.png", b"PNGDATA");
-        let path = write_temp("lower.zip", &bytes);
-        assert_eq!(read_pack_png(&path).as_deref(), Some(&b"PNGDATA"[..]));
+        let png = png_bytes();
+        let path = write_temp("lower.zip", &zip_with("pack.png", &png));
+        assert_eq!(read_pack_png_bytes(&path).as_deref(), Some(&png[..]));
     }
 
     #[test]
     fn reads_uppercase_pack_png() {
-        let bytes = zip_with("PACK.PNG", b"PNGDATA");
-        let path = write_temp("upper.zip", &bytes);
-        assert_eq!(read_pack_png(&path).as_deref(), Some(&b"PNGDATA"[..]));
+        let png = png_bytes();
+        let path = write_temp("upper.zip", &zip_with("PACK.PNG", &png));
+        assert_eq!(read_pack_png_bytes(&path).as_deref(), Some(&png[..]));
     }
 
     #[test]
     fn reads_prefixed_zip() {
-        let mut bytes = b"PK".to_vec();
-        bytes.extend(zip_with("pack.png", b"PNGDATA"));
+        let png = png_bytes();
+        let mut bytes = b"PK".to_vec();
+        bytes.extend(zip_with("pack.png", &png));
         let path = write_temp("prefixed.zip", &bytes);
-        assert_eq!(read_pack_png(&path).as_deref(), Some(&b"PNGDATA"[..]));
+        assert_eq!(read_pack_png_bytes(&path).as_deref(), Some(&png[..]));
     }
 
 }
