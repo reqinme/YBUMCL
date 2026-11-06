@@ -2892,8 +2892,15 @@
     const preset = page.url.searchParams.get("mod");
     if (preset !== null) {
       const wanted = page.url.searchParams.get("kind") ?? "";
-      const kindCat: Category =
-        wanted === "resourcepacks" ? "resourcepacks" : wanted === "shaders" ? "shaders" : "mods";
+      const kindMap: Record<string, Category> = {
+        resourcepacks: "resourcepacks",
+        shaders: "shaders",
+        worlds: "worlds",
+        saves: "worlds",
+        datapacks: "datapacks",
+        packs: "packs"
+      };
+      const kindCat: Category = kindMap[wanted] ?? "mods";
       cat = kindCat;
       // 实例页带过来的上下文：游戏版本 / 加载器只用来收窄筛选，搜索词永远是显示名。
       const presetGame = page.url.searchParams.get("mc") ?? "";

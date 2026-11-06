@@ -4434,7 +4434,9 @@ pub fn delete_entry(
         return Err("文件名不合法".into());
     }
     let sub = match subdir.as_str() {
-        "resourcepacks" | "shaderpacks" | "saves" | "screenshots" | "mods" => subdir.as_str(),
+        "resourcepacks" | "shaderpacks" | "saves" | "screenshots" | "schematics" | "mods" => {
+            subdir.as_str()
+        }
         _ => return Err("这个目录不支持删除".to_owned()),
     };
     let runtime = runtime_of(game_dir, game_directory)?;

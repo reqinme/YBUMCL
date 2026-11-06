@@ -128,7 +128,11 @@
   let packSelected = $state(new Set<string>());
   let pendingPackDelete = $state<{ tab: string; name: string } | null>(null);
   let pendingSaveDelete = $state<string | null>(null);
+  let pendingBulkDelete = $state<string | null>(null);
   let shotView = $state<{ name: string; data: string } | null>(null);
+  let shotQuery = $state("");
+  let schemQuery = $state("");
+  let serverQuery = $state("");
   /// 光影配置弹窗：配置表 + 改过的值。
   let shaderConfig = $state<ShaderConfig | null>(null);
   let shaderChoices = $state<Record<string, { value: string; label: string }[]>>({});
@@ -1383,6 +1387,113 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     return list.filter((item) => item.name.toLowerCase().includes(query));
   }
 
+  /// 这些列表的「全选 / 删除选中」共用一套选中集合（键是 `页码:名字`）。
+  function pickedIn(tab: string) {
+    const prefix = `${tab}:`;
+    return [...packSelected]
+      .filter((key) => key.startsWith(prefix))
+      .map((key) => key.slice(prefix.length));
+  }
+
+  function togglePicked(key: string) {
+    togglePackPicked(key);
+  }
+
+  const shownServers = $derived(
+    serverQuery.trim()
+      ? servers.filter((server) => {
+          const query = serverQuery.trim().toLowerCase();
+          return (
+            server.name.toLowerCase().includes(query) || server.ip.toLowerCase().includes(query)
+          );
+        })
+      : servers
+  );
+
+  const shownShots = $derived(
+    (entries.screenshots ?? [])
+      .filter((shot) => !shot.dir)
+      .filter((shot) =>
+        shotQuery.trim() ? shot.name.toLowerCase().includes(shotQuery.trim().toLowerCase()) : true
+      )
+  );
+
+  const allShotsPicked = $derived(
+    shownShots.length > 0 &&
+      shownShots.every((shot) => packSelected.has(`screenshots:${shot.name}`))
+  );
+
+  function toggleAllShots() {
+    if (allShotsPicked) {
+      packSelected = new Set();
+      return;
+    }
+    packSelected = new Set(shownShots.map((shot) => `screenshots:${shot.name}`));
+  }
+
+  const shownSaves = $derived(
+    packQuery.trim()
+      ? saves.filter((save) =>
+          `${save.levelName ?? ""} ${save.name}`
+            .toLowerCase()
+            .includes(packQuery.trim().toLowerCase())
+        )
+      : saves
+  );
+
+  const allSavesPicked = $derived(
+    shownSaves.length > 0 && shownSaves.every((save) => packSelected.has(`saves:${save.name}`))
+  );
+
+  function toggleAllSaves() {
+    if (allSavesPicked) {
+      packSelected = new Set();
+      return;
+    }
+    packSelected = new Set(shownSaves.map((save) => `saves:${save.name}`));
+  }
+
+  const shownSchematics = $derived(
+    (entries[tab] ?? []).filter((file) =>
+      schemQuery.trim() ? file.name.toLowerCase().includes(schemQuery.trim().toLowerCase()) : true
+    )
+  );
+
+  const allSchematicsPicked = $derived(
+    shownSchematics.length > 0 &&
+      shownSchematics.every((file) => packSelected.has(`${tab}:${file.name}`))
+  );
+
+  function toggleAllSchematics() {
+    if (allSchematicsPicked) {
+      packSelected = new Set();
+      return;
+    }
+    packSelected = new Set(shownSchematics.map((file) => `${tab}:${file.name}`));
+  }
+
+  /// 服务器没有「删除选中」——把选中的地址复制到剪贴板，方便粘到游戏里。
+  async function copyPickedServers() {
+    const picked = pickedIn("servers");
+    const list = servers.filter((server) => picked.includes(server.ip));
+    if (list.length === 0) return;
+    await navigator.clipboard.writeText(list.map((server) => server.ip).join("\n"));
+    announce(`已复制 ${list.length} 个服务器地址`);
+  }
+
+  async function bulkDelete(tab: string, permanent: boolean) {
+    const names = pickedIn(tab);
+    if (names.length === 0) return;
+    const sub = subPath(tab);
+    for (const name of names) {
+      await api.deleteEntry(gameDir, gameDirectory, sub, name, permanent).catch(() => {});
+    }
+    packSelected = new Set();
+    if (tab === "saves") await loadSaves();
+    else await loadEntries(tab);
+    announce(`已删除 ${names.length} 个`);
+  }
+
   function togglePackPicked(key: string) {
     const next = new Set(packSelected);
     if (next.has(key)) next.delete(key);
@@ -2426,31 +2537,79 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     </section>
   {:else if tab === "servers"}
     <section class="panel">
+      <div class="mods-head">
+        <input class="mods-search" placeholder="搜索名称或地址" bind:value={serverQuery} />
+        <div class="mods-tools">
+          <button class="btn" onclick={() => void openSub("servers")}>打开文件夹</button>
+          <button class="btn" onclick={copyPickedServers} disabled={pickedIn("servers").length === 0}>
+            复制选中地址{pickedIn("servers").length ? ` (${pickedIn("servers").length})` : ""}
+          </button>
+          <button
+            class="btn"
+            onclick={() =>
+              (packSelected = new Set(
+                shownServers.map((server) => `servers:${server.ip}`)
+              ))}
+          >
+            全选
+          </button>
+        </div>
+      </div>
       {#if servers.length === 0}
         <p class="dim">还没有记录服务器。</p>
+      {:else if shownServers.length === 0}
+        <p class="dim">没有匹配的服务器。</p>
       {:else}
         <table class="servers">
-          <thead><tr><th>名称</th><th>地址</th></tr></thead>
+          <thead><tr><th></th><th>名称</th><th>地址</th></tr></thead>
           <tbody>
-            {#each servers as server (server.ip)}
-              <tr><td>{server.name}</td><td class="mono">{server.ip}</td></tr>
+            {#each shownServers as server (server.ip)}
+              <tr
+                class:picked={packSelected.has(`servers:${server.ip}`)}
+                role="presentation"
+                onclick={() => togglePicked(`servers:${server.ip}`)}
+                onkeydown={() => {}}
+              >
+                <td class="pick-cell">{packSelected.has(`servers:${server.ip}`) ? "✓" : ""}</td>
+                <td>{server.name}</td>
+                <td class="mono">{server.ip}</td>
+              </tr>
             {/each}
           </tbody>
         </table>
       {/if}
-      <div class="row"><button class="btn" onclick={() => void openSub("servers")}>打开目录</button></div>
     </section>
   {:else if tab === "screenshots"}
     <section class="panel">
+      <div class="mods-head">
+        <input class="mods-search" placeholder="搜索文件名" bind:value={shotQuery} />
+        <div class="mods-tools">
+          <button class="btn" onclick={() => void openSub("screenshots")}>打开文件夹</button>
+          <button class="btn" onclick={toggleAllShots}>{allShotsPicked ? "取消全选" : "全选"}</button>
+          {#if pickedIn("screenshots").length > 0}
+            <button class="btn danger" onclick={() => (pendingBulkDelete = "screenshots")}>
+              删除选中 ({pickedIn("screenshots").length})
+            </button>
+          {/if}
+        </div>
+      </div>
       {#if (entries.screenshots ?? []).filter((shot) => !shot.dir).length === 0}
         <p class="dim">还没有截图。</p>
+      {:else if shownShots.length === 0}
+        <p class="dim">没有匹配的截图。</p>
       {:else}
         <div class="shots">
-          {#each (entries.screenshots ?? []).filter((shot) => !shot.dir) as shot (shot.name)}
+          {#each shownShots as shot (shot.name)}
             {#if shots[shot.name]}
               <div
                 class="shot-card"
+                class:picked={packSelected.has(`screenshots:${shot.name}`)}
                 role="group"
+                onclick={(event) => {
+                  if ((event.target as HTMLElement).closest("button")) return;
+                  togglePicked(`screenshots:${shot.name}`);
+                }}
+                onkeydown={() => {}}
                 onmousemove={(event) =>
                   (shotTip = {
                     name: shot.name,
@@ -2475,7 +2634,6 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           {/each}
         </div>
       {/if}
-      <div class="row"><button class="btn" onclick={() => void openSub("screenshots")}>打开目录</button></div>
     </section>
   {:else if tab === "resourcepacks" || tab === "shaders"}
     <section class="panel">
@@ -2499,6 +2657,11 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           <button class="btn" onclick={() => toggleAllPacks(tab)}>
             {allPacksPicked(tab) ? "取消全选" : "全选"}
           </button>
+          {#if pickedIn(tab).length > 0}
+            <button class="btn danger" onclick={() => (pendingBulkDelete = tab)}>
+              删除选中 ({pickedIn(tab).length})
+            </button>
+          {/if}
         </div>
       </div>
       {#if (entries[tab] ?? []).length === 0}
@@ -2551,6 +2714,15 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         <div class="mods-tools">
           <button class="btn" onclick={() => void openSub("saves")}>打开文件夹</button>
           <button class="btn" onclick={() => void pasteSaves()}>粘贴文件</button>
+          <button class="btn" onclick={() => goto("/downloads?kind=worlds&mod=")}>下载存档</button>
+          <button class="btn" onclick={toggleAllSaves}>
+            {allSavesPicked ? "取消全选" : "全选"}
+          </button>
+          {#if pickedIn("saves").length > 0}
+            <button class="btn danger" onclick={() => (pendingBulkDelete = "saves")}>
+              删除选中 ({pickedIn("saves").length})
+            </button>
+          {/if}
         </div>
       </div>
       {#if savesBusy}
@@ -2559,8 +2731,17 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         <p class="dim">还没有存档。</p>
       {:else}
         <div class="save-list">
-          {#each saves as save (save.name)}
-            <div class="pack-row">
+          {#each shownSaves as save (save.name)}
+            <div
+              class="pack-row"
+              class:picked={packSelected.has(`saves:${save.name}`)}
+              role="presentation"
+              onclick={(event) => {
+                if ((event.target as HTMLElement).closest("button")) return;
+                togglePicked(`saves:${save.name}`);
+              }}
+              onkeydown={() => {}}
+            >
               <span class="pack-icon save-icon">
                 {#if save.icon}
                   <img src={save.icon} alt="" />
@@ -2635,19 +2816,40 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     </section>
   {:else}
     <section class="panel">
+      <div class="mods-head">
+        <input class="mods-search" placeholder="搜索文件名" bind:value={schemQuery} />
+        <div class="mods-tools">
+          <button class="btn" onclick={() => void openSub(tab)}>打开文件夹</button>
+          <button class="btn" onclick={toggleAllSchematics}>
+            {allSchematicsPicked ? "取消全选" : "全选"}
+          </button>
+          {#if pickedIn(tab).length > 0}
+            <button class="btn danger" onclick={() => (pendingBulkDelete = tab)}>
+              删除选中 ({pickedIn(tab).length})
+            </button>
+          {/if}
+        </div>
+      </div>
       {#if (entries[tab] ?? []).length === 0}
         <p class="dim">{EMPTY_TEXT[tab] ?? "这个目录还是空的。"}</p>
+      {:else if shownSchematics.length === 0}
+        <p class="dim">没有匹配的文件。</p>
       {:else}
         <div class="files">
-          {#each entries[tab] ?? [] as file (file.name)}
-            <div class="file">
+          {#each shownSchematics as file (file.name)}
+            <div
+              class="file"
+              class:picked={packSelected.has(`${tab}:${file.name}`)}
+              role="presentation"
+              onclick={() => togglePicked(`${tab}:${file.name}`)}
+              onkeydown={() => {}}
+            >
               <span class="mono">{file.name}</span>
               <span class="dim">{file.dir ? "文件夹" : sizeText(file.size)}</span>
             </div>
           {/each}
         </div>
       {/if}
-      <div class="row"><button class="btn" onclick={() => void openSub(tab)}>打开目录</button></div>
     </section>
   {/if}
 {/if}
@@ -2744,6 +2946,21 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     <button class="btn ghost" onclick={() => (modDetail = null)}>关闭</button>
   {/snippet}
 </Modal>
+
+<ConfirmDialog
+  open={pendingBulkDelete !== null}
+  message={pendingBulkDelete === null
+    ? ""
+    : `删除选中的 ${pickedIn(pendingBulkDelete).length} 个条目？
+
+不按 Shift 会进回收站，还能捞回来；按住 Shift 点击是永久删除。`}
+  oncancel={() => (pendingBulkDelete = null)}
+  onconfirm={(event) => {
+    const target = pendingBulkDelete;
+    pendingBulkDelete = null;
+    if (target) void bulkDelete(target, event.shiftKey);
+  }}
+/>
 
 <ConfirmDialog
   open={pendingPackDelete !== null}
@@ -3016,6 +3233,22 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     padding-left: 18px;
     color: var(--text-dim);
     line-height: 1.7;
+  }
+  .file.picked {
+    border-color: var(--accent, #7bbf6a);
+    background: rgb(123 191 106 / 0.12);
+  }
+  .shot-card.picked {
+    border-color: var(--accent, #7bbf6a);
+    box-shadow: 0 0 0 1px rgb(123 191 106 / 0.5);
+  }
+  .servers tr.picked td {
+    background: rgb(123 191 106 / 0.12);
+  }
+  .servers .pick-cell {
+    width: 28px;
+    text-align: center;
+    color: var(--accent, #7bbf6a);
   }
   .file {
     display: flex;
@@ -3476,6 +3709,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     flex-wrap: wrap;
     align-items: center;
     flex: none;
+    margin-bottom: 14px;
   }
   .mods-search {
     flex: 1 1 220px;
@@ -3738,7 +3972,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   .pack-list {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 14px;
   }
   .pack-row {
     display: flex;
