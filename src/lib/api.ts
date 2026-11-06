@@ -564,6 +564,21 @@ export const api = {
   quickPlaySupported: (gameDir: string, id: string) =>
     invoke<boolean>("quick_play_supported", { gameDir, id }),
   /// 资源包 / 光影包的项目信息（名字、中文名、图标）。
+  /// 资源包/光影包自带的 `pack.png`（本地读，不联网），用来先把图标铺上。
+  packLocalIcons: (
+    gameDir: string,
+    gameDirectory: string | null,
+    subdir: string,
+    files: string[],
+  ): Promise<Record<string, string>> => {
+    return invoke<Record<string, string>>("pack_local_icons", {
+      gameDir,
+      gameDirectory,
+      subdir,
+      files,
+    });
+  },
+
   packProjects: (
     gameDir: string,
     gameDirectory: string | null,

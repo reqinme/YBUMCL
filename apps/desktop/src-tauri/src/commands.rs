@@ -4219,6 +4219,43 @@ pub struct EntryInfo {
     pub modified_ms: u64,
 }
 
+/// 资源包/光影包自带图标的快速路径：只读 zip 里的 `pack.png`，不联网。
+#[tauri::command]
+pub async fn pack_local_icons(
+    paths: State<'_, Paths>,
+    game_dir: String,
+    game_directory: Option<String>,
+    subdir: String,
+    files: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let _ = &paths;
+    tauri::async_runtime::spawn_blocking(move || {
+        let sub = match subdir.as_str() {
+            "resourcepacks" => "resourcepacks",
+            "shaderpacks" => "shaderpacks",
+            _ => return Err("这个目录没有对应的项目信息".to_owned()),
+        };
+        let runtime = runtime_of(game_dir, game_directory)?;
+        let dir = runtime.join(sub);
+        let mut icons = std::collections::HashMap::new();
+        for file_name in files {
+            if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+                continue;
+            }
+            let path = dir.join(&file_name);
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(icon) = launcher_core::modicons::local_pack_icon(&path) {
+                icons.insert(file_name, icon);
+            }
+        }
+        Ok(icons)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// 按哈希查资源包 / 光影包对应的平台项目（名字与图标）。
 #[tauri::command]
 pub async fn pack_projects(

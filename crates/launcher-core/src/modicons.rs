@@ -13,11 +13,32 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 const CACHE_FILE: &str = "mod-icons.json";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const CACHE_VERSION: u32 = 3;
+
+/// 资源包/光影包里自带的图标（`pack.png`）读成 data URL。
+///
+/// PCL 就是这条路：本地文件加载时直接 `jar.GetEntry("pack.png")`，不联网。
+/// 这里只解压一个几百字节的 entry，比「整包 SHA1 + 查平台 + 下载图标」快得多。
+pub fn local_pack_icon(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name("pack.png").ok()?;
+    if entry.size() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("data:image/png;base64,{encoded}"))
+}
 
 /// 一个模组文件的两种身份：Modrinth 认 SHA1，CurseForge 认指纹。
 #[derive(Debug, Clone)]

@@ -86,6 +86,7 @@ pub fn run() {
             commands::repair_instance_files,
             commands::diagnose_crash_report,
             commands::pack_projects,
+            commands::pack_local_icons,
             commands::shader_config,
             commands::save_shader_config,
             commands::list_saves,

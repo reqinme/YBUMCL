@@ -1300,6 +1300,21 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   }
 
   /// 资源包 / 光影包：按哈希去平台认领项目（名字、中文名、图标）。
+  /// 先把 zip 里自带的 `pack.png` 铺上（PCL 就是这么做的，纯本地、不等网络）。
+  async function loadLocalPackIcons(kind: "resourcepacks" | "shaders") {
+    const files = (entries[kind] ?? []).filter((item) => !item.dir).map((item) => item.name);
+    if (files.length === 0) return;
+    const sub = kind === "shaders" ? "shaderpacks" : kind;
+    try {
+      const icons = await api.packLocalIcons(gameDir, gameDirectory, sub, files);
+      const next = { ...packIcons };
+      for (const [name, icon] of Object.entries(icons)) next[`${kind}:${name}`] = icon;
+      packIcons = next;
+    } catch {
+      // 读不出就继续用 logo 占位。
+    }
+  }
+
   async function loadPackInfo(kind: "resourcepacks" | "shaders") {
     const list = (entries[kind] ?? []).filter((item) => !item.dir).map((item) => item.name);
     const unmet = list.filter((name) => !(`${kind}:${name}` in packInfo));
@@ -1745,6 +1760,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     if (next === "servers") await loadServers();
     if (next in SUB_DIRS && next !== "saves") await loadEntries(next);
     if (next === "resourcepacks" || next === "shaders") {
+      await loadLocalPackIcons(next as "resourcepacks" | "shaders");
       await loadPackInfo(next);
       if (next === "shaders") await checkShaderLoader();
     }
