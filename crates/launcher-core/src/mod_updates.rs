@@ -1,17 +1,27 @@
 //! 模组更新检查：按文件哈希反查来源，再问来源有没有适配当前版本/加载器的新文件。
 //!
-//! 只做「查」和「换」两件事，扫描目录、读写文件都走 `mods` 里已有的校验逻辑。
+//! 照 PCL 的做法：Modrinth 用 `POST /version_files/update` 一次问全，
+//! CurseForge 用项目自带的 `latestFilesIndexes` + `POST /mods/files` 批量取，
+//! 判定「要不要更新」只看**目标文件的 sha1 与本地是否相同**，不看版本号字符串。
+//! 结果按「sha1 + 版本 + 加载器」缓存 6 小时，没查到的一个都不写。
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{curseforge, export, modrinth, CoreError};
+
+/// 缓存有效期：6 小时后重新联网（PCL 同款）。
+const CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+
+/// 缓存文件；换版本/换加载器就整份失效。
+const CACHE_FILE: &str = "mod-updates.json";
 
 /// 一条模组的更新情况；只有能识别出来源的模组才会出现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +51,22 @@ pub struct ModProject {
     /// Modrinth 的 project id / CurseForge 的数字 id。
     pub project_id: String,
 }
+
+/// 一次检查的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateReport {
+    pub updates: Vec<ModUpdate>,
+    /// 认出来的项目数（不含没命中任何来源的 jar）。
+    pub identified: usize,
+    /// 这次联网失败、下次还得重查的项目数。
+    pub failed: usize,
+    /// 全部命中缓存、这次没联网。
+    pub cached: bool,
+}
+
+/// 进度回调：阶段名 + 已完成 + 总数。阶段名给界面直接显示。
+pub type Progress<'a> = &'a mut dyn FnMut(&str, usize, usize);
 
 /// 给单个模组文件认领项目：先查 Modrinth（sha1），查不到再问 CurseForge（指纹）。
 pub fn identify(runtime_dir: &Path, file_name: &str) -> Result<Option<ModProject>, CoreError> {
@@ -76,86 +102,205 @@ pub fn identify(runtime_dir: &Path, file_name: &str) -> Result<Option<ModProject
     Ok(None)
 }
 
-struct LocalFile {
-    file_name: String,
-    sha1: String,
-    murmur: u32,
-}
-
 /// 检查目录里所有模组的更新情况。认不出来源的文件直接跳过。
-pub fn check(runtime_dir: &Path, game: &str, loader: &str) -> Result<Vec<ModUpdate>, CoreError> {
+///
+/// `data_dir` 下写缓存；`force` 为真时忽略缓存整份重查；`cancel` 置位后尽快返回。
+pub fn check(
+    runtime_dir: &Path,
+    game: &str,
+    loader: &str,
+    data_dir: &Path,
+    force: bool,
+    cancel: &AtomicBool,
+    progress: Option<Progress<'_>>,
+) -> Result<UpdateReport, CoreError> {
+    let mut progress = progress;
+    let mut tick = |stage: &str, done: usize, total: usize| {
+        if let Some(callback) = progress.as_mut() {
+            callback(stage, done, total);
+        }
+    };
+
     let dir = mods_dir(runtime_dir);
-    let files = local_files(&dir)?;
+    let files = local_files(&dir, cancel, &mut tick)?;
+    if cancel.load(Ordering::SeqCst) {
+        // 取消不算失败：让界面保留上一次的结果，别用半份数据覆盖。
+        return Err(CoreError::InvalidInput("已取消".into()));
+    }
     if files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(UpdateReport {
+            updates: Vec::new(),
+            identified: 0,
+            failed: 0,
+            cached: false,
+        });
     }
 
-    let sha1s: Vec<String> = files.iter().map(|file| file.sha1.clone()).collect();
-    let by_modrinth = modrinth::lookup_sha1(&sha1s).unwrap_or_default();
-    let mut hit_sha: HashMap<String, modrinth::MrFileHit> = HashMap::new();
-    for hit in by_modrinth {
-        hit_sha.insert(hit.sha1.to_lowercase(), hit);
-    }
+    let game = game.trim();
+    let loader = loader.trim();
+    let now = now_secs();
+    let mut cache = load_cache(data_dir, game, loader);
+    let mut fresh = HashMap::new();
 
-    let fingerprints: Vec<u32> = files.iter().map(|file| file.murmur).collect();
-    let by_curse = curseforge::fingerprint_details(&fingerprints).unwrap_or_default();
-    let mut hit_fingerprint: HashMap<u32, u64> = HashMap::new();
-    for (fingerprint, mod_id, _file_id) in by_curse {
-        hit_fingerprint.insert(fingerprint, mod_id);
-    }
-
-    // 每个来源只查一次「最新版本」。
-    let mut wanted: Vec<(String, String)> = Vec::new(); // (source, project)
+    // 哪些还要联网：缓存里没有、或者过期 / 上次没查成功。
+    let mut pending: Vec<&LocalFile> = Vec::new();
     for file in &files {
-        if hit_sha.contains_key(&file.sha1.to_lowercase()) {
-            let project = hit_sha[&file.sha1.to_lowercase()].project_id.clone();
-            wanted.push(("modrinth".into(), project));
-        } else if let Some(project) = hit_fingerprint.get(&file.murmur) {
-            wanted.push(("curseforge".into(), project.to_string()));
+        let hit = cache.entries.get(&file.sha1);
+        let usable = !force
+            && hit.is_some_and(|entry| {
+                entry.ok && now.saturating_sub(entry.at) < CACHE_TTL_SECS && !entry.url.is_empty()
+            });
+        if !usable {
+            pending.push(file);
         }
     }
-    wanted.sort();
-    wanted.dedup();
+    if pending.is_empty() {
+        let mut report = report_from_cache(&files, &cache);
+        report.cached = true;
+        tick("done", files.len(), files.len());
+        return Ok(report);
+    }
 
-    // 空字符串等于「不筛」，别把空条件塞进接口。
-    let game = if game.is_empty() { None } else { Some(game) };
-    let loader = if loader.is_empty() { None } else { Some(loader) };
-    let latest = latest_versions(&wanted, game, loader);
-    let mut out = Vec::new();
-    for file in &files {
-        if let Some(hit) = hit_sha.get(&file.sha1.to_lowercase()) {
-            let key = ("modrinth".to_owned(), hit.project_id.clone());
-            let Some(Some(newest)) = latest.get(&key) else {
-                continue;
-            };
-            out.push(ModUpdate {
-                file_name: file.file_name.clone(),
-                source: "modrinth".into(),
-                project_id: hit.project_id.clone(),
-                current_version: hit.version_number.clone(),
-                latest_version: newest.0.clone(),
-                latest_file_name: newest.1.clone(),
-                latest_url: newest.2.clone(),
-                can_update: newest.0 != hit.version_number && !newest.2.is_empty(),
-            });
-        } else if let Some(project) = hit_fingerprint.get(&file.murmur) {
-            let key = ("curseforge".to_owned(), project.to_string());
-            let Some(Some(newest)) = latest.get(&key) else {
-                continue;
-            };
-            out.push(ModUpdate {
-                file_name: file.file_name.clone(),
-                source: "curseforge".into(),
-                project_id: project.to_string(),
-                current_version: file.file_name.clone(),
-                latest_version: newest.0.clone(),
-                latest_file_name: newest.1.clone(),
-                latest_url: newest.2.clone(),
-                can_update: newest.0 != file.file_name && !newest.2.is_empty(),
-            });
+    tick("modrinth", 0, pending.len());
+    if cancel.load(Ordering::SeqCst) {
+        return Err(CoreError::InvalidInput("已取消".into()));
+    }
+
+    // ── Modrinth：先 sha1 换项目，再一次问「该升级到哪个文件」。
+    let sha1s: Vec<String> = pending.iter().map(|file| file.sha1.clone()).collect();
+    let mut looked_up: HashSet<String> = HashSet::new();
+    // 只把「这一步真的报错」算成没查通；查到了但没有适配当前版本的更新是正常结果。
+    let mut modrinth_error = false;
+    let mut curse_error = false;
+    if let Ok(hits) = modrinth::lookup_sha1(&sha1s) {
+        for hit in &hits {
+            looked_up.insert(hit.sha1.to_lowercase());
+        }
+        match modrinth::update_version_files(&sha1s, none_if_empty(game), none_if_empty(loader)) {
+          Err(_) => modrinth_error = true,
+          Ok(targets) => {
+            for target in targets {
+                let sha1 = target.sha1.to_lowercase();
+                let Some(local) = pending.iter().find(|file| file.sha1 == sha1) else {
+                    continue;
+                };
+                fresh.insert(
+                    sha1.clone(),
+                    CacheEntry {
+                        source: "modrinth".into(),
+                        project: target.project_id,
+                        current: String::new(),
+                        latest: target.version_number,
+                        file_name: target.file_name,
+                        url: target.file_url,
+                        latest_sha1: target.file_sha1,
+                        at: now,
+                        ok: true,
+                        local_file: local.file_name.clone(),
+                    },
+                );
+            }
+          }
+        }
+    } else {
+        modrinth_error = true;
+    }
+    let modrinth_failed = if modrinth_error { looked_up.len() } else { 0 };
+    tick("modrinth", pending.len(), pending.len());
+
+    if cancel.load(Ordering::SeqCst) {
+        return Err(CoreError::InvalidInput("已取消".into()));
+    }
+
+    // ── CurseForge：指纹 → 项目（自带 latestFilesIndexes）→ 批量取文件详情。
+    tick("curseforge", 0, pending.len());
+    let curse_pending: Vec<&LocalFile> = pending
+        .iter()
+        .copied()
+        .filter(|file| !looked_up.contains(&file.sha1))
+        .collect();
+    if !curse_pending.is_empty() {
+        let fingerprints: Vec<u32> = curse_pending.iter().map(|file| file.murmur).collect();
+        let by_mod = curseforge::fingerprint_details(&fingerprints).unwrap_or_default();
+        let mut mod_of: HashMap<u32, u64> = HashMap::new();
+        let mut mod_ids: Vec<u64> = Vec::new();
+        for (fingerprint, mod_id, file_id) in by_mod {
+            mod_of.insert(fingerprint, mod_id);
+            mod_ids.push(mod_id);
+            let _ = fingerprint;
+            let _ = file_id;
+        }
+        mod_ids.sort_unstable();
+        mod_ids.dedup();
+
+        let indexes = match curseforge::latest_file_indexes(&mod_ids) {
+            Ok(indexes) => Some(indexes),
+            Err(_) => {
+                curse_error = true;
+                None
+            }
+        };
+        if let Some(indexes) = indexes {
+            // 每个项目：只留「游戏版本 + 加载器」对得上的，取 fileId 最大的（后发的 id 更大）。
+            let mut wanted: HashMap<u64, u64> = HashMap::new();
+            for index in indexes {
+                // 和 PCL 一样严格：游戏版本、加载器都要对上；
+                // 加载器为空（通用 jar）不算命中，宁可多报「没查到」也别推错文件。
+                if !game.is_empty() && index.game_version != game {
+                    continue;
+                }
+                if !loader.is_empty() && !index.mod_loader.eq_ignore_ascii_case(loader) {
+                    continue;
+                }
+                let slot = wanted.entry(index.mod_id).or_insert(index.file_id);
+                if index.file_id > *slot {
+                    *slot = index.file_id;
+                }
+            }
+            let ids: Vec<u64> = wanted.values().copied().collect();
+            if let Ok(files) = curseforge::files_by_ids(&ids) {
+                let by_id: HashMap<u64, curseforge::PackFile> =
+                    files.into_iter().map(|file| (file.id, file)).collect();
+                for local in &curse_pending {
+                    let Some(mod_id) = mod_of.get(&local.murmur).copied() else {
+                        continue;
+                    };
+                    let Some(file_id) = wanted.get(&mod_id).copied() else {
+                        continue;
+                    };
+                    let Some(file) = by_id.get(&file_id) else {
+                        continue;
+                    };
+                    fresh.insert(
+                        local.sha1.clone(),
+                        CacheEntry {
+                            source: "curseforge".into(),
+                            project: mod_id.to_string(),
+                            current: String::new(),
+                            latest: file.file_name.clone(),
+                            file_name: file.file_name.clone(),
+                            url: file.url.clone(),
+                            latest_sha1: file.sha1.clone().unwrap_or_default().to_lowercase(),
+                            at: now,
+                            ok: true,
+                            local_file: local.file_name.clone(),
+                        },
+                    );
+                }
+            }
         }
     }
-    Ok(out)
+    tick("curseforge", pending.len(), pending.len());
+
+    let found = fresh.len();
+    merge(&mut cache, fresh);
+    save_cache(data_dir, &cache);
+
+    let curse_failed = if curse_error { curse_pending.len() } else { 0 };
+    let mut report = report_from_cache(&files, &cache);
+    report.failed = modrinth_failed + curse_failed;
+    let _ = found;
+    Ok(report)
 }
 
 /// 下载最新文件并替换掉旧文件。返回替换后的新文件名。
@@ -205,31 +350,190 @@ pub fn apply(runtime_dir: &Path, update: &ModUpdate) -> Result<String, CoreError
         .unwrap_or_else(|| update.latest_file_name.clone()))
 }
 
+struct LocalFile {
+    file_name: String,
+    sha1: String,
+    murmur: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheEntry {
+    source: String,
+    project: String,
+    /// 本地版本号（Modrinth 才有，读的时候从文件里补）。
+    #[serde(default)]
+    current: String,
+    latest: String,
+    file_name: String,
+    url: String,
+    /// 目标文件的 sha1；和本地相同就说明已经是最新。
+    #[serde(default)]
+    latest_sha1: String,
+    at: u64,
+    ok: bool,
+    /// 缓存里记下本地文件名，换了文件自然就查不到了。
+    #[serde(default)]
+    local_file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CacheFile {
+    #[serde(default)]
+    game: String,
+    #[serde(default)]
+    loader: String,
+    #[serde(default)]
+    entries: HashMap<String, CacheEntry>,
+}
+
+fn cache_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(CACHE_FILE)
+}
+
+fn load_cache(data_dir: &Path, game: &str, loader: &str) -> CacheFile {
+    let path = cache_path(data_dir);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return CacheFile {
+            game: game.to_owned(),
+            loader: loader.to_owned(),
+            ..Default::default()
+        };
+    };
+    let Ok(mut cache) = serde_json::from_str::<CacheFile>(&text) else {
+        return CacheFile {
+            game: game.to_owned(),
+            loader: loader.to_owned(),
+            ..Default::default()
+        };
+    };
+    // 换游戏版本或加载器，旧结果一律作废。
+    if !cache.game.eq_ignore_ascii_case(game) || !cache.loader.eq_ignore_ascii_case(loader) {
+        cache.entries.clear();
+    }
+    cache.game = game.to_owned();
+    cache.loader = loader.to_owned();
+    cache
+}
+
+fn save_cache(data_dir: &Path, cache: &CacheFile) {
+    // 一条都没有就不写，别把「网络失败」缓存成「没有更新」。
+    if cache.entries.is_empty() {
+        return;
+    }
+    let path = cache_path(data_dir);
+    let Ok(text) = serde_json::to_string_pretty(cache) else {
+        return;
+    };
+    let temp = path.with_extension("json.tmp");
+    if fs::write(&temp, text).is_ok() {
+        let _ = fs::rename(&temp, &path);
+    }
+}
+
+fn merge(cache: &mut CacheFile, fresh: HashMap<String, CacheEntry>) {
+    for (sha1, entry) in fresh {
+        cache.entries.insert(sha1, entry);
+    }
+}
+
+/// 把缓存翻译成界面用的结果。
+fn report_from_cache(files: &[LocalFile], cache: &CacheFile) -> UpdateReport {
+    let mut updates = Vec::new();
+    let mut identified = 0;
+    for file in files {
+        let Some(entry) = cache.entries.get(&file.sha1) else {
+            continue;
+        };
+        if !entry.ok {
+            continue;
+        }
+        identified += 1;
+        // 目标文件就是本地这个文件 → 已经是最新。
+        let same = !entry.latest_sha1.is_empty() && entry.latest_sha1.eq_ignore_ascii_case(&file.sha1);
+        let current_version = if entry.source == "modrinth" && !entry.current.is_empty() {
+            entry.current.clone()
+        } else {
+            strip_disabled(&file.file_name)
+        };
+        updates.push(ModUpdate {
+            file_name: file.file_name.clone(),
+            source: entry.source.clone(),
+            project_id: entry.project.clone(),
+            current_version,
+            latest_version: entry.latest.clone(),
+            latest_file_name: entry.file_name.clone(),
+            latest_url: entry.url.clone(),
+            can_update: !same && !entry.url.is_empty(),
+        });
+    }
+    UpdateReport {
+        updates,
+        identified,
+        failed: 0,
+        cached: false,
+    }
+}
+
+fn strip_disabled(name: &str) -> String {
+    name.strip_suffix(".disabled").unwrap_or(name).to_owned()
+}
+
+fn none_if_empty(value: &str) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default()
+}
+
 fn mods_dir(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join("mods")
 }
 
-fn local_files(dir: &Path) -> Result<Vec<LocalFile>, CoreError> {
+fn local_files(
+    dir: &Path,
+    cancel: &AtomicBool,
+    tick: &mut dyn FnMut(&str, usize, usize),
+) -> Result<Vec<LocalFile>, CoreError> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(error) => return Err(crate::io_error(dir, error)),
     };
-    for entry in entries {
-        let entry = entry.map_err(|error| crate::io_error(dir, error))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    let names: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .map(|name| {
+                        let lower = name.to_string_lossy().to_lowercase();
+                        lower.ends_with(".jar") || lower.ends_with(".jar.disabled")
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    let total = names.len();
+    for (index, path) in names.into_iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            break;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let lower = name.to_lowercase();
-        if !lower.ends_with(".jar") && !lower.ends_with(".jar.disabled") {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Ok(bytes) = fs::read(&path) else {
             continue;
-        }
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
         };
         let mut hasher = Sha1::new();
         hasher.update(&bytes);
@@ -238,6 +542,9 @@ fn local_files(dir: &Path) -> Result<Vec<LocalFile>, CoreError> {
             sha1: hex(&hasher.finalize()),
             murmur: export::curseforge_fingerprint(&bytes),
         });
+        if index % 8 == 0 || index + 1 == total {
+            tick("hash", index + 1, total);
+        }
     }
     Ok(out)
 }
@@ -248,56 +555,6 @@ fn hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
-}
-
-/// 结果表的 key 是 `(来源, 项目 id)`，值是新版本的 `(版本号, 文件名, 下载地址)`。
-/// 四路并发：几百个模组逐个查会拖到一两分钟。
-fn latest_versions(
-    wanted: &[(String, String)],
-    game: Option<&str>,
-    loader: Option<&str>,
-) -> HashMap<(String, String), Option<(String, String, String)>> {
-    let results: Mutex<HashMap<(String, String), Option<(String, String, String)>>> =
-        Mutex::new(HashMap::new());
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = wanted.len().min(4).max(1);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let Some((source, project)) = wanted.get(index) else {
-                    return;
-                };
-                let found = if source == "modrinth" {
-                    modrinth::versions(project, game, loader)
-                        .ok()
-                        .and_then(|list| list.into_iter().next())
-                        .map(|version| {
-                            (
-                                version.version_number,
-                                version.file_name,
-                                version.file_url,
-                            )
-                        })
-                } else {
-                    curseforge::versions(project, game, loader)
-                        .ok()
-                        .and_then(|list| list.into_iter().next())
-                        .map(|version| {
-                            (
-                                version.file_name.clone(),
-                                version.file_name,
-                                version.file_url,
-                            )
-                        })
-                };
-                if let Ok(mut guard) = results.lock() {
-                    guard.insert((source.clone(), project.clone()), found);
-                }
-            });
-        }
-    });
-    results.into_inner().unwrap_or_default()
 }
 
 /// 目标文件名已经存在且不是同一个文件时，加序号避免覆盖别人的文件。

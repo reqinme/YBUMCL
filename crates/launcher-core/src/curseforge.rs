@@ -160,6 +160,34 @@ fn call(path: &str, body: Option<&Value>) -> Result<Value> {
     Err(last.unwrap_or_else(|| CoreError::InvalidInput("CurseForge 没有可用的接口".into())))
 }
 
+/// 按模组 id 批量取 `logo.thumbnailUrl`。
+pub fn project_icons(mod_ids: &[u64]) -> Result<std::collections::HashMap<u64, String>> {
+    use std::collections::HashMap;
+    let mut out: HashMap<u64, String> = HashMap::new();
+    if mod_ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in mod_ids.chunks(100) {
+        let body = serde_json::json!({ "modIds": chunk });
+        let Ok(value) = post("/mods", &body) else {
+            continue;
+        };
+        let Some(mods) = value["data"].as_array() else {
+            continue;
+        };
+        for item in mods {
+            let (Some(id), Some(icon)) = (
+                item["id"].as_u64(),
+                item["logo"]["thumbnailUrl"].as_str(),
+            ) else {
+                continue;
+            };
+            out.insert(id, icon.to_owned());
+        }
+    }
+    Ok(out)
+}
+
 /// 界面的内容分类 → CurseForge 的 classId。
 fn class_id(kind: &str) -> Option<u32> {
     Some(match kind {
@@ -660,6 +688,50 @@ pub fn fingerprint_details(hashes: &[u32]) -> Result<Vec<(u32, u64, u64)>> {
                 continue;
             };
             out.push((fingerprint as u32, mod_id, file_id));
+        }
+    }
+    Ok(out)
+}
+
+/// 项目返回的 `latestFilesIndexes` 里的一条：某个游戏版本 + 加载器对应的最新文件。
+#[derive(Debug, Clone)]
+pub struct LatestFileIndex {
+    pub mod_id: u64,
+    pub file_id: u64,
+    pub game_version: String,
+    pub mod_loader: String,
+}
+
+/// 批量取「每个项目在每个版本/加载器下的最新文件 id」。
+///
+/// 项目详情里自带 `latestFilesIndexes`，不用再去 `/mods/{id}/files` 拉全部文件——
+/// 这正是 PCL 的取法，一个请求就能覆盖上百个项目。
+pub fn latest_file_indexes(mod_ids: &[u64]) -> Result<Vec<LatestFileIndex>> {
+    let mut out = Vec::new();
+    for chunk in mod_ids.chunks(100) {
+        let body = serde_json::json!({ "modIds": chunk, "filterPcOnly": false });
+        let value = post("/mods", &body)?;
+        let data = value["data"].as_array().cloned().unwrap_or_default();
+        for item in data {
+            let mod_id = number(&item, "id");
+            let Some(indexes) = item["latestFilesIndexes"].as_array() else {
+                continue;
+            };
+            for index in indexes {
+                out.push(LatestFileIndex {
+                    mod_id,
+                    file_id: number(index, "fileId"),
+                    game_version: text(index, "gameVersion"),
+                    // 接口里 `modLoader` 是数字（1 Forge / 3 LiteLoader / 4 Fabric / 5 Quilt / 6 NeoForge），
+                    // 少数情况给字符串；统一成小写名字，方便和实例的加载器比。
+                    mod_loader: match index["modLoader"].as_u64() {
+                        Some(number) => loader_name(number)
+                            .map(|name| name.to_lowercase())
+                            .unwrap_or_default(),
+                        None => text(index, "modLoader").to_lowercase(),
+                    },
+                });
+            }
         }
     }
     Ok(out)

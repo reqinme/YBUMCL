@@ -5,9 +5,11 @@
   import { announce } from "$lib/tasks.svelte";
   import BackButton from "$lib/components/BackButton.svelte";
   import Modal from "$lib/components/Modal.svelte";
+  import Dropdown from "$lib/components/Dropdown.svelte";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
 
-  type Filter = "all" | "offline" | "microsoft";
+  /// "all" / "offline" / "microsoft"，或者某个认证服务器的地址。
+  type Filter = string;
   type Layout = "grid" | "list";
 
   let view = $state<AccountsView | null>(null);
@@ -16,12 +18,18 @@
   let layout = $state<Layout>(readLayout());
 
   let addOpen = $state(false);
-  let addKind = $state<"pick" | "offline" | "microsoft">("pick");
+  let addKind = $state<"pick" | "offline" | "microsoft" | "thirdparty">("pick");
   let newName = $state("");
   let busy = $state(false);
 
   let device = $state<DeviceCode | null>(null);
   let msLeft = $state(0);
+
+  let serverOpen = $state(false);
+  let serverUrl = $state("");
+  let thirdUrl = $state("");
+  let thirdUser = $state("");
+  let thirdPassword = $state("");
 
   let menuFor = $state<string | null>(null);
   let renaming = $state<Account | null>(null);
@@ -32,20 +40,38 @@
 
   let timer: ReturnType<typeof setInterval> | undefined;
 
-  const sources: { id: Filter; label: string }[] = [
+  const sources = $derived<{ id: Filter; label: string }[]>([
     { id: "all", label: "全部来源" },
     { id: "offline", label: "离线账户" },
-    { id: "microsoft", label: "微软账户" }
-  ];
+    { id: "microsoft", label: "微软账户" },
+    ...(view?.servers ?? []).map((server) => ({ id: server.url, label: server.name }))
+  ]);
+
+  function countOf(id: Filter) {
+    const players = view?.players ?? [];
+    if (id === "all") return players.length;
+    if (id === "offline" || id === "microsoft") {
+      return players.filter((account) => account.kind === id).length;
+    }
+    return players.filter((account) => account.server === id).length;
+  }
 
   const visible = $derived(
-    (view?.players ?? []).filter((account) => filter === "all" || account.kind === filter)
+    (view?.players ?? []).filter((account) => {
+      if (filter === "all") return true;
+      if (filter === "offline" || filter === "microsoft") return account.kind === filter;
+      return account.server === filter;
+    })
   );
-  const counts = $derived({
-    all: view?.players.length ?? 0,
-    offline: (view?.players ?? []).filter((account) => account.kind === "offline").length,
-    microsoft: (view?.players ?? []).filter((account) => account.kind === "microsoft").length
-  });
+
+  /// 第三方账户卡片的副标题用服务器名，没名字就退回地址。
+  function sourceName(account: Account) {
+    if (account.kind === "microsoft") return "微软账户";
+    if (account.kind === "offline") return "离线账户";
+    const url = account.server ?? "";
+    const server = (view?.servers ?? []).find((item) => item.url === url);
+    return server?.name || url;
+  }
 
   function readLayout(): Layout {
     try {
@@ -90,6 +116,58 @@
     }
   }
 
+  async function addServer() {
+    busy = true;
+    try {
+      view = await api.addAuthServer(serverUrl);
+      announce("认证服务器已添加");
+      serverOpen = false;
+      serverUrl = "";
+      addKind = "pick";
+      addOpen = true;
+    } catch (error) {
+      showError("添加认证服务器失败", String(error));
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function removeServer() {
+    const server = (view?.servers ?? []).find((item) => item.url === filter);
+    if (!server) return;
+    try {
+      view = await api.removeAuthServer(server.url);
+      filter = "all";
+      announce(`已移除「${server.name}」和它下面的账户`);
+    } catch (error) {
+      showError("移除认证服务器失败", String(error));
+    }
+  }
+
+  function startThirdParty(preset?: string) {
+    addKind = "thirdparty";
+    thirdUrl =
+      preset ??
+      (filter !== "all" && filter !== "offline" && filter !== "microsoft"
+        ? filter
+        : (view?.servers[0]?.url ?? ""));
+    thirdUser = "";
+    thirdPassword = "";
+  }
+
+  async function addThirdParty() {
+    busy = true;
+    try {
+      view = await api.addThirdPartyAccount(thirdUrl, thirdUser, thirdPassword);
+      announce(`已添加第三方账户「${thirdUser.trim()}」`);
+      closeAdd();
+    } catch (error) {
+      showError("第三方登录失败", String(error));
+    } finally {
+      busy = false;
+    }
+  }
+
   async function addOffline() {
     busy = true;
     try {
@@ -109,6 +187,8 @@
     addKind = "pick";
     newName = "";
     device = null;
+    thirdUser = "";
+    thirdPassword = "";
   }
 
   function stopPolling() {
@@ -243,9 +323,14 @@
           onclick={() => (filter = source.id)}
         >
           <span class="label">{source.label}</span>
-          {#if counts[source.id] > 0}<span class="count">{counts[source.id]}</span>{/if}
+          {#if countOf(source.id) > 0}<span class="count">{countOf(source.id)}</span>{/if}
         </button>
       {/each}
+      <div class="rail-foot">
+        <button class="ghost-link" onclick={() => { serverOpen = true; serverUrl = ""; }}>
+          + 添加认证服务器
+        </button>
+      </div>
     </aside>
 
     <section class="panel">
@@ -267,6 +352,9 @@
             </svg>
           </button>
         </div>
+        {#if filter !== "all" && filter !== "offline" && filter !== "microsoft"}
+          <button class="btn ghost small" onclick={removeServer}>移除这个服务器</button>
+        {/if}
         <button class="btn primary add" onclick={() => (addOpen = true)}>+ 添加角色</button>
       </div>
 
@@ -286,7 +374,7 @@
                 {/if}
                 <span class="meta">
                   <span class="name">{account.name}</span>
-                  <span class="sub">{account.kind === "microsoft" ? "微软账户" : "离线账户"}</span>
+                  <span class="sub">{sourceName(account)}</span>
                 </span>
                 {#if view?.current === account.id}
                   <span class="dot" aria-label="当前账户"></span>
@@ -310,9 +398,19 @@
                   {/if}
                   {#if account.kind === "offline"}
                     <button onclick={() => startRename(account)}>重命名</button>
-                  {:else}
+                  {:else if account.kind === "microsoft"}
                     <button onclick={() => refresh(account)}>续期登录</button>
                     <button onclick={() => { menuFor = null; void startMicrosoft(); }}>重新登录</button>
+                  {:else}
+                    <button
+                      onclick={() => {
+                        menuFor = null;
+                        addOpen = true;
+                        startThirdParty(account.server ?? undefined);
+                      }}
+                    >
+                      重新登录
+                    </button>
                   {/if}
                   <button class="danger" onclick={() => { menuFor = null; removing = account; }}>删除</button>
                 </div>
@@ -338,6 +436,18 @@
         <strong>微软账户</strong>
         <span class="dim">在浏览器里输一次设备码，能进正版服务器。</span>
       </button>
+      <button
+        class="kind"
+        disabled={!view?.servers.length}
+        onclick={() => startThirdParty()}
+      >
+        <strong>第三方账户</strong>
+        <span class="dim">
+          {view?.servers.length
+            ? "用认证服务器的账号密码登录，能进这些服务器。"
+            : "先点左下角「添加认证服务器」，再加这里的账号。"}
+        </span>
+      </button>
     </div>
   {:else if addKind === "offline"}
     <div class="form">
@@ -349,6 +459,32 @@
       <div class="row">
         <button class="btn primary" disabled={busy} onclick={addOffline}>
           {busy ? "添加中…" : "添加"}
+        </button>
+        <button class="btn ghost" onclick={() => (addKind = "pick")}>返回</button>
+      </div>
+    </div>
+  {:else if addKind === "thirdparty"}
+    <div class="form">
+      <label>
+        <span>认证服务器</span>
+        <Dropdown
+          value={thirdUrl}
+          options={(view?.servers ?? []).map((server) => ({ value: server.url, label: server.name }))}
+          onchange={(next) => (thirdUrl = next)}
+        />
+      </label>
+      <label>
+        <span>账号</span>
+        <input bind:value={thirdUser} autocomplete="username" placeholder="邮箱或用户名" />
+      </label>
+      <label>
+        <span>密码</span>
+        <input type="password" bind:value={thirdPassword} autocomplete="current-password" placeholder="密码" />
+      </label>
+      <p class="dim small">密码只用来换一次登录令牌，不会存下来。</p>
+      <div class="row">
+        <button class="btn primary" disabled={busy} onclick={addThirdParty}>
+          {busy ? "登录中…" : "登录"}
         </button>
         <button class="btn ghost" onclick={() => (addKind = "pick")}>返回</button>
       </div>
@@ -373,6 +509,24 @@
       {/if}
     </div>
   {/if}
+</Modal>
+
+<Modal open={serverOpen} title="添加认证服务器" onclose={() => (serverOpen = false)}>
+  <div class="form">
+    <label>
+      <span>服务器地址</span>
+      <input bind:value={serverUrl} placeholder="https://example.com/api/yggdrasil" />
+    </label>
+    <p class="dim small">
+      地址是认证服务器的 yggdrasil 根地址；加进来之后左栏会多一项，点「添加角色」就能用它的账号登录。
+    </p>
+    <div class="row">
+      <button class="btn primary" disabled={busy} onclick={addServer}>
+        {busy ? "正在读取服务器信息…" : "添加"}
+      </button>
+      <button class="btn ghost" onclick={() => (serverOpen = false)}>取消</button>
+    </div>
+  </div>
 </Modal>
 
 <Modal open={renaming !== null} title="重命名" onclose={() => (renaming = null)}>
@@ -421,6 +575,30 @@
     grid-template-columns: 200px minmax(0, 1fr);
     gap: 16px;
     align-items: start;
+  }
+  .rail-foot {
+    margin-top: auto;
+    padding-top: 8px;
+    border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  }
+  .ghost-link {
+    width: 100%;
+    padding: 8px 10px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--dim, #9aa0aa);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ghost-link:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text, #e6e8ee);
+  }
+  .btn.small {
+    padding: 4px 10px;
+    font-size: 12px;
   }
   .rail {
     display: flex;

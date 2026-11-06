@@ -17,6 +17,7 @@ use thiserror::Error;
 
 /// 账户：离线档案与微软（设备代码）登录。
 pub mod auth;
+pub mod authlib;
 pub mod cleanroom;
 /// 崩溃报告诊断：认识几类高置信度的原因，认不出来就返回空。
 pub mod crash;
@@ -37,6 +38,7 @@ pub mod modloader;
 pub mod mod_updates;
 pub mod modpack;
 pub mod modrinth;
+pub mod modicons;
 pub mod mods;
 pub mod names;
 pub mod packages;
@@ -148,6 +150,22 @@ pub struct LaunchRequest {
     /// 实例设置里的「使用调试级别 log4j 配置文件」。
     #[serde(default)]
     pub log4j_debug: bool,
+    /// 第三方认证服务器：非空时给 JVM 加 authlib-injector 的 agent 参数。
+    #[serde(default)]
+    pub authlib: Option<AuthlibInject>,
+}
+
+/// authlib-injector 的启动参数（由界面按当前账户的认证服务器算好传进来）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthlibInject {
+    /// 数据目录里的 `authlib-injector.jar`。
+    pub jar: String,
+    /// 认证服务器接口地址。
+    pub server: String,
+    /// 服务器元数据（原文 JSON）；游戏端会预取，不再联网。
+    #[serde(default)]
+    pub metadata: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2140,6 +2158,19 @@ fn prepare(
     let mut args = vec![format!("-Xmx{}M", request.max_memory_mb)];
     if request.initial_memory_mb > 0 {
         args.push(format!("-Xms{}M", request.initial_memory_mb));
+    }
+    // 第三方登录：authlib-injector 的 agent 要排在所有 JVM 参数之后、main class
+    // 之前（它靠 agentmain 改 classloader，位置错了游戏端还是走正版验证）。
+    if let Some(authlib) = request.authlib.as_ref() {
+        let metadata = authlib
+            .metadata
+            .as_deref()
+            .ok_or_else(|| CoreError::InvalidInput("认证服务器缺少元数据，重新添加一次。".into()))?;
+        use base64::Engine;
+        let prefetched = base64::engine::general_purpose::STANDARD.encode(metadata.as_bytes());
+        jvm.push(format!("-javaagent:{}={}", authlib.jar, authlib.server));
+        jvm.push("-Dauthlibinjector.side=client".into());
+        jvm.push(format!("-Dauthlibinjector.yggdrasil.prefetched={prefetched}"));
     }
     args.extend(jvm);
     args.push(v["mainClass"].as_str().unwrap().into());

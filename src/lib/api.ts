@@ -421,6 +421,14 @@ export type ModImportOutcome = {
 };
 
 /// 一条模组的更新情况；只有能识别出来源（Modrinth / CurseForge）的才有。
+/// 一次检查的结果：`identified` 是认出来源的模组数，`failed` 是这轮没查通的。
+export type UpdateReport = {
+  updates: ModUpdate[];
+  identified: number;
+  failed: number;
+  cached: boolean;
+};
+
 export type ModUpdate = {
   fileName: string;
   source: "modrinth" | "curseforge";
@@ -433,8 +441,8 @@ export type ModUpdate = {
 };
 
 
-/// 账户：离线档案（名字即身份）和微软账户（登录后拿到的档案）。
-export type AccountKind = "offline" | "microsoft";
+/// 账户：离线档案（名字即身份）、微软账户、第三方认证服务器上的账户。
+export type AccountKind = "offline" | "microsoft" | "thirdparty";
 
 export type Account = {
   id: string;
@@ -443,11 +451,20 @@ export type Account = {
   kind: AccountKind;
   /// `data:image/png;base64,…`，离线账户没有。
   avatar: string | null;
+  /// 第三方账户所属的认证服务器地址。
+  server: string | null;
+};
+
+/// 加过的第三方认证服务器（左栏就是按这个列表生成的）。
+export type AuthServer = {
+  url: string;
+  name: string;
 };
 
 export type AccountsView = {
   players: Account[];
   current: string | null;
+  servers: AuthServer[];
 };
 
 /// 设备代码登录：把 userCode + verificationUri 显示给用户。
@@ -887,6 +904,17 @@ export const api = {
   ) => invoke<void>("remove_mod", { gameDir, gameDirectory, fileName, permanent }),
   modIcon: (gameDir: string, gameDirectory: string | null, fileName: string) =>
     invoke<string | null>("mod_icon", { gameDir, gameDirectory, fileName }),
+  /// 给 jar 里没带图标的模组，按 SHA1 / 指纹去 Modrinth、CurseForge 找项目图标。
+  modProjectIcons: (
+    gameDir: string,
+    gameDirectory: string | null,
+    files: string[],
+  ) =>
+    invoke<Record<string, string>>("mod_project_icons", {
+      gameDir,
+      gameDirectory,
+      files,
+    }),
   /// 认领这个 jar 在 Modrinth / CurseForge 上的项目；认不到就是 null。
   modProject: (gameDir: string, gameDirectory: string | null, fileName: string) =>
     invoke<{ source: string; projectId: string } | null>("mod_project", {
@@ -894,18 +922,22 @@ export const api = {
       gameDirectory,
       fileName
     }),
+  /// 查更新。`force` 为真是手动的「检查更新」（忽略 6 小时缓存）。
   checkModUpdates: (
     gameDir: string,
     gameDirectory: string | null,
     gameVersion: string,
     loader: string,
+    force = false,
   ) =>
-    invoke<ModUpdate[]>("check_mod_updates", {
+    invoke<UpdateReport>("check_mod_updates", {
       gameDir,
       gameDirectory,
       gameVersion,
       loader,
+      force,
     }),
+  cancelModUpdates: () => invoke<void>("cancel_mod_updates"),
   applyModUpdate: (
     gameDir: string,
     gameDirectory: string | null,
@@ -938,6 +970,12 @@ export const api = {
   removeAccount: (id: string) => invoke<AccountsView>("remove_account", { id }),
   selectAccount: (id: string) => invoke<AccountsView>("select_account", { id }),
   refreshAccount: (id: string) => invoke<AccountsView>("refresh_account", { id }),
+  addAuthServer: (url: string) =>
+    invoke<AccountsView>("add_auth_server", { url }),
+  removeAuthServer: (url: string) =>
+    invoke<AccountsView>("remove_auth_server", { url }),
+  addThirdPartyAccount: (url: string, username: string, password: string) =>
+    invoke<AccountsView>("add_third_party_account", { url, username, password }),
   msLoginStart: () => invoke<DeviceCode>("ms_login_start"),
   msLoginPoll: (deviceCode: string) =>
     invoke<MsLogin>("ms_login_poll", { deviceCode }),
@@ -1031,6 +1069,16 @@ export function onModpackProgress(
   handler: (progress: ModpackProgress) => void,
 ): Promise<UnlistenFn> {
   return listen<ModpackProgress>("modpack-progress", (event) =>
+    handler(event.payload),
+  );
+}
+
+/// 查更新的进度：阶段名（hash / modrinth / curseforge / done）+ 已完成 + 总数。
+export type ModUpdateProgress = { stage: string; done: number; total: number };
+export function onModUpdatesProgress(
+  handler: (progress: ModUpdateProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<ModUpdateProgress>("mod-updates-progress", (event) =>
     handler(event.payload),
   );
 }

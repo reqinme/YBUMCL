@@ -1,6 +1,6 @@
 [package]
 name = "ybumcl-desktop"
-version = "0.2.3"
+version = "0.2.4"
 description = "延边大学我的世界启动器 / Yanbian University Minecraft Launcher"
 authors = ["YBUMCL"]
 edition = "2024"

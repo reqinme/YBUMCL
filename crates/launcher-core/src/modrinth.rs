@@ -3,7 +3,7 @@
 //! 只用公开的 `/v2` 接口：搜索、项目版本列表、按文件直链下载。
 //! Modrinth 要求带 User-Agent，且并发有配额，所以这里用一个共享的阻塞客户端。
 
-use std::{fs, path::Path, sync::OnceLock, time::Duration};
+use std::{collections::HashMap, fs, path::Path, sync::OnceLock, time::Duration};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -707,4 +707,94 @@ pub fn lookup_sha1(hashes: &[String]) -> Result<Vec<MrFileHit>> {
 
 fn text_of(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().to_owned()
+}
+
+/// 按项目 id 批量取 `icon_url`，给「jar 里没有图标」的模组用项目图标。
+pub fn project_icon_urls(ids: &[String]) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in ids.chunks(100) {
+        let quoted: Vec<String> = chunk.iter().map(|id| format!("\"{id}\"")).collect();
+        let url = format!("{API}/projects?ids=[{}]", quoted.join(","));
+        let Ok(projects) = get_json(&url) else { continue };
+        let Some(list) = projects.as_array() else { continue };
+        for project in list {
+            let id = project.get("id").and_then(|v| v.as_str());
+            let icon = project.get("icon_url").and_then(|v| v.as_str());
+            if let (Some(id), Some(icon)) = (id, icon) {
+                out.insert(id.to_owned(), icon.to_owned());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `POST /v2/version_files/update` 的一条：某个本地文件在该版本/加载器下应升级到的目标文件。
+#[derive(Debug, Clone)]
+pub struct MrUpdateHit {
+    pub sha1: String,
+    pub project_id: String,
+    pub version_number: String,
+    pub file_name: String,
+    pub file_url: String,
+    /// 目标文件的 sha1：跟本地相同就说明已经是最新。
+    pub file_sha1: String,
+}
+
+/// 一次问清「这批文件在该版本 + 加载器下各自应升级到哪个文件」。
+///
+/// 这是 Modrinth 专门给启动器用的批量升级接口：不像 `versions(project)` 那样逐项目查，
+/// 几百个模组也只要一次请求（PCL 用的就是它）。
+pub fn update_version_files(
+    hashes: &[String],
+    game: Option<&str>,
+    loader: Option<&str>,
+) -> Result<Vec<MrUpdateHit>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut body = serde_json::json!({ "hashes": hashes, "algorithm": "sha1" });
+    if let Some(game) = game {
+        body["game_versions"] = serde_json::json!([game]);
+    }
+    if let Some(loader) = loader {
+        body["loaders"] = serde_json::json!([loader.to_lowercase()]);
+    }
+    let mut out = Vec::new();
+    for chunk in hashes.chunks(1000) {
+        let mut chunk_body = body.clone();
+        chunk_body["hashes"] = serde_json::json!(chunk);
+        let response = client()?
+            .post(format!("{API}/version_files/update"))
+            .header("content-type", "application/json")
+            .body(chunk_body.to_string())
+            .send()
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 请求失败：{error}")))?;
+        if !response.status().is_success() {
+            return Err(CoreError::InvalidInput(format!(
+                "Modrinth 返回 {}",
+                response.status()
+            )));
+        }
+        let text = response
+            .text()
+            .map_err(|error| CoreError::InvalidInput(format!("Modrinth 响应读取失败：{error}")))?;
+        let value: Value = parse("update", &text)?;
+        let Some(map) = value.as_object() else {
+            continue;
+        };
+        for (sha1, version) in map {
+            out.push(MrUpdateHit {
+                sha1: sha1.clone(),
+                project_id: text_of(version, "project_id"),
+                version_number: text_of(version, "version_number"),
+                file_name: text_of(&version["files"][0], "filename"),
+                file_url: text_of(&version["files"][0], "url"),
+                file_sha1: text_of(&version["files"][0]["hashes"], "sha1").to_lowercase(),
+            });
+        }
+    }
+    Ok(out)
 }

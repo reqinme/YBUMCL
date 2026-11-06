@@ -31,6 +31,8 @@
     type JavaInstallation,
     type ModEntry,
     type ModUpdate,
+    type UpdateReport,
+    onModUpdatesProgress,
     type ServerEntry,
     type VersionSettings,
     type VersionView
@@ -98,6 +100,10 @@
   let modUpdates = $state<Record<string, ModUpdate>>({});
   let checkingUpdates = $state(false);
   let updateChecked = $state(false);
+  /// 这一轮查的结果：认出来多少、多少个没查通。
+  let updateReport = $state<{ identified: number; failed: number; cached: boolean } | null>(null);
+  /// 查更新的进度（阶段 + 已完成 / 总数），只在查的时候有值。
+  let updateProgress = $state<{ stage: string; done: number; total: number } | null>(null);
   let modDetail = $state<ModEntry | null>(null);
   /// 批量更新前的风险确认。
   let updateConfirm = $state(false);
@@ -347,7 +353,9 @@
     const alive = new Set(mods.map((mod) => mod.fileName));
     selectedMods = new Set([...selectedMods].filter((name) => alive.has(name)));
     void ensureModIcons();
-    if (updateChecked) void refreshUpdates(false);
+    // 照 PCL：打开模组页就自动补项目信息/更新（6 小时内有缓存就不联网）。
+    if (!updateChecked && canUseMods && mods.length > 0) void refreshUpdates(false);
+    else if (updateChecked) void refreshUpdates(false);
   }
 
   /// 更新检查用的加载器 id：取实例的第一个加载器。
@@ -477,49 +485,131 @@
   }
 
   /// 逐个补图标：只问一次，拿不到的记成 null，滚动时不重复请求。
+  /// 图标分两步：先读 jar 自带的（快，离线也有），再让后端按哈希去
+  /// Modrinth / CurseForge 反查项目图标，补上 jar 里没带图的那批。
   async function ensureModIcons() {
-    for (const mod of mods) {
-      if (mod.fileName in modIcons) continue;
-      // 描述符里没写 icon 的模组也可能有 icon.png / logo.png，
-      // 交给后端按常见文件名再找一层，别在元数据这一层就放弃。
-      try {
-        const icon = await api.modIcon(gameDir, gameDirectory, mod.fileName);
-        modIcons = { ...modIcons, [mod.fileName]: icon };
-      } catch {
-        modIcons = { ...modIcons, [mod.fileName]: null };
-      }
+    const pending = mods.filter((mod) => !(mod.fileName in modIcons));
+    if (pending.length === 0) return;
+    for (let index = 0; index < pending.length; index += 8) {
+      const batch = pending.slice(index, index + 8);
+      await Promise.all(
+        batch.map(async (mod) => {
+          let icon: string | null = null;
+          try {
+            // 描述符里没写 icon 的模组也可能有 icon.png / logo.png，
+            // 交给后端按常见文件名再找一层，别在元数据这一层就放弃。
+            icon = await api.modIcon(gameDir, gameDirectory, mod.fileName);
+          } catch {
+            icon = null;
+          }
+          if (!(mod.fileName in modIcons)) {
+            modIcons = { ...modIcons, [mod.fileName]: icon };
+          }
+        }),
+      );
+    }
+
+    const missing = pending
+      .filter((mod) => !modIcons[mod.fileName])
+      .map((mod) => mod.fileName);
+    if (missing.length === 0) return;
+    let urls: Record<string, string> = {};
+    try {
+      urls = await api.modProjectIcons(gameDir, gameDirectory, missing);
+    } catch {
+      return;
+    }
+    const entries = Object.entries(urls);
+    for (let index = 0; index < entries.length; index += 4) {
+      const batch = entries.slice(index, index + 4);
+      await Promise.all(
+        batch.map(async ([fileName, url]) => {
+          try {
+            const icon = await api.fetchIcon(url);
+            if (icon) modIcons = { ...modIcons, [fileName]: icon };
+          } catch {
+            // 拉不到就保持 jar 里的结果（多半是空），下次进页面再试。
+          }
+        }),
+      );
     }
   }
 
-  /// 查更新：几百个模组要算哈希再问两站，比较慢，只在用户点「检查更新」或切到可更新时跑。
-  async function refreshUpdates(notify: boolean) {
+  /// 查更新。打开模组页时自动跑一次（结果缓存 6 小时，命中缓存就不联网）；
+  /// `force` 只给手动的「检查更新」用，会忽略缓存整份重查。
+  async function refreshUpdates(notify: boolean, force = false) {
     if (!version || checkingUpdates) return;
     checkingUpdates = true;
     updateChecked = true;
+    updateProgress = null;
     try {
-      const list = await api.checkModUpdates(
+      const report: UpdateReport = await api.checkModUpdates(
         gameDir,
         gameDirectory,
         version.gameVersion ?? version.id,
-        modLoader
+        modLoader,
+        force
       );
       const map: Record<string, ModUpdate> = {};
-      for (const item of list) {
+      for (const item of report.updates) {
         if (item.canUpdate) map[item.fileName] = item;
       }
       modUpdates = map;
+      updateReport = {
+        identified: report.identified,
+        failed: report.failed,
+        cached: report.cached
+      };
       if (notify) {
-        announce(
-          Object.keys(map).length > 0
-            ? `有 ${Object.keys(map).length} 个模组可以更新`
-            : "模组都是最新的"
-        );
+        const count = Object.keys(map).length;
+        if (count > 0) announce(`有 ${count} 个模组可以更新`);
+        else if (report.failed > 0) announce(`没查到更新的（${report.failed} 个没查通）`);
+        else announce("模组都是最新的");
       }
     } catch (e) {
-      if (notify) showError("检查更新失败", "两个来源都没查通，过会儿再试。", String(e));
+      // 用户点了取消：保留上一次的结果，不当成错误。
+      const message = String(e);
+      if (message.includes("已取消")) {
+        if (notify) announce("已取消检查更新");
+      } else {
+        updateReport = null;
+        if (notify) showError("检查更新失败", "两个来源都没查通，过会儿再试。", message);
+      }
     } finally {
       checkingUpdates = false;
+      updateProgress = null;
     }
+  }
+
+  /// 取消正在跑的更新检查：后端在阶段之间、每读几个 jar 时看这个标志。
+  async function cancelUpdateCheck() {
+    try {
+      await api.cancelModUpdates();
+    } catch {
+      // 取消失败也没关系，检查跑完会自己停。
+    }
+  }
+
+  /// 行内标签：Modrinth 显示「旧版本 → 新版本」，CurseForge 只有文件名，就只写新文件名。
+  function updateLabel(update: ModUpdate): string {
+    const latest = update.latestVersion.replace(/\.jar(?:\.disabled)?$/i, "");
+    // 后端只记「目标文件」，旧版本号优先用本地 jar 描述符里的 version，
+    // 拿不到再退回文件名（CurseForge 本来就只给文件名）。
+    let current = update.currentVersion;
+    if (/\.jar(?:\.disabled)?$/i.test(current)) {
+      const mod = mods.find((item) => item.fileName === update.fileName);
+      current = mod?.metadata?.version?.trim() ?? "";
+    }
+    if (current && current !== latest) return `${current} → ${latest}`;
+    return latest;
+  }
+
+  /// 阶段名翻译成一句话；进度条上的文字用它。
+  function stageText(stage: string): string {
+    if (stage === "hash") return "正在读模组文件";
+    if (stage === "modrinth") return "正在问 Modrinth";
+    if (stage === "curseforge") return "正在问 CurseForge";
+    return "正在检查更新";
   }
 
   /// 从磁盘选 .jar 装进 mods。
@@ -1281,7 +1371,16 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       })
       .then((fn) => (unlisten = fn))
       .catch(() => {});
-    return () => unlisten?.();
+    let unlistenUpdate: UnlistenFn | undefined;
+    void onModUpdatesProgress((progress) => {
+      updateProgress = progress;
+    })
+      .then((fn) => (unlistenUpdate = fn))
+      .catch(() => {});
+    return () => {
+      unlisten?.();
+      unlistenUpdate?.();
+    };
   });
 </script>
 
@@ -1477,14 +1576,18 @@ function loaderKey(name: string): InstanceLoader["loader"] {
             >{option.label}（{option.count}）</button>
           {/each}
           <span class="grow"></span>
-          <button
-            class="btn ghost"
-            disabled={checkingUpdates}
-            onclick={() => void refreshUpdates(true)}
-          >{checkingUpdates ? "正在检查更新…" : "检查更新"}</button>
+          {#if checkingUpdates}
+            <span class="dim">
+              {stageText(updateProgress?.stage ?? "")}{#if updateProgress && updateProgress.total > 0}
+                {updateProgress.done}/{updateProgress.total}{/if}
+            </span>
+            <button class="btn ghost" onclick={() => void cancelUpdateCheck()}>取消</button>
+          {:else}
+            <button class="btn ghost" onclick={() => void refreshUpdates(true, true)}>检查更新</button>
+          {/if}
         </div>
         <p class="dim">
-          共 {mods.length} 个模组{#if modQuery.trim()}，匹配 {shownMods.length} 个{/if}{#if updatableCount > 0}，其中 {updatableCount} 个可更新{/if}
+          共 {mods.length} 个模组{#if modQuery.trim()}，匹配 {shownMods.length} 个{/if}{#if updatableCount > 0}，其中 {updatableCount} 个可更新{/if}{#if updateReport && updateReport.failed > 0}，{updateReport.failed} 个这次没查通{/if}
         </p>
         <div class="mod-list">
           {#each shownMods as mod (mod.fileName)}
@@ -1526,7 +1629,10 @@ function loaderKey(name: string): InstanceLoader["loader"] {
                 </small>
               </div>
               {#if modUpdates[mod.fileName]?.canUpdate}
-                <span class="tag-update" title="有新版本">可更新</span>
+                <span
+                  class="tag-update"
+                  title={`${modUpdates[mod.fileName].currentVersion} → ${modUpdates[mod.fileName].latestVersion}`}
+                >{updateLabel(modUpdates[mod.fileName])}</span>
               {/if}
               <span class="mod-meta">{(mod.sizeBytes / 1024).toFixed(0)} KB</span>
               <div class="mod-actions">
@@ -2073,7 +2179,12 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 
 <Modal open={modDetail !== null} title="模组详情" onclose={() => (modDetail = null)}>
   {#if modDetail}
-    <p><strong>{modDetail.modName}</strong></p>
+    <div class="mod-head">
+      {#if modIcons[modDetail.fileName]}
+        <img class="mod-face" src={modIcons[modDetail.fileName]} alt="" />
+      {/if}
+      <p><strong>{modDetail.modName}</strong></p>
+    </div>
     <p class="hint mono">{modDetail.fileName}</p>
     {#if modDetail.metadata?.description}
       <p class="hint">{modDetail.metadata.description}</p>
@@ -2180,6 +2291,19 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 </div>
 
 <style>
+  .mod-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .mod-face {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    object-fit: cover;
+    flex: none;
+  }
+
   .servers {
     width: 100%;
     border-collapse: collapse;

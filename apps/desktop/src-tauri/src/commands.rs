@@ -847,6 +847,25 @@ fn launch_request(
         None
     };
     if let Some(player) = account.as_mut() {
+        if player.kind == launcher_core::auth::AccountKind::Thirdparty {
+            let url = player.server.clone().unwrap_or_default();
+            let server = store
+                .auth_servers
+                .iter()
+                .find(|server| server.url == url)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("账户「{}」用的认证服务器已经删了，重新加一个再登录。", player.name)
+                })?;
+            launcher_core::auth::session(player, &server)
+                .map_err(|error| format!("「{}」的登录过期了：{error}", player.name))?;
+            if let Some(saved) = store.players.iter_mut().find(|saved| saved.id == player.id) {
+                saved.access = player.access.clone();
+                saved.refresh = player.refresh.clone();
+                saved.access_expires = player.access_expires;
+                let _ = store.save(paths.data_dir());
+            }
+        }
         if player.kind == launcher_core::auth::AccountKind::Microsoft {
             launcher_core::auth::ensure_fresh(player)
                 .map_err(|error| format!("微软账户「{}」的登录状态不能用了：{error}", player.name))?;
@@ -863,6 +882,29 @@ fn launch_request(
     let microsoft = account
         .as_ref()
         .is_some_and(|player| player.kind == launcher_core::auth::AccountKind::Microsoft);
+    let third_party = account
+        .as_ref()
+        .is_some_and(|player| player.kind == launcher_core::auth::AccountKind::Thirdparty);
+    // 第三方账户要把 authlib-injector 塞进 JVM 参数，游戏端才知道去哪验证。
+    let authlib = if third_party {
+        let player = account.as_ref().expect("third_party 只会在有账户时为真");
+        let url = player.server.clone().unwrap_or_default();
+        let server = store
+            .auth_servers
+            .iter()
+            .find(|server| server.url == url)
+            .cloned()
+            .ok_or_else(|| "账户用的认证服务器已经被删了。".to_string())?;
+        let jar = launcher_core::authlib::ensure_jar(paths.data_dir())
+            .map_err(|error| format!("下载 authlib-injector 失败：{error}"))?;
+        Some(launcher_core::AuthlibInject {
+            jar: jar.to_string_lossy().into_owned(),
+            server: server.url.clone(),
+            metadata: server.metadata.clone(),
+        })
+    } else {
+        None
+    };
     let username = account
         .as_ref()
         .map(|player| player.name.clone())
@@ -893,9 +935,9 @@ fn launch_request(
                     .into(),
             )
         }
-        3 => {
+        3 if !third_party => {
             return Err(
-                "这个实例限了「仅第三方登录」，第三方认证服务器（authlib-injector）还没接，暂时只能把它改成不限制或仅离线模式。"
+                "这个实例限了「仅第三方登录」：先添加一个第三方认证服务器并登录那里的账号，选中它再启动。"
                     .into(),
             )
         }
@@ -975,7 +1017,13 @@ fn launch_request(
         },
         access_token: account
             .as_ref()
-            .filter(|player| player.kind == launcher_core::auth::AccountKind::Microsoft)
+            .filter(|player| {
+                matches!(
+                    player.kind,
+                    launcher_core::auth::AccountKind::Microsoft
+                        | launcher_core::auth::AccountKind::Thirdparty
+                )
+            })
             .and_then(|player| player.access.clone()),
         uuid: account.as_ref().map(|player| player.uuid.clone()),
         version_type: Some(version.version_type.clone()).filter(|text| !text.trim().is_empty()),
@@ -985,6 +1033,7 @@ fn launch_request(
         skip_file_check: version.skip_file_check,
         allow_java_upgrade: true,
         log4j_debug: version.debug_log4j,
+        authlib,
     })
 }
 
@@ -2600,25 +2649,52 @@ pub async fn content_categories(
 /// 取一张图标并转成 data URL；纯白/纯透明的图返回 None（界面用首字母占位）。
 ///
 /// CurseForge 的图片服务器不带 CORS 头，前端没法直接读像素，所以判断放在后端做。
+/// 图标缓存：同一个地址只下载一次。
+///
+/// 列表和详情面板是同一个组件的两个实例，各取一次；以前两次都走网络，
+/// 哪次慢过前端 6 秒就永远显示成「没有图标」（左边有、右边没有就是这么来的）。
+static ICON_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>> =
+    std::sync::OnceLock::new();
+
+fn icon_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
+    ICON_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 #[tauri::command]
 pub async fn fetch_icon(url: String) -> Result<Option<String>, String> {
     if !url.starts_with("https://") {
         return Err("Invalid input: icon url must be https".into());
     }
+    if let Some(hit) = icon_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&url).cloned())
+    {
+        return Ok(hit);
+    }
+    let key = url.clone();
     let bytes = tauri::async_runtime::spawn_blocking(move || {
-        launcher_core::download::fetch_file_bytes(&url, &CancellationToken::default())
+        launcher_core::download::fetch_file_bytes(&key, &CancellationToken::default())
     })
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())?;
-    match launcher_core::icons::inspect(&bytes) {
-        Some((_mime, true)) => Ok(None),
-        Some((mime, false)) => Ok(Some(format!(
+    let icon = match launcher_core::icons::inspect(&bytes) {
+        Some((_mime, true)) => None,
+        Some((mime, false)) => Some(format!(
             "data:image/{mime};base64,{}",
             launcher_core::icons::base64(&bytes)
-        ))),
-        None => Ok(None),
+        )),
+        None => None,
+    };
+    if let Ok(mut cache) = icon_cache().lock() {
+        // 图标都很小，缓存 512 个足够翻很久；超了直接清空重来。
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        cache.insert(url, icon.clone());
     }
+    Ok(icon)
 }
 
 /// 把 Modrinth 的文件下到指定目录。
@@ -3286,8 +3362,29 @@ pub fn save_settings(
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountsView {
-    pub players: Vec<launcher_core::auth::Account>,
+    pub players: Vec<PlayerView>,
     pub current: Option<String>,
+    /// 加过的第三方认证服务器（只给界面显示名字与地址，元数据留在磁盘上）。
+    pub servers: Vec<AuthServerView>,
+}
+
+/// 给界面看的账户：不带刷新令牌。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerView {
+    pub id: String,
+    pub name: String,
+    pub uuid: String,
+    pub kind: launcher_core::auth::AccountKind,
+    pub avatar: Option<String>,
+    pub server: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthServerView {
+    pub url: String,
+    pub name: String,
 }
 
 /// 读账户表；空表时把老设置里那个玩家名转成一个离线账户，避免升级后「一个账户都没有」。
@@ -3304,8 +3401,27 @@ fn accounts_store(paths: &crate::portable::Paths) -> launcher_core::auth::Store 
 
 fn accounts_view(store: &launcher_core::auth::Store) -> AccountsView {
     AccountsView {
-        players: store.players.clone(),
+        players: store
+            .players
+            .iter()
+            .map(|player| PlayerView {
+                id: player.id.clone(),
+                name: player.name.clone(),
+                uuid: player.uuid.clone(),
+                kind: player.kind,
+                avatar: player.avatar.clone(),
+                server: player.server.clone(),
+            })
+            .collect(),
         current: store.current.clone(),
+        servers: store
+            .auth_servers
+            .iter()
+            .map(|server| AuthServerView {
+                url: server.url.clone(),
+                name: server.name.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -3438,6 +3554,82 @@ pub async fn refresh_account(
     .map_err(|error| error.to_string())?
 }
 
+/// 加一个第三方认证服务器：读它的元数据（名字、签名公钥），存进账户表。
+#[tauri::command]
+pub async fn add_auth_server(paths: State<'_, Paths>, url: String) -> Result<AccountsView, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let server = launcher_core::authlib::fetch_server(&url)?;
+        let mut store = launcher_core::auth::Store::load(&data_dir);
+        store.add_server(server);
+        store
+            .save(&data_dir)
+            .map_err(|error| format!("账户表写不进去：{error}"))?;
+        Ok::<_, String>(accounts_view(&store))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn remove_auth_server(paths: State<'_, Paths>, url: String) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    store.remove_server(&url);
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
+/// 用账号密码登录第三方认证服务器；一个账号下有多个角色时全部加进来。
+#[tauri::command]
+pub async fn add_third_party_account(
+    paths: State<'_, Paths>,
+    url: String,
+    username: String,
+    password: String,
+) -> Result<AccountsView, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = launcher_core::auth::Store::load(&data_dir);
+        // 服务器可能被手动删过，登录前先确认元数据还在（不在就重新拉一次）。
+        let server = match store.auth_servers.iter().find(|server| server.url == url) {
+            Some(server) => server.clone(),
+            None => {
+                let fetched = launcher_core::authlib::fetch_server(&url)?;
+                store.add_server(fetched.clone());
+                fetched
+            }
+        };
+        let profiles = launcher_core::authlib::login(&server, &username, &password)?;
+        if profiles.is_empty() {
+            return Err("这个账号里没有 Minecraft 角色。".into());
+        }
+        for profile in profiles {
+            let mut account = launcher_core::auth::Account {
+                id: String::new(),
+                name: profile.name,
+                uuid: profile.uuid.to_lowercase(),
+                kind: launcher_core::auth::AccountKind::Thirdparty,
+                avatar: profile.avatar,
+                refresh: None,
+                access: None,
+                access_expires: 0,
+                server: Some(server.url.clone()),
+            };
+            // 一个账号下可能有多个角色，都加进来；最后添加的那个成为当前账户。
+            launcher_core::auth::set_session(&mut account, &profile.token);
+            store.add_third_party(account);
+        }
+        store
+            .save(&data_dir)
+            .map_err(|error| format!("账户表写不进去：{error}"))?;
+        Ok::<_, String>(accounts_view(&store))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 // ---------------------------------------------------------------- 模组
 
 /// 实例的运行目录：隔离实例是 `<游戏目录>/instances/<实例 id>`，否则就是游戏目录。
@@ -3454,6 +3646,40 @@ pub async fn list_mods(
     tauri::async_runtime::spawn_blocking(move || {
         let runtime = runtime_of(game_dir, game_directory)?;
         launcher_core::scan_mods(&runtime).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 给「缺图标的模组」按哈希去 Modrinth / CurseForge 反查项目图标。
+///
+/// 只对 `files` 里点名的文件算哈希，返回「文件名 → 图标地址」。
+#[tauri::command]
+pub async fn mod_project_icons(
+    paths: State<'_, Paths>,
+    game_dir: String,
+    game_directory: Option<String>,
+    files: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        let mods_dir = runtime.join("mods");
+        let mut keys = Vec::new();
+        for file_name in files {
+            let path = mods_dir.join(&file_name);
+            if !path.is_file() {
+                continue;
+            }
+            match launcher_core::modicons::key_of(&path, &file_name) {
+                Ok(key) => keys.push(key),
+                Err(_) => continue,
+            }
+        }
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        Ok(launcher_core::modicons::icons_for(&data_dir, &keys))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3541,17 +3767,47 @@ pub async fn mod_icon(
     .map_err(|e| e.to_string())?
 }
 
+/// 取消正在跑的模组更新检查（下次开始时会自动复位）。
+static MOD_UPDATE_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+pub fn cancel_mod_updates() {
+    MOD_UPDATE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 查模组更新。打开模组页时自动跑一次，`force` 只给手动的「检查更新」用。
+/// 进度用 `mod-updates-progress` 事件发出去，前端按阶段显示。
 #[tauri::command]
 pub async fn check_mod_updates(
+    app: tauri::AppHandle,
+    paths: State<'_, Paths>,
     game_dir: String,
     game_directory: Option<String>,
     game_version: String,
     loader: String,
-) -> Result<Vec<launcher_core::mod_updates::ModUpdate>, String> {
+    force: Option<bool>,
+) -> Result<launcher_core::mod_updates::UpdateReport, String> {
+    let data_dir = paths.data_dir().to_owned();
+    MOD_UPDATE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     tauri::async_runtime::spawn_blocking(move || {
         let runtime = runtime_of(game_dir, game_directory)?;
-        launcher_core::mod_updates::check(&runtime, &game_version, &loader)
-            .map_err(|e| e.to_string())
+        let emitter = app.clone();
+        let mut progress = move |stage: &str, done: usize, total: usize| {
+            let _ = emitter.emit(
+                "mod-updates-progress",
+                serde_json::json!({ "stage": stage, "done": done, "total": total }),
+            );
+        };
+        launcher_core::mod_updates::check(
+            &runtime,
+            &game_version,
+            &loader,
+            &data_dir,
+            force.unwrap_or(false),
+            &MOD_UPDATE_CANCEL,
+            Some(&mut progress),
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

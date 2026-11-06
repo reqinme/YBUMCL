@@ -11,8 +11,8 @@
   let phase = $state<"loading" | "image" | "missing">("loading");
   let dataUrl = $state<string | null>(null);
 
-  /// 单个图标最多等这么久，超时当作没有图标。
-  const TIMEOUT = 6000;
+  /// 单个图标最多等这么久；超时只是这次不显示，下次进页面还会再试。
+  const TIMEOUT = 12000;
 
   /// 换项目时组件会被复用（详情面板没重建），所以跟着 iconUrl 走，不能只在 onMount 里取一次。
   let token = 0;
@@ -33,15 +33,20 @@
     dataUrl = null;
     phase = "loading";
     void (async () => {
-      const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), TIMEOUT));
-      let source: string | null = null;
+      const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), TIMEOUT));
+      let source: string | null | "timeout" = "timeout";
       try {
         source = await Promise.race([api.fetchIcon(url), timeout]);
       } catch {
         source = null;
       }
-      cache.set(url, source);
       if (mine !== token) return;
+      // 超时不算「没有图标」：不写缓存，下次挂载再取一次。
+      if (source === "timeout") {
+        phase = "missing";
+        return;
+      }
+      cache.set(url, source);
       dataUrl = source;
       phase = source ? "image" : "missing";
     })();

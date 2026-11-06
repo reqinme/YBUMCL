@@ -28,6 +28,8 @@ pub enum AccountKind {
     #[default]
     Offline,
     Microsoft,
+    /// 第三方认证服务器（authlib-injector / yggdrasil）。
+    Thirdparty,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -41,8 +43,9 @@ pub struct Account {
     pub kind: AccountKind,
     /// 头像（`data:image/png;base64,…`），离线账户没有。
     pub avatar: Option<String>,
-    /// 刷新令牌，DPAPI 保护后的 base64；离线账户为 None。不往界面送。
-    #[serde(skip_serializing)]
+    /// 刷新令牌（微软）或 yggdrasil 访问令牌（第三方），DPAPI 保护后的 base64；
+    /// 离线账户为 None。会写进 accounts.json，界面用 PlayerView 过滤掉。
+    #[serde(default)]
     pub refresh: Option<String>,
     /// 访问令牌只在内存里用，不落盘。
     #[serde(skip)]
@@ -50,6 +53,9 @@ pub struct Account {
     /// 访问令牌过期时间（epoch 秒）。
     #[serde(default)]
     pub access_expires: u64,
+    /// 第三方账户所属的认证服务器地址（离线 / 微软账户为 None）。
+    #[serde(default)]
+    pub server: Option<String>,
 }
 
 impl Account {
@@ -57,6 +63,7 @@ impl Account {
         match self.kind {
             AccountKind::Offline => "离线账户",
             AccountKind::Microsoft => "微软账户",
+            AccountKind::Thirdparty => "第三方账户",
         }
     }
 }
@@ -68,6 +75,9 @@ pub struct Store {
     /// 当前选中的账户 id。
     pub current: Option<String>,
     pub players: Vec<Account>,
+    /// 添加过的第三方认证服务器（用不到的不会有，删掉账户也不会自动删服务器）。
+    #[serde(default)]
+    pub auth_servers: Vec<crate::authlib::Server>,
 }
 
 impl Default for Store {
@@ -76,6 +86,7 @@ impl Default for Store {
             schema_version: SCHEMA_VERSION,
             current: None,
             players: Vec::new(),
+            auth_servers: Vec::new(),
         }
     }
 }
@@ -124,6 +135,58 @@ impl Store {
         }
         self.current = Some(id.to_owned());
         Ok(())
+    }
+
+    /// 第三方账户：同一个服务器下按 UUID 合并（换过一次皮肤也只是同一个人）。
+    pub fn add_third_party(&mut self, mut account: Account) -> String {
+        let server = account.server.clone().unwrap_or_default();
+        if let Some(existing) = self.players.iter_mut().find(|player| {
+            player.kind == AccountKind::Thirdparty
+                && player.uuid == account.uuid
+                && player.server.as_deref() == Some(server.as_str())
+        }) {
+            existing.name = account.name;
+            existing.avatar = account.avatar.take();
+            existing.access = account.access.take();
+            existing.refresh = account.refresh.take();
+            existing.access_expires = account.access_expires;
+            self.current = Some(existing.id.clone());
+            return existing.id.clone();
+        }
+        let id = format!("tp-{}", account.uuid);
+        account.id = id.clone();
+        self.players.push(account);
+        self.current = Some(id.clone());
+        id
+    }
+
+    /// 认证服务器：同地址的更新名字与元数据，不重复添加。
+    pub fn add_server(&mut self, server: crate::authlib::Server) {
+        if let Some(existing) = self
+            .auth_servers
+            .iter_mut()
+            .find(|saved| saved.url == server.url)
+        {
+            *existing = server;
+        } else {
+            self.auth_servers.push(server);
+        }
+    }
+
+    /// 删服务器时把它名下的账户一起删掉（留着也登不进去）。
+    pub fn remove_server(&mut self, url: &str) {
+        self.auth_servers.retain(|server| server.url != url);
+        let removed: Vec<String> = self
+            .players
+            .iter()
+            .filter(|player| player.server.as_deref() == Some(url))
+            .map(|player| player.id.clone())
+            .collect();
+        self.players
+            .retain(|player| player.server.as_deref() != Some(url));
+        if self.current.as_ref().is_some_and(|id| removed.contains(id)) {
+            self.current = self.players.first().map(|player| player.id.clone());
+        }
     }
 
     /// 离线账户用「玩家名」当身份：UUID 由名字按 Minecraft 的老规矩算出来。
@@ -428,7 +491,34 @@ fn finish_microsoft(ms_access: &str, refresh_token: Option<String>) -> Result<Po
         refresh: refresh_token.as_deref().and_then(protect),
         access: Some(mc_access),
         access_expires: now_secs() + expires_in.max(60),
+        server: None,
     })))
+}
+
+/// 第三方账户：把 yggdrasil 的访问令牌记进内存，同时 DPAPI 保护后存进 `refresh`，
+/// 这样重启启动器还能续上（yggdrasil 的 refresh 只认 accessToken）。
+pub fn set_session(account: &mut Account, token: &str) {
+    account.access = Some(token.to_owned());
+    account.refresh = protect(token);
+    // 各服务器给的有效期不一样，按 12 小时保守估计；过期了下次启动会走一次 refresh。
+    account.access_expires = now_secs() + 12 * 3600;
+}
+
+/// 取第三方账户还能用的访问令牌；过期或缺失时用存下来的令牌调 `/authserver/refresh`。
+pub fn session(account: &mut Account, server: &crate::authlib::Server) -> Result<String, String> {
+    if let Some(token) = account.access.clone().filter(|token| !token.is_empty()) {
+        if account.access_expires == 0 || account.access_expires > now_secs() + 60 {
+            return Ok(token);
+        }
+    }
+    let saved = account
+        .refresh
+        .as_deref()
+        .and_then(unprotect)
+        .ok_or_else(|| "这个账户的登录状态没了，重新输入一次密码。".to_string())?;
+    let token = crate::authlib::refresh(server, &saved)?;
+    set_session(account, &token);
+    Ok(token)
 }
 
 /// `d=` 前缀对应 Xbox Live 的 RPS 登录方式。
@@ -590,7 +680,7 @@ fn minecraft_profile(mc_access: &str) -> Result<Profile, String> {
 }
 
 /// 把皮肤裁成头像：取头部正面 8×8，再叠上帽子层，放大成 64×64。
-fn head_avatar(url: &str) -> Result<Option<String>, String> {
+pub(crate) fn head_avatar(url: &str) -> Result<Option<String>, String> {
     let bytes = client()
         .get(url)
         .send()
