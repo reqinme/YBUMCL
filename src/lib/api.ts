@@ -387,6 +387,7 @@ export type Settings = {
   /** 世界包：true = 解压进 saves，false = 只下载 zip。 */
   worldExtract: boolean;
   fileNameFormat: number;
+  modNameLayout: number;
 };
 
 export type ModMetadata = {
@@ -400,6 +401,13 @@ export type ModMetadata = {
   icon: boolean;
   /// 描述符条目名，例如 `fabric.mod.json`。
   descriptor: string | null;
+};
+
+export type ModProjectInfo = {
+  url: string | null;
+  title: string | null;
+  slug: string | null;
+  chinese: string | null;
 };
 
 export type ModEntry = {
@@ -910,7 +918,7 @@ export const api = {
     gameDirectory: string | null,
     files: string[],
   ) =>
-    invoke<Record<string, string>>("mod_project_icons", {
+    invoke<Record<string, ModProjectInfo>>("mod_project_icons", {
       gameDir,
       gameDirectory,
       files,

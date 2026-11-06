@@ -731,6 +731,53 @@ pub fn project_icon_urls(ids: &[String]) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// `/v2/projects` 返回的项目元信息：图标、原始名与 slug（slug 用来查中文名表）。
+#[derive(Debug, Clone)]
+pub struct ProjectMeta {
+    pub title: String,
+    pub slug: String,
+    pub icon: Option<String>,
+}
+
+/// 批量取项目元信息（每批 100 个），查不到的不会出现在结果里。
+pub fn project_meta(ids: &[String]) -> Result<HashMap<String, ProjectMeta>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in ids.chunks(100) {
+        let quoted: Vec<String> = chunk.iter().map(|id| format!("\"{id}\"")).collect();
+        let url = format!("{API}/projects?ids=[{}]", quoted.join(","));
+        let Ok(projects) = get_json(&url) else { continue };
+        let Some(list) = projects.as_array() else { continue };
+        for project in list {
+            let Some(id) = project.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            out.insert(
+                id.to_owned(),
+                ProjectMeta {
+                    title: project
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    slug: project
+                        .get("slug")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    icon: project
+                        .get("icon_url")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// `POST /v2/version_files/update` 的一条：某个本地文件在该版本/加载器下应升级到的目标文件。
 #[derive(Debug, Clone)]
 pub struct MrUpdateHit {

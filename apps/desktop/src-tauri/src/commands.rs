@@ -3660,7 +3660,7 @@ pub async fn mod_project_icons(
     game_dir: String,
     game_directory: Option<String>,
     files: Vec<String>,
-) -> Result<std::collections::HashMap<String, String>, String> {
+) -> Result<std::collections::HashMap<String, launcher_core::modicons::ProjectInfo>, String> {
     let data_dir = paths.data_dir().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
         let runtime = runtime_of(game_dir, game_directory)?;

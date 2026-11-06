@@ -149,6 +149,20 @@
           ]}
         />
       </label>
+      <label>
+        <span>实例模组列表的排版</span>
+        <Dropdown
+          value={String(settings.modNameLayout)}
+          label="实例模组列表的排版"
+          onchange={(next) => {
+            if (settings) settings.modNameLayout = Number(next);
+          }}
+          options={[
+            { value: "0", label: "名称在上（默认）", hint: "钠 | Sodium | 0.9.3 · neoforge / sodium-fabric-0.9.3.jar" },
+            { value: "1", label: "文件名在上", hint: "sodium-fabric-0.9.3.jar / 钠 | Sodium | 0.9.3 · neoforge" }
+          ]}
+        />
+      </label>
       <label class="row">
         <input type="checkbox" bind:checked={settings.askSaveLocation} />
         <span>下载时询问保存位置</span>

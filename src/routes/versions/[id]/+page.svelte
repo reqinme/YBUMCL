@@ -30,6 +30,7 @@
     type EntryInfo,
     type JavaInstallation,
     type ModEntry,
+    type ModProjectInfo,
     type ModUpdate,
     type UpdateReport,
     onModUpdatesProgress,
@@ -97,6 +98,12 @@
     selectedModList.some((mod) => modUpdates[mod.fileName]?.canUpdate)
   );
   let modIcons = $state<Record<string, string | null>>({});
+  /// 平台项目信息（原始名 / 中文名 / slug），和图标一起从同一轮反查里拿到。
+  let modProjects = $state<Record<string, ModProjectInfo>>({});
+  /// 全局设置里的模组列表排版：0 = 名称在上，1 = 文件名在上。
+  let nameLayout = $state(0);
+  /// 平台信息是后到的：加个版本号当 key，让列表行重建一次，别留旧名字。
+  let modProjectsTick = $state(0);
   let modUpdates = $state<Record<string, ModUpdate>>({});
   let checkingUpdates = $state(false);
   let updateChecked = $state(false);
@@ -382,10 +389,28 @@
     return name.trim() || stem;
   }
 
-  function modDisplayName(mod: ModEntry): string {
+  /// 英文名：平台项目名优先（本地可能被改过），退回描述符里的名字，再退回文件名。
+  function modEnglishName(mod: ModEntry): string {
+    const title = modProjects[mod.fileName]?.title?.trim();
+    if (title) return title;
     const declared = mod.metadata?.name?.trim();
     if (declared) return declared;
     return stripModVersion(mod.modName || mod.fileName.replace(/\.jar(?:\.disabled)?$/i, ""));
+  }
+
+  function modDisplayName(mod: ModEntry): string {
+    return modEnglishName(mod);
+  }
+
+  /// 第一/第二行的名称串：`汉化名 | 英文名 | 版本 · 加载器`（缺哪个就省哪个）。
+  function modNameLine(mod: ModEntry): string {
+    const name = modEnglishName(mod);
+    const chinese = modProjects[mod.fileName]?.chinese?.trim();
+    const head = chinese && chinese !== name ? `${chinese} | ${name}` : name;
+    const tail = [mod.metadata?.version?.trim(), mod.metadata?.loader?.trim()]
+      .filter(Boolean)
+      .join(" · ");
+    return tail ? `${head} | ${tail}` : head;
   }
 
   /// 搜索 + 筛选后的列表：启用的排前面，再按名字排。
@@ -399,6 +424,7 @@
       const meta = mod.metadata;
       const haystack = [
         modDisplayName(mod),
+        modProjects[mod.fileName]?.chinese ?? "",
         mod.modName,
         mod.fileName,
         meta?.name ?? "",
@@ -509,23 +535,30 @@
       );
     }
 
-    const missing = pending
-      .filter((mod) => !modIcons[mod.fileName])
+    // 平台项目信息要覆盖全部模组：中文名和平台名都在这里，不只是缺图的那批。
+    const unmet = mods
+      .filter((mod) => !(mod.fileName in modProjects))
       .map((mod) => mod.fileName);
-    if (missing.length === 0) return;
-    let urls: Record<string, string> = {};
+    if (unmet.length === 0) return;
+    let infos: Record<string, ModProjectInfo> = {};
     try {
-      urls = await api.modProjectIcons(gameDir, gameDirectory, missing);
+      infos = await api.modProjectIcons(gameDir, gameDirectory, unmet);
     } catch {
       return;
     }
-    const entries = Object.entries(urls);
+    modProjects = { ...modProjects, ...infos };
+    modProjectsTick += 1;
+    // 项目图标只用来补 jar 里没有图的那批，jar 自带的优先。
+    const entries = Object.entries(infos).filter(
+      ([fileName, info]) => info.url && !modIcons[fileName],
+    );
     for (let index = 0; index < entries.length; index += 4) {
       const batch = entries.slice(index, index + 4);
       await Promise.all(
-        batch.map(async ([fileName, url]) => {
+        batch.map(async ([fileName, info]) => {
+          if (!info.url) return;
           try {
-            const icon = await api.fetchIcon(url);
+            const icon = await api.fetchIcon(info.url);
             if (icon) modIcons = { ...modIcons, [fileName]: icon };
           } catch {
             // 拉不到就保持 jar 里的结果（多半是空），下次进页面再试。
@@ -1359,6 +1392,10 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 
   onMount(() => {
     void load();
+    void api
+      .loadSettings()
+      .then((saved) => (nameLayout = saved.modNameLayout ?? 0))
+      .catch(() => {});
     let unlisten: UnlistenFn | undefined;
     void getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -1590,7 +1627,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           共 {mods.length} 个模组{#if modQuery.trim()}，匹配 {shownMods.length} 个{/if}{#if updatableCount > 0}，其中 {updatableCount} 个可更新{/if}{#if updateReport && updateReport.failed > 0}，{updateReport.failed} 个这次没查通{/if}
         </p>
         <div class="mod-list">
-          {#each shownMods as mod (mod.fileName)}
+          {#each shownMods as mod (`${mod.fileName}:${modProjectsTick}`)}
             <div
               class="mod-row"
               class:disabled={!mod.enabled}
@@ -1623,10 +1660,13 @@ function loaderKey(name: string): InstanceLoader["loader"] {
                 {/if}
               </span>
               <div class="mod-name">
-                <strong title={mod.fileName}>{modDisplayName(mod)}</strong>
-                <small>
-                  {mod.metadata?.version ?? "—"} · {mod.metadata?.loader ?? "未知加载器"}
-                </small>
+                {#if nameLayout === 1}
+                  <strong title={modNameLine(mod)}>{mod.fileName}</strong>
+                  <small title={modNameLine(mod)}>{modNameLine(mod)}</small>
+                {:else}
+                  <strong title={mod.fileName}>{modNameLine(mod)}</strong>
+                  <small title={mod.fileName}>{mod.fileName}</small>
+                {/if}
               </div>
               {#if modUpdates[mod.fileName]?.canUpdate}
                 <span

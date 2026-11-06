@@ -188,6 +188,46 @@ pub fn project_icons(mod_ids: &[u64]) -> Result<std::collections::HashMap<u64, S
     Ok(out)
 }
 
+/// `/mods` 返回的项目元信息：名称、slug（用来查中文名表）与图标。
+#[derive(Debug, Clone)]
+pub struct CfProjectMeta {
+    pub name: String,
+    pub slug: String,
+    pub icon: Option<String>,
+}
+
+/// 批量取项目元信息（每批 100 个）。
+pub fn project_meta(mod_ids: &[u64]) -> Result<std::collections::HashMap<u64, CfProjectMeta>> {
+    use std::collections::HashMap;
+    let mut out: HashMap<u64, CfProjectMeta> = HashMap::new();
+    if mod_ids.is_empty() {
+        return Ok(out);
+    }
+    for chunk in mod_ids.chunks(100) {
+        let body = serde_json::json!({ "modIds": chunk });
+        let Ok(value) = post("/mods", &body) else {
+            continue;
+        };
+        let Some(mods) = value["data"].as_array() else {
+            continue;
+        };
+        for item in mods {
+            let Some(id) = item["id"].as_u64() else {
+                continue;
+            };
+            out.insert(
+                id,
+                CfProjectMeta {
+                    name: item["name"].as_str().unwrap_or_default().to_owned(),
+                    slug: item["slug"].as_str().unwrap_or_default().to_owned(),
+                    icon: item["logo"]["thumbnailUrl"].as_str().map(str::to_owned),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// 界面的内容分类 → CurseForge 的 classId。
 fn class_id(kind: &str) -> Option<u32> {
     Some(match kind {
