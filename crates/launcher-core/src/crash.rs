@@ -237,19 +237,104 @@ pub fn diagnose(text: &str) -> Vec<Diagnosis> {
     }
 
     // 最后兜底：crash report 自带的那行描述。
+    // 游戏常常只写一句 `Description: Unexpected error`，那就从堆栈里挖线索。
     if let Some(reason) = crash_reason(text) {
+        let vague = reason.trim().is_empty()
+            || reason.to_lowercase().contains("unexpected")
+            || reason.to_lowercase().contains("unknown");
+        let mut advice = Vec::new();
+        if let Some(cause) = caused_by(text) {
+            advice.push(format!("Caused by: {cause}"));
+        }
+        let frames = suspect_frames(text);
+        if !frames.is_empty() {
+            advice.push(format!("可疑位置：{}", frames.join("、")));
+        }
+        if advice.is_empty() || !vague {
+            advice.push("先翻原文里第一段堆栈，看是哪个模组抛的".into());
+        }
+        if vague {
+            advice.push("不确定就先移除最近装的模组，再一个个加回来".into());
+        }
         push(Diagnosis {
             key: "crash-report".into(),
             title: "崩溃报告里的原因".into(),
             detail: reason,
-            advice: vec![
-                "先翻原文里第一段堆栈，看是哪个模组抛的".into(),
-                "不确定就先移除最近装的模组，再一个个加回来".into(),
-            ],
+            advice,
         });
     }
 
     found
+}
+
+/// 第一条 `Caused by:`：比 `Description:` 具体得多。
+fn caused_by(text: &str) -> Option<String> {
+    for line in text.lines().take(400) {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Caused by:") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest.chars().take(160).collect());
+            }
+        }
+    }
+    None
+}
+
+/// 堆栈里不像原版/加载器的帧，去掉包名只留类，最多三个。
+fn suspect_frames(text: &str) -> Vec<String> {
+    const SKIP: [&str; 19] = [
+        "java.",
+        "javax.",
+        "jdk.",
+        "sun.",
+        "com.sun.",
+        "net.minecraft.",
+        "com.mojang.",
+        "cpw.mods.",
+        "net.minecraftforge.",
+        "org.spongepowered.",
+        "org.lwjgl.",
+        "it.unimi.",
+        "com.google.",
+        "org.apache.",
+        "io.netty.",
+        "kotlin.",
+        "knot",
+        "net.fabricmc.",
+        "org.jetbrains.",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines().take(400) {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("at ") else {
+            continue;
+        };
+        let class = rest.split('(').next().unwrap_or(rest).trim();
+        let class = class.split(" / ").next().unwrap_or(class).trim();
+        let Some(first) = class.split('.').next() else {
+            continue;
+        };
+        if SKIP.iter().any(|prefix| class.starts_with(prefix)) {
+            continue;
+        }
+        // 只认像包名的（至少两段），避免把 `at Native Method` 之类算进来。
+        if !class.contains('.') || first.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        // 混淆名（`net.minecraft.class_761`）对人没用，跳过。
+        if class.contains(".class_") {
+            continue;
+        }
+        if out.iter().any(|seen| seen == class) {
+            continue;
+        }
+        out.push(class.to_string());
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
 }
 
 /// 崩溃报告开头那几行：`Description: ...` 或 `The game crashed whilst ...`。
@@ -291,6 +376,34 @@ mod tests {
     fn duplicate_mods_is_recognised() {
         let text = "net.fabricmc.loader.impl.FormattedException: DuplicateModsFoundException";
         assert!(diagnose(text).iter().any(|item| item.key == "duplicate-mod"));
+    }
+
+    #[test]
+    fn vague_description_lists_suspect_frames() {
+        let text = "---- Minecraft Crash Report ----
+
+Description: Unexpected error
+
+java.lang.RuntimeException: boom
+	at com.simibubi.create.content.Create.onInitialize(Create.java:120)
+	at net.minecraft.client.Minecraft.run(Minecraft.java:900)
+";
+        let found = diagnose(text);
+        let item = found.iter().find(|d| d.key == "crash-report").expect("fallback");
+        assert!(item.advice.iter().any(|line| line.contains("com.simibubi.create")));
+        assert!(!item.advice.iter().any(|line| line.contains("net.minecraft.client")));
+    }
+
+    #[test]
+    fn caused_by_is_surfaced() {
+        let text = "Description: Unexpected error
+
+java.lang.RuntimeException: wrap
+	Caused by: java.lang.IllegalStateException: bad state
+";
+        let found = diagnose(text);
+        let item = found.iter().find(|d| d.key == "crash-report").expect("fallback");
+        assert!(item.advice.iter().any(|line| line.starts_with("Caused by:")));
     }
 
     #[test]
