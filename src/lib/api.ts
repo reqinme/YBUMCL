@@ -1239,6 +1239,23 @@ export type ModUpdateProgress = {
   bytes?: number;
   file?: string;
 };
+export interface PackUpdateProgress {
+  stage: string;
+  done?: number;
+  total?: number;
+  bytes?: number;
+  totalBytes?: number;
+}
+
+/** 整合包更新（下载包本体 + 展开）的进度事件。 */
+export function onPackUpdateProgress(
+  handler: (progress: PackUpdateProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<PackUpdateProgress>("pack-update-progress", (event) =>
+    handler(event.payload),
+  );
+}
+
 export function onModUpdatesProgress(
   handler: (progress: ModUpdateProgress) => void,
 ): Promise<UnlistenFn> {
@@ -1318,11 +1335,6 @@ export interface PackUpdateInfo {
   reason: string;
 }
 
-export interface PackUpdateProgress {
-  stage: string;
-  done: number;
-  total: number;
-}
 
 export interface MrVersion {
   id: string;

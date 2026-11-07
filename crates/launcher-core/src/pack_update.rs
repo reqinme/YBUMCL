@@ -76,6 +76,9 @@ pub struct UpdateInfo {
     pub latest_version_id: String,
     pub latest_url: String,
     pub latest_file_name: String,
+    /// 新包的大小（字节），界面用来显示下载进度；0 表示来源没给。
+    #[serde(default)]
+    pub latest_file_size: u64,
     pub game_version: String,
     /// 增量更新是否安全（加载器或大版本变了就不行）。
     pub allow_incremental: bool,
@@ -307,6 +310,7 @@ pub fn check(instance_dir: &Path) -> Result<Option<UpdateInfo>> {
         latest_version_id: latest.id.clone(),
         latest_url: latest.file_url.clone(),
         latest_file_name: latest.file_name.clone(),
+        latest_file_size: latest.file_size,
         game_version: meta.game_version.clone(),
         allow_incremental,
         reason: reason.unwrap_or_default(),

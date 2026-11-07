@@ -38,6 +38,7 @@
   type ShaderOption,
     type UpdateReport,
     onModUpdatesProgress,
+    onPackUpdateProgress,
     type ServerEntry,
     type VersionSettings,
     type VersionView
@@ -247,6 +248,13 @@
   let packCanRestore = $state(false);
   let packError = $state("");
   let packCheckedOnce = false;
+  /** 下载整合包本体的字节进度；0 表示还没收到第一条事件。 */
+  let packBytes = $state(0);
+  let packTotalBytes = $state(0);
+  let packSpeed = $state(0);
+  let packStartedAt = 0;
+  let packLastBytes = 0;
+  let packLastAt = 0;
 
   async function checkPackUpdate(force = false) {
     if (!version?.pack || !gameDirectory || packChecking) return;
@@ -268,7 +276,13 @@
     packReminder = false;
     if (!gameDirectory || packBusy) return;
     packBusy = true;
-    packLabel = packMode === "incremental" ? "正在增量更新…" : "正在重装…";
+    packBytes = 0;
+    packTotalBytes = 0;
+    packSpeed = 0;
+    packStartedAt = Date.now();
+    packLastBytes = 0;
+    packLastAt = 0;
+    packLabel = packMode === "incremental" ? "正在准备更新…" : "正在准备重装…";
     try {
       if (packMode === "incremental") {
         await api.packUpdateApply(gameDir, gameDirectory, packKeepCustom);
@@ -1997,6 +2011,43 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       .then((fn) => (unlisten = fn))
       .catch(() => {});
     let unlistenUpdate: UnlistenFn | undefined;
+    void onPackUpdateProgress((progress) => {
+      if (!packBusy) return;
+      if (progress.stage !== "download-pack") {
+        // 解压/替换阶段没有字节，退回一句阶段文案。
+        packLabel = progress.total
+          ? `${progress.stage} ${progress.done ?? 0}/${progress.total}`
+          : progress.stage;
+        return;
+      }
+      const now = Date.now();
+      const bytes = progress.bytes ?? 0;
+      packBytes = bytes;
+      if (progress.totalBytes && progress.totalBytes > 0) packTotalBytes = progress.totalBytes;
+      if (!packLastAt) {
+        packLastAt = now;
+        packLastBytes = bytes;
+      } else if (now - packLastAt >= 800) {
+        const instant = ((bytes - packLastBytes) * 1000) / (now - packLastAt);
+        packSpeed = packSpeed ? packSpeed * 0.6 + instant * 0.4 : instant;
+        packLastAt = now;
+        packLastBytes = bytes;
+      }
+      const mb = (value: number) => (value / 1024 / 1024).toFixed(1);
+      const elapsed = (now - packStartedAt) / 1000;
+      const avg = elapsed > 1 ? bytes / elapsed : 0;
+      const speed = packSpeed || avg;
+      const parts = [`下载整合包 ${mb(bytes)}`];
+      if (packTotalBytes > 0) parts[0] += ` / ${mb(packTotalBytes)} MB`;
+      else parts[0] += " MB";
+      if (speed > 0) parts.push(`${mb(speed)} MB/s`);
+      if (packTotalBytes > 0 && speed > 0) {
+        const left = (packTotalBytes - bytes) / speed;
+        if (left > 1 && left < 3600) parts.push(`剩余约 ${Math.max(1, Math.round(left))} 秒`);
+      }
+      packLabel = parts.join(" · ");
+    });
+
     void onModUpdatesProgress((progress) => {
       if (progress.stage === "download" && modUpdating) {
         const size = progress.bytes ?? 0;

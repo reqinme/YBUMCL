@@ -1188,6 +1188,42 @@ pub fn open_file_stream(url: &str) -> Result<(Box<dyn Read>, Option<u64>)> {
 
 /// 单个文件的完整内容（客户端 jar、安装器这类，几十 MB 到几百 MB）。
 /// 和元数据一样走多源竞速，只是上限放宽。
+/// 下载整合包本体：走和模组一样的下载引擎（分区段、镜像回退、断点续传）。
+///
+/// 和 `fetch_files_to` 的差别只在「完成之后」：先落到 `dest.part`，校验通过再改名，
+/// 中途失败不会留下一个看起来像是完整包的文件。
+pub fn fetch_pack_archive(
+    url: &str,
+    dest: &Path,
+    size: Option<u64>,
+    cancel: &CancellationToken,
+    progress: impl Fn(&BatchProgress) + Sync,
+) -> Result<()> {
+    let mut urls = vec![url.to_owned()];
+    if let Some(mirror) = mirror_url(url) {
+        if mirror != url {
+            urls.push(mirror);
+        }
+    }
+    let job = DownloadJob {
+        urls,
+        dest: dest.to_path_buf(),
+        size,
+        sha1: None,
+    };
+    let (_, failed) = fetch_files_to(
+        &[job],
+        cancel,
+        4,
+        DownloadStrategy::OfficialFirst,
+        progress,
+    )?;
+    if let Some(reason) = failed.into_iter().next() {
+        return Err(DownloadError::Network(reason));
+    }
+    Ok(())
+}
+
 pub fn fetch_file_bytes(url: &str, cancel: &CancellationToken) -> Result<Vec<u8>> {
     const FILE_LIMIT: u64 = 512 * 1024 * 1024;
     let source = Http::new(strategy())?;

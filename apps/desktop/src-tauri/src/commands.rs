@@ -3377,13 +3377,29 @@ pub async fn pack_update_apply(
     let pack_path = staging.join(&info.latest_file_name);
     let download_url = info.latest_url.clone();
     let target = pack_path.clone();
+    let total_bytes = info.latest_file_size;
+    let size_hint = if total_bytes > 0 { Some(total_bytes) } else { None };
+    let pack_emitter = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let bytes = launcher_core::download::fetch_file_bytes(
+        launcher_core::download::fetch_pack_archive(
             &download_url,
+            &target,
+            size_hint,
             &launcher_core::download::CancellationToken::default(),
+            move |progress: &launcher_core::download::BatchProgress| {
+                let _ = pack_emitter.emit(
+                    "pack-update-progress",
+                    serde_json::json!({
+                        "stage": "download-pack",
+                        "bytes": progress.bytes,
+                        "totalBytes": total_bytes,
+                        "done": progress.done,
+                        "total": progress.total,
+                    }),
+                );
+            },
         )
-        .map_err(|e| e.to_string())?;
-        std::fs::write(&target, &bytes).map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -3452,13 +3468,29 @@ pub async fn pack_reinstall(
     let pack_path = workspace.join(&info.latest_file_name);
     let download_url = info.latest_url.clone();
     let target = pack_path.clone();
+    let total_bytes = info.latest_file_size;
+    let size_hint = if total_bytes > 0 { Some(total_bytes) } else { None };
+    let pack_emitter = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let bytes = launcher_core::download::fetch_file_bytes(
+        launcher_core::download::fetch_pack_archive(
             &download_url,
+            &target,
+            size_hint,
             &launcher_core::download::CancellationToken::default(),
+            move |progress: &launcher_core::download::BatchProgress| {
+                let _ = pack_emitter.emit(
+                    "pack-update-progress",
+                    serde_json::json!({
+                        "stage": "download-pack",
+                        "bytes": progress.bytes,
+                        "totalBytes": total_bytes,
+                        "done": progress.done,
+                        "total": progress.total,
+                    }),
+                );
+            },
         )
-        .map_err(|e| e.to_string())?;
-        std::fs::write(&target, &bytes).map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
