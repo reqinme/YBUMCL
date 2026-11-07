@@ -243,15 +243,19 @@
   let packBusy = $state(false);
   let packLabel = $state("");
   let packCanRestore = $state(false);
+  let packError = $state("");
   let packCheckedOnce = false;
 
   async function checkPackUpdate(force = false) {
     if (!version?.pack || !gameDirectory || packChecking) return;
     packChecking = true;
+    packError = "";
     try {
       packUpdate = await api.packUpdateCheck(gameDir, gameDirectory);
+      if (packUpdate && !packUpdate.allowIncremental) packMode = "reinstall";
       if (force && !packUpdate) announce("整合包已经是最新版本");
     } catch (e) {
+      packError = "更新信息读取失败";
       if (force) showError("检查整合包更新失败", "没能取到最新版本信息。", String(e));
     } finally {
       packChecking = false;
@@ -2039,9 +2043,18 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         title={`更新 ${version.pack?.projectName ?? version.id}`}
         onclose={() => (packDialog = false)}
       >
+        {#snippet footer()}
+          <button class="btn ghost" disabled={packBusy} onclick={() => (packDialog = false)}>取消</button>
+          <button class="btn" disabled={packBusy} onclick={() => (packReminder = true)}>开始更新</button>
+        {/snippet}
         <div class="pack-modes">
-          <label class="mode">
-            <input type="radio" bind:group={packMode} value="incremental" />
+          <label class="mode" class:disabled={!packUpdate.allowIncremental}>
+            <input
+              type="radio"
+              bind:group={packMode}
+              value="incremental"
+              disabled={!packUpdate.allowIncremental}
+            />
             <span>
               <strong>增量更新</strong>
               <small class="dim">按新包清单增删改文件，保留存档、设置与截图。</small>
@@ -2062,10 +2075,9 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         <p class="dim">
           当前 {packUpdate.currentVersion} → 新版 {packUpdate.latestVersion}（{packUpdate.latestFileName}）
         </p>
-        <div class="row">
-          <button class="btn" disabled={packBusy} onclick={() => (packReminder = true)}>开始更新</button>
-          <button class="btn" disabled={packBusy} onclick={() => (packDialog = false)}>取消</button>
-        </div>
+        {#if !packUpdate.allowIncremental && packUpdate.reason}
+          <p class="dim">{packUpdate.reason}，只能重装更新。</p>
+        {/if}
       </Modal>
     {/if}
 

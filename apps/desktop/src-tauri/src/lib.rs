@@ -29,6 +29,19 @@ fn launcher_info(paths: tauri::State<'_, portable::Paths>) -> serde_json::Value 
     })
 }
 
+/// 界面心跳：前端每 5 秒报一次，主进程超过 30 秒收不到就认为 WebView 卡死，
+/// 主动 reload 一次（这几年 Tauri/WebView2 偶发整窗不重绘、点击无响应）。
+static LAST_BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[tauri::command]
+fn heartbeat() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| span.as_millis() as u64)
+        .unwrap_or(0);
+    LAST_BEAT.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 数据目录要先解析出来：单实例互斥键就是它（同一份数据只许一个进程，
@@ -195,6 +208,7 @@ pub fn run() {
             commands::open_url,
             commands::cleanup_targets,
             commands::cleanup_run,
+            heartbeat,
         ])
         .setup(move |app| {
             paths.write_startup_log(env!("CARGO_PKG_VERSION"));
@@ -213,6 +227,26 @@ pub fn run() {
             game_folders::remember_known(&paths);
             // 每条实例的设置现在是实例文件夹里的 `ybmcl.json`，老的整体存储搬过去。
             versions::migrate_store_into_instances(paths.data_dir(), &game_folders::current(&paths));
+
+            // 心跳看门狗：界面连续 30 秒没报到就重载页面，避免整窗假死。
+            if let Some(window) = app.get_webview_window("main") {
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    let last = LAST_BEAT.load(std::sync::atomic::Ordering::Relaxed);
+                    if last == 0 {
+                        continue;
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|span| span.as_millis() as u64)
+                        .unwrap_or(0);
+                    if now.saturating_sub(last) > 30_000 {
+                        LAST_BEAT.store(0, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("界面心跳超时，重新加载 WebView");
+                        let _ = window.eval("location.reload()");
+                    }
+                });
+            }
 
             // 老版本（以及别的启动器）留下的是「版本核心 + 加载器外壳」两层结构，
             // 启动时顺手并成自包含实例。只动 json 和 jar，mods/存档不动。

@@ -127,6 +127,8 @@ pub fn diagnose(text: &str) -> Vec<Diagnosis> {
     // Fabric：缺前置。
     if hit(&lower, "missing or unsupported mandatory dependencies")
         || hit(&lower, "missingdependencyexception")
+        || hit(&lower, "missing mods:")
+        || hit(&lower, "mod resolution encountered an incompatible mod set")
     {
         push(Diagnosis {
             key: "missing-dependency".into(),

@@ -585,6 +585,8 @@ export const api = {
       { ids }
     ),
 
+  /// 界面心跳，主进程用它判断 WebView 是否卡死。
+  heartbeat: () => invoke<void>("heartbeat"),
   packLocalIcons: (
     gameDir: string,
     gameDirectory: string | null,
@@ -1285,6 +1287,10 @@ export interface PackUpdateInfo {
   latestUrl: string;
   latestFileName: string;
   gameVersion: string;
+  /// 增量更新是否安全（加载器或大版本变了就只能重装）。
+  allowIncremental: boolean;
+  /// 不能增量的原因。
+  reason: string;
 }
 
 export interface PackUpdateProgress {

@@ -2,6 +2,7 @@
   import "$lib/styles/theme.css";
   import { onMount } from "svelte";
   import { startPrefetch } from "$lib/detect";
+  import { api } from "$lib/api";
   import { setTaskProgress } from "$lib/tasks.svelte";
   import { listen } from "@tauri-apps/api/event";
   import { page } from "$app/state";
@@ -31,6 +32,12 @@
   const isFullBleed = $derived(
     page.url.pathname === "/" || page.url.pathname.startsWith("/launch")
   );
+
+  // 每 5 秒报一次心跳；主进程 30 秒收不到会主动重载页面。
+  onMount(() => {
+    const timer = setInterval(() => void api.heartbeat().catch(() => {}), 5000);
+    return () => clearInterval(timer);
+  });
 </script>
 
 <div class="app">

@@ -77,6 +77,11 @@ pub struct UpdateInfo {
     pub latest_url: String,
     pub latest_file_name: String,
     pub game_version: String,
+    /// 增量更新是否安全（加载器或大版本变了就不行）。
+    pub allow_incremental: bool,
+    /// 不能增量的原因，空表示可以。
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// 算出来的差异。
@@ -235,37 +240,111 @@ pub fn check(instance_dir: &Path) -> Result<Option<UpdateInfo>> {
     if !meta.version_id.trim().is_empty() && meta.version_id.trim() == latest.id.trim() {
         return Ok(None);
     }
-    let latest_label = if latest.version_number.trim().is_empty() {
-        latest.name.trim().to_owned()
-    } else {
-        latest.version_number.trim().to_owned()
+    // CurseForge 的版本号就是文件名，先去后缀再比，避免同版本反复提示。
+    let latest_label = {
+        let raw = if latest.version_number.trim().is_empty() {
+            latest.name.trim()
+        } else {
+            latest.version_number.trim()
+        };
+        raw.trim_end_matches(".zip").trim_end_matches(".mrpack").to_owned()
     };
-    if meta.version_name.trim().is_empty() {
-        // 老实例没有版本名：无法判断，按「有新版」处理，让用户自己决定。
-        return Ok(Some(UpdateInfo {
-            source: meta.source.clone(),
-            project_id: meta.project_id.clone(),
-            current_version: String::new(),
-            latest_version: latest_label,
-            latest_version_id: latest.id.clone(),
-            latest_url: latest.file_url.clone(),
-            latest_file_name: latest.file_name.clone(),
-            game_version: meta.game_version.clone(),
-        }));
-    }
-    if latest_label.eq_ignore_ascii_case(meta.version_name.trim()) {
+    if same_version(&latest_label, &meta.version_name) {
         return Ok(None);
     }
+    let reason = span_reason(&meta, latest);
+    let allow_incremental = reason.is_none();
     Ok(Some(UpdateInfo {
         source: meta.source.clone(),
         project_id: meta.project_id.clone(),
-        current_version: meta.version_name.clone(),
+        current_version: meta.version_name.trim().to_owned(),
         latest_version: latest_label,
         latest_version_id: latest.id.clone(),
         latest_url: latest.file_url.clone(),
         latest_file_name: latest.file_name.clone(),
         game_version: meta.game_version.clone(),
+        allow_incremental,
+        reason: reason.unwrap_or_default(),
     }))
+}
+
+/// 版本号比对：去掉压缩包后缀、忽略大小写，并允许互相包含
+/// （CurseForge 的版本号是 `项目名-1.3.1-Beta.zip` 这种文件名）。
+fn same_version(latest: &str, current: &str) -> bool {
+    let clean = |value: &str| {
+        value
+            .trim()
+            .trim_end_matches(".zip")
+            .trim_end_matches(".mrpack")
+            .to_ascii_lowercase()
+    };
+    let left = clean(latest);
+    let right = clean(current);
+    if right.is_empty() {
+        return false;
+    }
+    left == right || left.ends_with(&right) || right.ends_with(&left)
+}
+
+/// 加载器或大版本变了，增量更新会把实例搞坏，只能重装。
+fn span_reason(meta: &PackMeta, latest: &crate::modrinth::MrVersion) -> Option<String> {
+    let mine: Vec<String> = meta
+        .loaders
+        .iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let theirs: Vec<String> = latest
+        .loaders
+        .iter()
+        .map(|value| value.trim().to_lowercase())
+        .collect();
+    if !mine.is_empty()
+        && !theirs.is_empty()
+        && !mine.iter().any(|left| {
+            theirs
+                .iter()
+                .any(|right| right.contains(left.as_str()) || left.contains(right.as_str()))
+        })
+    {
+        return Some(format!(
+            "加载器从 {} 变成了 {}",
+            mine.join("/"),
+            theirs.join("/")
+        ));
+    }
+    let current = meta.game_version.trim();
+    if !current.is_empty()
+        && !latest.game_versions.is_empty()
+        && !latest
+            .game_versions
+            .iter()
+            .any(|value| value.trim() == current)
+    {
+        let major = |value: &str| {
+            value
+                .split('.')
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        if !latest
+            .game_versions
+            .iter()
+            .any(|value| major(value.trim()) == major(current))
+        {
+            return Some(format!(
+                "游戏版本从 {} 跨到了 {}",
+                current,
+                latest
+                    .game_versions
+                    .first()
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    None
 }
 
 fn table(meta: &PackMeta) -> BTreeMap<String, Option<String>> {

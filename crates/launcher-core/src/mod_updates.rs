@@ -39,6 +39,9 @@ pub struct ModUpdate {
     pub latest_version: String,
     pub latest_file_name: String,
     pub latest_url: String,
+    /// 新文件的 SHA1（为空表示来源没给）。
+    #[serde(default)]
+    pub latest_sha1: String,
     pub can_update: bool,
 }
 
@@ -320,37 +323,51 @@ pub fn apply(runtime_dir: &Path, update: &ModUpdate) -> Result<String, CoreError
     let temp = dir.join(format!(".{merged}.ybmcl-new"));
     let _ = fs::remove_file(&temp);
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("YBUMCL/0.1 (Minecraft launcher; https://github.com/ybumcl)")
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|error| CoreError::InvalidInput(format!("无法创建 HTTP 客户端：{error}")))?;
-    let response = client
-        .get(&update.latest_url)
-        .send()
-        .map_err(|error| CoreError::InvalidInput(format!("下载新版本失败：{error}")))?;
-    if !response.status().is_success() {
-        return Err(CoreError::InvalidInput(format!(
-            "下载新版本失败：HTTP {}",
-            response.status()
-        )));
+    let mut urls = vec![update.latest_url.clone()];
+    if let Some(mirror) = crate::download::mirror_url(&update.latest_url) {
+        urls.push(mirror);
     }
-    let bytes = response
-        .bytes()
-        .map_err(|error| CoreError::InvalidInput(format!("读取新版本失败：{error}")))?;
-    fs::write(&temp, &bytes).map_err(|error| crate::io_error(&temp, error))?;
+    let job = crate::download::DownloadJob {
+        urls,
+        dest: temp.clone(),
+        size: None,
+        sha1: if update.latest_sha1.trim().is_empty() {
+            None
+        } else {
+            Some(update.latest_sha1.to_ascii_lowercase())
+        },
+    };
+    crate::download::fetch_files_to(
+        &[job],
+        &crate::download::CancellationToken::default(),
+        4,
+        crate::download::DownloadStrategy::default(),
+        |_| {},
+    )
+    .map_err(|error| CoreError::InvalidInput(format!("下载新版本失败：{error}")))?;
 
-    // 旧文件进回收站；替换失败时把新文件删掉，别留半成品。
+    // 先把旧文件改名留底，再换上新的；任一步失败都复原，最后才把留底送进回收站。
     let old = update.file_name.clone();
-    if let Err(error) = crate::mods::delete_mod(runtime_dir, &old, false) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
+    let old_path = dir.join(&old);
+    let backup = dir.join(format!(".{old}.ybmcl-old"));
+    let _ = fs::remove_file(&backup);
+    let had_old = old_path.exists();
+    if had_old {
+        fs::rename(&old_path, &backup).map_err(|error| {
+            let _ = fs::remove_file(&temp);
+            crate::io_error(&old_path, error)
+        })?;
     }
-    fs::rename(&temp, &target).map_err(|error| {
+    if let Err(error) = fs::rename(&temp, &target) {
         let _ = fs::remove_file(&temp);
-        crate::io_error(&target, error)
-    })?;
+        if had_old {
+            let _ = fs::rename(&backup, &old_path);
+        }
+        return Err(crate::io_error(&target, error));
+    }
+    if had_old {
+        let _ = crate::mods::recycle_path(&backup);
+    }
     Ok(target
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -472,6 +489,7 @@ fn report_from_cache(files: &[LocalFile], cache: &CacheFile) -> UpdateReport {
             latest_version: entry.latest.clone(),
             latest_file_name: entry.file_name.clone(),
             latest_url: entry.url.clone(),
+            latest_sha1: entry.latest_sha1.clone(),
             can_update: !same && !entry.url.is_empty(),
         });
     }
