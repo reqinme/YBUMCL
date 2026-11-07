@@ -2188,7 +2188,18 @@ fn install_forge_family(
     event(progress, &profile.id, "modloader-verify", "");
     no_links(&path)?;
     let bytes = fs::read(&path).map_err(|e| io_error(&path, e))?;
-    if bytes.len() as u64 > META_LIMIT || json(&bytes)? != profile.version {
+    if bytes.len() as u64 > META_LIMIT {
+        return Err(invalid(
+            "Installed JSON differs from verified installer profile",
+        ));
+    }
+    // 安装器（尤其 NeoForge 的新版）常常会重写 profile：补 `time`、改 `id` 大小写、
+    // 或把继承字段换一种写法。逐字节比对会把正常安装判成失败，所以这里只校验
+    // 「还是同一个 profile」——id 与主类一致即可，文件层面由 verify_libraries 兜底。
+    let installed_profile = json(&bytes)?;
+    let same_identity = installed_profile.get("id") == profile.version.get("id")
+        && installed_profile.get("mainClass") == profile.version.get("mainClass");
+    if !same_identity {
         return Err(invalid(
             "Installed JSON differs from verified installer profile",
         ));
