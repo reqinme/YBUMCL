@@ -1605,8 +1605,15 @@ fn relative_library_files_reads_local_libraries() {
 
 #[test]
 fn plan_chunks_covers_the_file_without_gaps() {
-    // 小于阈值不分块
-    assert!(download::plan_chunks(8 * 1024 * 1024 - 1).is_empty());
+    // 小于阈值不分块（阈值 256 KiB）
+    assert!(download::plan_chunks(256 * 1024 - 1).is_empty());
+
+    // 413 KB 这类小文件也要分块（至少两块，避免单连接被限速拖住）
+    let small = 413 * 1024;
+    let small_chunks = download::plan_chunks(small);
+    assert!(small_chunks.len() >= 2);
+    assert_eq!(small_chunks[0].0, 0);
+    assert_eq!(small_chunks.last().unwrap().1, small - 1);
 
     // 11 MB → 至少两块，且首块从 0 开始、末块以 size-1 结束、中间无缝
     let size = 11 * 1024 * 1024;

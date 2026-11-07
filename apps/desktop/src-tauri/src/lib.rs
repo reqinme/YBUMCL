@@ -151,6 +151,7 @@ pub fn run() {
             commands::install_game_modloader,
             commands::instance_name_taken,
             commands::pack_update_check,
+            commands::pack_update_backfill,
             commands::pack_update_apply,
             commands::pack_update_restore,
             commands::pack_reinstall,

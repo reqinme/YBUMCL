@@ -209,6 +209,39 @@ pub fn record_install(instance_dir: &Path, files: &PackFiles, file_name: &str) -
     write_meta(instance_dir, &meta)
 }
 
+/// 老实例没有 `META_FILE` 时，用实例记录里留下的来源补一份。
+/// 版本 id 与文件清单补不出来，补出来的实例只能走「重装更新」。
+pub fn backfill_meta(
+    instance_dir: &Path,
+    source: &str,
+    project_id: &str,
+    version_label: &str,
+    game_version: &str,
+    loaders: &[String],
+) -> Result<bool> {
+    if instance_dir.join(META_FILE).exists() {
+        return Ok(false);
+    }
+    let source = source.trim().to_lowercase();
+    if (source != "modrinth" && source != "curseforge") || project_id.trim().is_empty() {
+        return Ok(false);
+    }
+    let meta = PackMeta {
+        source,
+        project_id: project_id.trim().to_string(),
+        version_id: String::new(),
+        version_name: version_label.trim().to_string(),
+        game_version: game_version.to_string(),
+        loaders: loaders.to_vec(),
+        file_name: String::new(),
+        installed_at: now_secs(),
+        files: Vec::new(),
+        last_update: None,
+    };
+    write_meta(instance_dir, &meta)?;
+    Ok(true)
+}
+
 /// 查这个实例的整合包有没有新版本；没有来源或已是最新都返回 `None`。
 pub fn check(instance_dir: &Path) -> Result<Option<UpdateInfo>> {
     let Some(meta) = read_meta_checked(instance_dir)? else {
@@ -218,17 +251,29 @@ pub fn check(instance_dir: &Path) -> Result<Option<UpdateInfo>> {
         return Ok(None);
     }
     let game = meta.game_version.clone();
-    // 只按实例自己的加载器筛，避免提示一个 Fabric 版给 NeoForge 实例。
-    let loader = meta
+    // 按实例自己的加载器筛，避免提示一个 Fabric 版给 NeoForge 实例。
+    // 实例可能同时写着多个加载器（整合包声明 + 实际加载器），逐个试到有结果为止。
+    let mut candidates: Vec<Option<String>> = meta
         .loaders
-        .first()
+        .iter()
         .map(|value| value.trim().to_lowercase())
-        .filter(|value| !value.is_empty());
-    let list = match meta.source.as_str() {
-        "modrinth" => crate::modrinth::versions(&meta.project_id, Some(&game), loader.as_deref())?,
-        "curseforge" => crate::curseforge::versions(&meta.project_id, Some(&game), loader.as_deref())?,
-        _ => return Ok(None),
-    };
+        .filter(|value| !value.is_empty())
+        .map(Some)
+        .collect();
+    if candidates.is_empty() {
+        candidates.push(None);
+    }
+    let mut list = Vec::new();
+    for loader in candidates {
+        list = match meta.source.as_str() {
+            "modrinth" => crate::modrinth::versions(&meta.project_id, Some(&game), loader.as_deref())?,
+            "curseforge" => crate::curseforge::versions(&meta.project_id, Some(&game), loader.as_deref())?,
+            _ => return Ok(None),
+        };
+        if !list.is_empty() {
+            break;
+        }
+    }
     if list.is_empty() {
         return Ok(None);
     }

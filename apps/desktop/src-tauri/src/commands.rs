@@ -3325,6 +3325,34 @@ pub async fn pack_update_check(
     .map_err(|e| e.to_string())?
 }
 
+/// 老实例没有来源记录时补一份（只写一次），补完只能走「重装更新」。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn pack_update_backfill(
+    game_dir: String,
+    game_directory: Option<String>,
+    source: String,
+    project_id: String,
+    version_label: String,
+    game_version: String,
+    loaders: Vec<String>,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::pack_update::backfill_meta(
+            &runtime,
+            &source,
+            &project_id,
+            &version_label,
+            &game_version,
+            &loaders,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 增量更新：备份 → 下载新增/替换 → 删除新包里没有的 → 写新记录。
 #[tauri::command]
 pub async fn pack_update_apply(
@@ -3978,10 +4006,18 @@ pub async fn mod_icon(
 
 /// 取消正在跑的模组更新检查（下次开始时会自动复位）。
 static MOD_UPDATE_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 批量更新/下载时的取消令牌，前端点「取消」就 cancel 它。
+static MOD_UPDATE_TOKEN: std::sync::Mutex<Option<launcher_core::download::CancellationToken>> =
+    std::sync::Mutex::new(None);
 
 #[tauri::command]
 pub fn cancel_mod_updates() {
     MOD_UPDATE_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(guard) = MOD_UPDATE_TOKEN.lock() {
+        if let Some(token) = guard.as_ref() {
+            token.cancel();
+        }
+    }
 }
 
 /// 查模组更新。打开模组页时自动跑一次，`force` 只给手动的「检查更新」用。
@@ -4024,16 +4060,40 @@ pub async fn check_mod_updates(
 
 #[tauri::command]
 pub async fn apply_mod_update(
+    app: tauri::AppHandle,
     game_dir: String,
     game_directory: Option<String>,
     update: launcher_core::mod_updates::ModUpdate,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    MOD_UPDATE_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+    let token = launcher_core::download::CancellationToken::default();
+    if let Ok(mut guard) = MOD_UPDATE_TOKEN.lock() {
+        *guard = Some(token.clone());
+    }
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let runtime = runtime_of(game_dir, game_directory)?;
-        launcher_core::mod_updates::apply(&runtime, &update).map_err(|e| e.to_string())
+        let emitter = app.clone();
+        let progress = move |batch: &launcher_core::download::BatchProgress| {
+            let _ = emitter.emit(
+                "mod-updates-progress",
+                serde_json::json!({
+                    "stage": "download",
+                    "done": batch.done,
+                    "total": batch.total,
+                    "bytes": batch.bytes,
+                    "file": batch.file,
+                }),
+            );
+        };
+        launcher_core::mod_updates::apply(&runtime, &update, &token, progress)
+            .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if let Ok(mut guard) = MOD_UPDATE_TOKEN.lock() {
+        *guard = None;
+    }
+    result
 }
 
 #[tauri::command]

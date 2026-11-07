@@ -571,6 +571,25 @@ export const api = {
     invoke<string[]>("installed_mod_ids", { gameDir, gameDirectory }),
   packUpdateCheck: (gameDir: string, gameDirectory: string) =>
     invoke<PackUpdateInfo | null>("pack_update_check", { gameDir, gameDirectory }),
+  /// 老实例补一份整合包来源（没有来源记录才写），返回是否真的写了。
+  packUpdateBackfill: (
+    gameDir: string,
+    gameDirectory: string,
+    source: string,
+    projectId: string,
+    versionLabel: string,
+    gameVersion: string,
+    loaders: string[]
+  ) =>
+    invoke<boolean>("pack_update_backfill", {
+      gameDir,
+      gameDirectory,
+      source,
+      projectId,
+      versionLabel,
+      gameVersion,
+      loaders
+    }),
   packUpdateApply: (gameDir: string, gameDirectory: string, keepCustom: boolean) =>
     invoke<unknown>("pack_update_apply", { gameDir, gameDirectory, keepCustom }),
   packReinstall: (gameDir: string, gameDirectory: string, keepCustom: boolean) =>
@@ -1213,7 +1232,13 @@ export function onModpackProgress(
 }
 
 /// 查更新的进度：阶段名（hash / modrinth / curseforge / done）+ 已完成 + 总数。
-export type ModUpdateProgress = { stage: string; done: number; total: number };
+export type ModUpdateProgress = {
+  stage: string;
+  done: number;
+  total: number;
+  bytes?: number;
+  file?: string;
+};
 export function onModUpdatesProgress(
   handler: (progress: ModUpdateProgress) => void,
 ): Promise<UnlistenFn> {

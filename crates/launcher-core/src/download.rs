@@ -46,7 +46,7 @@ const MODPACK_PARALLEL: usize = 64;
 /// 设置里「最大线程数」的上限（PCL 同款 1..=256）。
 const MAX_PARALLEL_DOWNLOADS: u32 = 256;
 /// 超过这个体积的文件切成多段并发 Range 拉取，避免一条连接吃不满带宽。
-const CHUNK_THRESHOLD: u64 = 8 * 1024 * 1024;
+const CHUNK_THRESHOLD: u64 = 256 * 1024;
 const CHUNK_MIN_PARTS: usize = 2;
 const CHUNK_MAX_PARTS: usize = 8;
 /// 单连接速率低于这个值并持续 `SLOW_WINDOW`，判定为源不通畅，换另一条源重试。

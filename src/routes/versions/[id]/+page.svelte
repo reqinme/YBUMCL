@@ -152,6 +152,8 @@
   let updateConfirm = $state(false);
   /// 批量更新时的进度文案，例如「正在更新 2/5」。
   let modUpdateLabel = $state("");
+  /// 批量更新中：此时底栏换成「取消」。
+  let modUpdating = $state(false);
 
   /// 自定义图标的图片数据（`icon` 是 custom 时才有）。
   let iconUrl = $state<string | null>(null);
@@ -413,7 +415,24 @@
   $effect(() => {
     if (tab === "overview" && version?.pack && gameDirectory && !packCheckedOnce) {
       packCheckedOnce = true;
-      void checkPackUpdate();
+      const pack = version.pack;
+      const backfill =
+        pack.projectId && (pack.source === "modrinth" || pack.source === "curseforge")
+          ? api.packUpdateBackfill(
+              gameDir,
+              gameDirectory,
+              pack.source,
+              pack.projectId,
+              pack.versionLabel ?? "",
+              version.gameVersion ?? "",
+              (version.loadersDetail ?? []).map((item) => item.loader).length > 0
+                ? (version.loadersDetail ?? []).map((item) => item.loader)
+                : version.loaders ?? []
+            )
+          : Promise.resolve(false);
+      void backfill
+        .catch(() => false)
+        .then(() => checkPackUpdate());
     }
   });
 
@@ -853,6 +872,7 @@
     const failures: string[] = [];
     let done = 0;
     try {
+      modUpdating = true;
       for (const [index, update] of targets.entries()) {
         modUpdateLabel = `正在更新 ${index + 1}/${targets.length}`;
         try {
@@ -875,6 +895,7 @@
       }
     } finally {
       modUpdateLabel = "";
+      modUpdating = false;
       busy = "";
     }
   }
@@ -1977,6 +1998,16 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       .catch(() => {});
     let unlistenUpdate: UnlistenFn | undefined;
     void onModUpdatesProgress((progress) => {
+      if (progress.stage === "download" && modUpdating) {
+        const size = progress.bytes ?? 0;
+        const text = size >= 1024 * 1024
+          ? `${(size / 1024 / 1024).toFixed(1)} MB`
+          : `${Math.max(1, Math.round(size / 1024))} KB`;
+        modUpdateLabel = progress.total > 1
+          ? `正在下载 ${progress.done}/${progress.total} · ${text}`
+          : `正在下载 · ${text}`;
+        return;
+      }
       updateProgress = progress;
     })
       .then((fn) => (unlistenUpdate = fn))
@@ -2339,11 +2370,15 @@ function loaderKey(name: string): InstanceLoader["loader"] {
               >{#if modUpdateLabel}{modUpdateLabel}{:else}已选 {selectedMods.size} 个文件{/if}</span
             >
             <div class="mod-bar-actions">
-              <button
-                class="btn"
-                disabled={busy !== "" || checkingUpdates || !selectedAnyUpdatable}
-                onclick={askUpdate}>更新</button
-              >
+              {#if modUpdating}
+                <button class="btn ghost" onclick={() => void cancelUpdateCheck()}>取消</button>
+              {:else}
+                <button
+                  class="btn"
+                  disabled={busy !== "" || checkingUpdates || !selectedAnyUpdatable}
+                  onclick={askUpdate}>更新</button
+                >
+              {/if}
               <button
                 class="btn"
                 disabled={busy !== "" || selectedAllEnabled}

@@ -307,7 +307,12 @@ pub fn check(
 }
 
 /// 下载最新文件并替换掉旧文件。返回替换后的新文件名。
-pub fn apply(runtime_dir: &Path, update: &ModUpdate) -> Result<String, CoreError> {
+pub fn apply(
+    runtime_dir: &Path,
+    update: &ModUpdate,
+    cancel: &crate::download::CancellationToken,
+    progress: impl Fn(&crate::download::BatchProgress) + Sync,
+) -> Result<String, CoreError> {
     if update.latest_url.is_empty() || update.latest_file_name.is_empty() {
         return Err(CoreError::InvalidInput("没有可下载的新版本".into()));
     }
@@ -339,11 +344,11 @@ pub fn apply(runtime_dir: &Path, update: &ModUpdate) -> Result<String, CoreError
     };
     crate::download::fetch_files_to(
         &[job],
-        &crate::download::CancellationToken::default(),
+        cancel,
         4,
         // 官方优先：镜像对 cdn.modrinth.com 只是 302 回 CDN，竞速反而可能抓住慢的那条。
         crate::download::DownloadStrategy::OfficialFirst,
-        |_| {},
+        progress,
     )
     .map_err(|error| CoreError::InvalidInput(format!("下载新版本失败：{error}")))?;
 
