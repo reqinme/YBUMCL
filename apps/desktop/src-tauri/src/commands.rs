@@ -3375,7 +3375,8 @@ pub async fn pack_update_apply(
             &latest_version,
             keep_custom,
             &launcher_core::download::CancellationToken::default(),
-            Default::default(),
+            // 官方优先：镜像对 cdn.modrinth.com 只是 302 回 CDN，竞速反而可能抓住慢的那条。
+            launcher_core::download::DownloadStrategy::OfficialFirst,
             &|stage: &str, done: u64, total: u64| {
                 let _ = emitter.emit(
                     "pack-update-progress",

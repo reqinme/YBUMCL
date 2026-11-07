@@ -341,7 +341,8 @@ pub fn apply(runtime_dir: &Path, update: &ModUpdate) -> Result<String, CoreError
         &[job],
         &crate::download::CancellationToken::default(),
         4,
-        crate::download::DownloadStrategy::default(),
+        // 官方优先：镜像对 cdn.modrinth.com 只是 302 回 CDN，竞速反而可能抓住慢的那条。
+        crate::download::DownloadStrategy::OfficialFirst,
         |_| {},
     )
     .map_err(|error| CoreError::InvalidInput(format!("下载新版本失败：{error}")))?;
