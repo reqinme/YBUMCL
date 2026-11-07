@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 
@@ -231,11 +231,22 @@ fn install_modpack_inner(
                 bytes: 0,
                 file: None,
             });
-            let bytes = download::fetch_file_bytes(&url, &cancel)
-                .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
-            let mut file = fs::File::create(&archive).map_err(io_error)?;
-            file.write_all(&bytes).map_err(io_error)?;
-            drop(file);
+            download::fetch_pack_archive(
+                &url,
+                &archive,
+                None,
+                &cancel,
+                |batch| {
+                    progress(&Step {
+                        stage: "下载整合包",
+                        done: batch.done as u64,
+                        total: batch.total.max(1) as u64,
+                        bytes: batch.bytes,
+                        file: None,
+                    });
+                },
+            )
+            .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
             progress(&step("下载整合包", 1, 1));
         }
     }
