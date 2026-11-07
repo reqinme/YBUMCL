@@ -101,21 +101,38 @@ fn io_error(error: std::io::Error) -> CoreError {
     CoreError::InvalidInput(error.to_string())
 }
 
-fn join(instance_dir: &Path, relative: &str) -> PathBuf {
+/// 把清单里的相对路径落到实例目录下；拒绝 `..`、盘符与反斜杠，防止清单写到别处。
+fn safe_join(instance_dir: &Path, relative: &str) -> Result<PathBuf> {
     let mut out = instance_dir.to_path_buf();
     for part in relative.split('/') {
-        if part.is_empty() {
+        let part = part.trim();
+        if part.is_empty() || part == "." {
             continue;
+        }
+        if part == ".." || part.contains(':') || part.contains('\\') {
+            return Err(CoreError::InvalidInput(format!("清单里有非法路径：{relative}")));
         }
         out.push(part);
     }
-    out
+    Ok(out)
 }
 
 /// 读实例里的整合包记录；没有或解析失败都当作「没有来源」。
 pub fn read_meta(instance_dir: &Path) -> Option<PackMeta> {
-    let raw = fs::read_to_string(instance_dir.join(META_FILE)).ok()?;
-    serde_json::from_str::<PackMeta>(&raw).ok()
+    read_meta_checked(instance_dir).ok().flatten()
+}
+
+/// 读记录，但把「文件坏了」与「没有记录」区分开——界面上要能提示。
+pub fn read_meta_checked(instance_dir: &Path) -> Result<Option<PackMeta>> {
+    let path = instance_dir.join(META_FILE);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    let meta = serde_json::from_str::<PackMeta>(&raw)
+        .map_err(|error| CoreError::InvalidInput(format!("整合包记录解析失败：{error}")))?;
+    Ok(Some(meta))
 }
 
 /// 写整合包记录。
@@ -126,9 +143,11 @@ pub fn write_meta(instance_dir: &Path, meta: &PackMeta) -> Result<()> {
 }
 
 /// 安装流程装完之后调用：把来源与文件清单记进实例目录。
+#[allow(clippy::too_many_arguments)]
 pub fn record_install_from_plan(
     instance_dir: &Path,
     pack: &crate::modpack::PackOrigin,
+    version_id: &str,
     version_name: &str,
     game_version: &str,
     loaders: &[(String, String)],
@@ -138,7 +157,7 @@ pub fn record_install_from_plan(
     let meta = PackMeta {
         source: pack.source.clone(),
         project_id: pack.project_id.clone(),
-        version_id: String::new(),
+        version_id: version_id.to_owned(),
         version_name: version_name.to_owned(),
         game_version: game_version.to_owned(),
         loaders: loaders.iter().map(|(loader, _)| loader.clone()).collect(),
@@ -158,11 +177,16 @@ pub fn record_install_from_plan(
 
 /// 一次整合包装完之后，把来源与文件清单记进实例目录。
 pub fn record_install(instance_dir: &Path, files: &PackFiles, file_name: &str) -> Result<()> {
+    let version_name = if files.version.trim().is_empty() {
+        files.pack.version_label.clone()
+    } else {
+        files.version.trim().to_owned()
+    };
     let meta = PackMeta {
         source: files.pack.source.clone(),
         project_id: files.pack.project_id.clone(),
         version_id: files.version.clone(),
-        version_name: files.pack.version_label.clone(),
+        version_name,
         game_version: files.game_version.clone(),
         loaders: files.loaders.iter().map(|(loader, _)| loader.clone()).collect(),
         file_name: file_name.to_owned(),
@@ -182,40 +206,61 @@ pub fn record_install(instance_dir: &Path, files: &PackFiles, file_name: &str) -
 
 /// 查这个实例的整合包有没有新版本；没有来源或已是最新都返回 `None`。
 pub fn check(instance_dir: &Path) -> Result<Option<UpdateInfo>> {
-    let Some(meta) = read_meta(instance_dir) else {
+    let Some(meta) = read_meta_checked(instance_dir)? else {
         return Ok(None);
     };
     if meta.project_id.trim().is_empty() {
         return Ok(None);
     }
     let game = meta.game_version.clone();
+    // 只按实例自己的加载器筛，避免提示一个 Fabric 版给 NeoForge 实例。
+    let loader = meta
+        .loaders
+        .first()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
     let list = match meta.source.as_str() {
-        "modrinth" => crate::modrinth::versions(&meta.project_id, Some(&game), None)?,
-        "curseforge" => crate::curseforge::versions(&meta.project_id, Some(&game), None)?,
+        "modrinth" => crate::modrinth::versions(&meta.project_id, Some(&game), loader.as_deref())?,
+        "curseforge" => crate::curseforge::versions(&meta.project_id, Some(&game), loader.as_deref())?,
         _ => return Ok(None),
     };
-    let Some(latest) = list.first() else {
+    if list.is_empty() {
         return Ok(None);
-    };
+    }
+    // 正式版优先；没有正式版才退回第一个（按日期）。
+    let latest = list
+        .iter()
+        .find(|item| item.version_type.eq_ignore_ascii_case("release"))
+        .unwrap_or(&list[0]);
+    if !meta.version_id.trim().is_empty() && meta.version_id.trim() == latest.id.trim() {
+        return Ok(None);
+    }
     let latest_label = if latest.version_number.trim().is_empty() {
-        latest.name.trim()
+        latest.name.trim().to_owned()
     } else {
-        latest.version_number.trim()
+        latest.version_number.trim().to_owned()
     };
-    if !meta.version_name.trim().is_empty()
-        && latest_label.eq_ignore_ascii_case(meta.version_name.trim())
-    {
+    if meta.version_name.trim().is_empty() {
+        // 老实例没有版本名：无法判断，按「有新版」处理，让用户自己决定。
+        return Ok(Some(UpdateInfo {
+            source: meta.source.clone(),
+            project_id: meta.project_id.clone(),
+            current_version: String::new(),
+            latest_version: latest_label,
+            latest_version_id: latest.id.clone(),
+            latest_url: latest.file_url.clone(),
+            latest_file_name: latest.file_name.clone(),
+            game_version: meta.game_version.clone(),
+        }));
+    }
+    if latest_label.eq_ignore_ascii_case(meta.version_name.trim()) {
         return Ok(None);
     }
     Ok(Some(UpdateInfo {
         source: meta.source.clone(),
         project_id: meta.project_id.clone(),
         current_version: meta.version_name.clone(),
-        latest_version: if latest.version_number.trim().is_empty() {
-            latest.name.clone()
-        } else {
-            latest.version_number.clone()
-        },
+        latest_version: latest_label,
         latest_version_id: latest.id.clone(),
         latest_url: latest.file_url.clone(),
         latest_file_name: latest.file_name.clone(),
@@ -238,28 +283,28 @@ fn next_table(files: &PackFiles) -> BTreeMap<String, Option<String>> {
         .collect()
 }
 
-/// 算差异。`sha1` 有一侧缺失时按路径判断（CurseForge 的清单只有文件名）。
+/// 算差异。两侧都没有 sha1 时按路径当作没变（极少数资源站条目）。
 pub fn plan(instance_dir: &Path, meta: &PackMeta, next: &PackFiles, keep_custom: bool) -> UpdatePlan {
     let old = table(meta);
     let fresh = next_table(next);
-    let mut plan = UpdatePlan::default();
+    let mut result = UpdatePlan::default();
     for (path, sha1) in &fresh {
         match old.get(path) {
-            None => plan.add.push(path.clone()),
+            None => result.add.push(path.clone()),
             Some(previous) => {
                 let changed = match (previous, sha1) {
                     (Some(left), Some(right)) => !left.eq_ignore_ascii_case(right),
                     _ => false,
                 };
                 if changed {
-                    plan.replace.push(path.clone());
+                    result.replace.push(path.clone());
                 }
             }
         }
     }
     for path in old.keys() {
         if !fresh.contains_key(path) {
-            plan.remove.push(path.clone());
+            result.remove.push(path.clone());
         }
     }
     if !keep_custom {
@@ -277,16 +322,16 @@ pub fn plan(instance_dir: &Path, meta: &PackMeta, next: &PackFiles, keep_custom:
                 let name = entry.file_name().to_string_lossy().to_string();
                 let relative = format!("{folder}/{name}");
                 if !known.contains(&relative) {
-                    plan.extra.push(relative);
+                    result.extra.push(relative);
                 }
             }
         }
     }
-    plan.add.sort();
-    plan.replace.sort();
-    plan.remove.sort();
-    plan.extra.sort();
-    plan
+    result.add.sort();
+    result.replace.sort();
+    result.remove.sort();
+    result.extra.sort();
+    result
 }
 
 fn copy_into(from: &Path, to: &Path) -> Result<()> {
@@ -299,13 +344,34 @@ fn copy_into(from: &Path, to: &Path) -> Result<()> {
     fs::copy(from, to).map(|_| ()).map_err(io_error)
 }
 
-/// 增量更新：备份 → 下载新增/替换 → 删除多余 → 写新记录。
+/// 只留最近一次备份，其余删掉（这些是整包里的文件，留着很占地方）。
+fn prune_backups(instance_dir: &Path, keep: &str) {
+    let root = instance_dir.join(BACKUP_DIR);
+    let Ok(read) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == keep {
+            continue;
+        }
+        if entry.path().is_dir() {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 增量更新：备份 → 下载到暂存 → 逐个替换 → 删除多余 → 写新记录。
+#[allow(clippy::too_many_arguments)]
 pub fn apply(
     instance_dir: &Path,
     meta: &PackMeta,
     next: &PackFiles,
+    next_version_name: &str,
     keep_custom: bool,
-    progress: &mut dyn FnMut(&str, u64, u64),
+    cancel: &crate::download::CancellationToken,
+    strategy: crate::download::DownloadStrategy,
+    progress: &(dyn Fn(&str, u64, u64) + Sync),
 ) -> Result<PackMeta> {
     let plan = plan(instance_dir, meta, next, keep_custom);
     let stamp = now_secs();
@@ -318,7 +384,7 @@ pub fn apply(
         .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
     fs::write(backup_dir.join("meta.json"), old_meta_raw).map_err(io_error)?;
 
-    // 会被替换/删除/清理的文件先备份。
+    // 会被替换/删除/清理的文件先备份；备份失败就整次失败，别留半套。
     let affected: Vec<String> = plan
         .replace
         .iter()
@@ -327,59 +393,95 @@ pub fn apply(
         .cloned()
         .collect();
     for relative in &affected {
-        copy_into(
-            &join(instance_dir, relative),
-            &backup_dir.join("files").join(relative.replace('/', "\\")),
-        )
-        .ok();
+        let from = safe_join(instance_dir, relative)?;
+        if from.is_file() {
+            copy_into(&from, &safe_join(&backup_dir.join("files"), relative)?)?;
+        }
     }
 
-    // 下载新增与替换的文件。
-    let fresh: BTreeMap<&str, (Option<String>, &Vec<String>)> = next
+    // 下载新增与替换的文件到暂存区，全部成功再动实例。
+    let fresh: BTreeMap<&str, (&Option<String>, &Vec<String>, &Option<u64>)> = next
         .entries
         .iter()
-        .map(|(path, sha1, urls, _)| (path.as_str(), (sha1.clone(), urls)))
+        .map(|(path, sha1, urls, size)| (path.as_str(), (sha1, urls, size)))
         .collect();
     let todo: Vec<String> = plan.add.iter().chain(plan.replace.iter()).cloned().collect();
-    let total = todo.len() as u64;
-    progress("下载更新文件", 0, total);
-    let mut added: Vec<String> = Vec::new();
-    for (index, relative) in todo.iter().enumerate() {
-        let Some((_, urls)) = fresh.get(relative.as_str()) else {
+    let staging = instance_dir.join(".ybmcl").join("pack-update").join("staging");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(io_error)?;
+    let mut jobs = Vec::new();
+    let mut planned = Vec::new();
+    for relative in &todo {
+        let Some((sha1, urls, size)) = fresh.get(relative.as_str()) else {
             continue;
         };
-        let bytes = urls
-            .iter()
-            .find_map(|url| crate::download::fetch_file_bytes(url, &Default::default()).ok())
-            .ok_or_else(|| CoreError::InvalidInput(format!("下载失败：{relative}")))?;
-        let target = join(instance_dir, relative);
-        if let Some(parent) = target.parent() {
+        if urls.is_empty() {
+            return Err(CoreError::InvalidInput(format!("清单里没有下载地址：{relative}")));
+        }
+        jobs.push(crate::download::DownloadJob {
+            urls: (*urls).clone(),
+            dest: safe_join(&staging, relative)?,
+            size: **size,
+            sha1: (*sha1).clone(),
+        });
+        planned.push(relative.clone());
+    }
+    let total = jobs.len() as u64;
+    progress("下载更新文件", 0, total);
+    let (_, failures) = crate::download::fetch_files_to(&jobs, cancel, 8, strategy, |batch| {
+        progress("下载更新文件", batch.done as u64, batch.total as u64);
+    })
+    .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    if !failures.is_empty() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(CoreError::InvalidInput(format!(
+            "有 {} 个文件没下成功：{}",
+            failures.len(),
+            failures.join("、")
+        )));
+    }
+
+    // 替换：旧文件进回收站，再从暂存区挪过去（rename 是原子的）。
+    progress("替换旧版文件", 0, planned.len() as u64);
+    for (index, relative) in planned.iter().enumerate() {
+        let from = safe_join(&staging, relative)?;
+        let to = safe_join(instance_dir, relative)?;
+        if let Some(parent) = to.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
-        fs::write(&target, &bytes).map_err(io_error)?;
-        added.push(relative.clone());
-        progress("下载更新文件", index as u64 + 1, total);
+        if to.exists() {
+            let _ = crate::mods::recycle_path(&to);
+        }
+        fs::rename(&from, &to).map_err(io_error)?;
+        progress("替换旧版文件", index as u64 + 1, planned.len() as u64);
     }
+    let _ = fs::remove_dir_all(&staging);
 
     // 删除新包里已经没有的文件（以及关掉「保留我加的 mod」时的多余文件）。
     let drops: Vec<String> = plan.remove.iter().chain(plan.extra.iter()).cloned().collect();
     let drop_total = drops.len() as u64;
     progress("替换旧版文件", 0, drop_total);
     for (index, relative) in drops.iter().enumerate() {
-        let path = join(instance_dir, relative);
+        let path = safe_join(instance_dir, relative)?;
         if path.exists() {
-            crate::mods::recycle_path(&path).ok();
+            let _ = crate::mods::recycle_path(&path);
         }
         progress("替换旧版文件", index as u64 + 1, drop_total);
     }
 
-    fs::write(backup_dir.join("added.txt"), added.join("\n")).ok();
+    // 只记真正新增的，恢复时才会先删掉它们、再把备份放回去。
+    fs::write(backup_dir.join("added.txt"), plan.add.join("\n")).ok();
 
+    let version_name = if next_version_name.trim().is_empty() {
+        next.pack.version_label.clone()
+    } else {
+        next_version_name.trim().to_owned()
+    };
     let updated = PackMeta {
         source: next.pack.source.clone(),
         project_id: next.pack.project_id.clone(),
         version_id: next.version.clone(),
-        version_name: next.pack.version_label.clone(),
+        version_name: version_name.clone(),
         game_version: next.game_version.clone(),
         loaders: next.loaders.iter().map(|(loader, _)| loader.clone()).collect(),
         file_name: meta.file_name.clone(),
@@ -395,23 +497,24 @@ pub fn apply(
         last_update: Some(LastUpdate {
             at: stamp,
             from: meta.version_name.clone(),
-            to: next.pack.version_label.clone(),
+            to: version_name,
             backup: backup_rel,
         }),
     };
     write_meta(instance_dir, &updated)?;
+    prune_backups(instance_dir, &stamp.to_string());
     Ok(updated)
 }
 
 /// 恢复上次更新：把备份里的文件放回去，删掉那次更新新增的文件。
 pub fn restore(instance_dir: &Path) -> Result<()> {
-    let Some(meta) = read_meta(instance_dir) else {
+    let Some(meta) = read_meta_checked(instance_dir)? else {
         return Err(CoreError::InvalidInput("这个实例没有整合包更新记录".into()));
     };
     let Some(last) = meta.last_update.clone() else {
         return Err(CoreError::InvalidInput("没有可恢复的更新".into()));
     };
-    let backup_dir = instance_dir.join(last.backup.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let backup_dir = safe_join(instance_dir, &last.backup)?;
     if !backup_dir.is_dir() {
         return Err(CoreError::InvalidInput("备份目录不在了".into()));
     }
@@ -421,9 +524,9 @@ pub fn restore(instance_dir: &Path) -> Result<()> {
             if relative.is_empty() {
                 continue;
             }
-            let path = join(instance_dir, relative);
+            let path = safe_join(instance_dir, relative)?;
             if path.exists() {
-                crate::mods::recycle_path(&path).ok();
+                let _ = crate::mods::recycle_path(&path);
             }
         }
     }
@@ -433,7 +536,8 @@ pub fn restore(instance_dir: &Path) -> Result<()> {
             let Ok(relative) = source.strip_prefix(&files_dir) else {
                 continue;
             };
-            let target = instance_dir.join(relative);
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let target = safe_join(instance_dir, &relative)?;
             copy_into(&source, &target)?;
         }
     }
@@ -444,6 +548,71 @@ pub fn restore(instance_dir: &Path) -> Result<()> {
         }
     }
     fs::remove_dir_all(&backup_dir).ok();
+    Ok(())
+}
+
+/// 重装更新：把实例里的用户数据挪到工作区，返回「新位置 + 相对实例根的路径」。
+pub fn reinstall_move_out(
+    instance_dir: &Path,
+    workspace: &Path,
+) -> Result<Vec<(PathBuf, String)>> {
+    let keep = workspace.join("keep");
+    fs::create_dir_all(&keep).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    let mut moved = Vec::new();
+    for entry in ["saves", "screenshots", "options.txt", "servers.dat"] {
+        let from = instance_dir.join(entry);
+        if !from.exists() {
+            continue;
+        }
+        let to = keep.join(entry);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+        }
+        fs::rename(&from, &to).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+        moved.push((to, entry.to_owned()));
+    }
+    Ok(moved)
+}
+
+/// 重装更新：旧实例先改名留底（同一父目录下 `<name>.old-<stamp>`）。
+pub fn reinstall_swap_old(instance_dir: &Path, stamp: u64) -> Result<PathBuf> {
+    let name = instance_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| CoreError::InvalidInput("实例目录名不合法".to_owned()))?;
+    let backup = instance_dir.with_file_name(format!("{name}.old-{stamp}"));
+    if backup.exists() {
+        fs::remove_dir_all(&backup).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    }
+    fs::rename(instance_dir, &backup).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    Ok(backup)
+}
+
+/// 重装失败：删掉半成品新实例，把旧实例改回来。
+pub fn reinstall_undo_old(instance_dir: &Path, backup: &Path) -> Result<()> {
+    if instance_dir.exists() {
+        fs::remove_dir_all(instance_dir).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    }
+    fs::rename(backup, instance_dir).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    Ok(())
+}
+
+/// 重装成功（或回滚后）：把挪出来的用户数据放回指定实例目录。
+pub fn reinstall_put_back(instance_dir: &Path, moved: &[(PathBuf, String)]) -> Result<()> {
+    for (from, relative) in moved {
+        let dest = safe_join(instance_dir, relative).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+        }
+        if dest.exists() {
+            if dest.is_dir() {
+                fs::remove_dir_all(&dest).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+            } else {
+                fs::remove_file(&dest).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+            }
+        }
+        fs::rename(from, &dest).map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    }
     Ok(())
 }
 
@@ -469,6 +638,50 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ybmcl-reinstall-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn reinstall_moves_user_data_out_and_back() {
+        let root = scratch("move");
+        let instance = root.join("MyPack");
+        fs::create_dir_all(instance.join("saves").join("World")).unwrap();
+        fs::write(instance.join("options.txt"), "lang:zh_cn").unwrap();
+        fs::write(instance.join("saves").join("World").join("level.dat"), "nbt").unwrap();
+
+        let workspace = root.join(".ybmcl-tmp").join("reinstall-1");
+        let moved = reinstall_move_out(&instance, &workspace).unwrap();
+        assert_eq!(moved.len(), 2);
+        assert!(!instance.join("saves").exists());
+        assert!(!instance.join("options.txt").exists());
+        assert!(workspace.join("keep").join("saves").join("World").join("level.dat").exists());
+
+        let backup = reinstall_swap_old(&instance, 1).unwrap();
+        assert!(!instance.exists());
+        assert!(backup.exists());
+        reinstall_undo_old(&instance, &backup).unwrap();
+        assert!(instance.exists());
+        assert!(backup.exists() == false);
+
+        let fresh = root.join("Fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        reinstall_put_back(&fresh, &moved).unwrap();
+        assert_eq!(
+            fs::read_to_string(fresh.join("options.txt")).unwrap(),
+            "lang:zh_cn"
+        );
+        assert!(fresh.join("saves").join("World").join("level.dat").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
     use crate::modpack::read_pack_files;
 
     fn temp_dir(tag: &str) -> PathBuf {

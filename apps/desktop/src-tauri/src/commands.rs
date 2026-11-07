@@ -3343,7 +3343,7 @@ pub async fn pack_update_apply(
     .await
     .map_err(|e| e.to_string())??;
 
-    // 先把新包下载到临时目录，再读它的清单算差异。
+    // 先把新包下载到实例内的暂存目录，再读它的清单算差异。
     let staging = instance_dir.join(".ybmcl").join("pack-update");
     let _ = std::fs::create_dir_all(&staging);
     let pack_path = staging.join(&info.latest_file_name);
@@ -3361,8 +3361,10 @@ pub async fn pack_update_apply(
     .map_err(|e| e.to_string())??;
 
     let next = launcher_core::modpack::read_pack_files(&pack_path).map_err(|e| e.to_string())?;
-    let meta = launcher_core::pack_update::read_meta(&instance_dir)
+    let meta = launcher_core::pack_update::read_meta_checked(&instance_dir)
+        .map_err(|e| e.to_string())?
         .ok_or_else(|| "这个实例没有整合包更新记录".to_string())?;
+    let latest_version = info.latest_version.clone();
     let emitter = app.clone();
     let dir = instance_dir.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -3370,8 +3372,11 @@ pub async fn pack_update_apply(
             &dir,
             &meta,
             &next,
+            &latest_version,
             keep_custom,
-            &mut |stage: &str, done: u64, total: u64| {
+            &launcher_core::download::CancellationToken::default(),
+            Default::default(),
+            &|stage: &str, done: u64, total: u64| {
                 let _ = emitter.emit(
                     "pack-update-progress",
                     serde_json::json!({ "stage": stage, "done": done, "total": total }),
@@ -3387,7 +3392,7 @@ pub async fn pack_update_apply(
     result
 }
 
-/// 重装更新：把用户数据（以及可选的自加内容）挪出来，删掉实例，按新包完整重建，再放回。
+/// 重装更新：用户数据挪到实例外，旧实例改名留底，按新包重建，再放回。
 #[tauri::command]
 pub async fn pack_reinstall(
     app: AppHandle,
@@ -3395,12 +3400,8 @@ pub async fn pack_reinstall(
     game_directory: Option<String>,
     keep_custom: bool,
 ) -> Result<launcher_core::modpack::ModpackSummary, String> {
-    let instance_dir = runtime_of(game_dir.clone(), game_directory.clone())?;
-    let name = instance_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| "实例目录名不合法".to_string())?
-        .to_owned();
+    let root = std::path::PathBuf::from(&game_dir);
+    let instance_dir = runtime_of(game_dir.clone(), game_directory)?;
     let info = tauri::async_runtime::spawn_blocking({
         let instance_dir = instance_dir.clone();
         move || {
@@ -3412,11 +3413,16 @@ pub async fn pack_reinstall(
     .await
     .map_err(|e| e.to_string())??;
 
-    let staging = instance_dir.join(".ybmcl").join("pack-reinstall");
-    let _ = std::fs::create_dir_all(&staging);
-    let pack_path = staging.join(&info.latest_file_name);
-    let target = pack_path.clone();
+    // 暂存与用户数据都放在游戏根目录下，绝不会被实例目录的删除波及。
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let workspace = root.join(".ybmcl-tmp").join(format!("reinstall-{stamp}"));
+    std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+    let pack_path = workspace.join(&info.latest_file_name);
     let download_url = info.latest_url.clone();
+    let target = pack_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = launcher_core::download::fetch_file_bytes(
             &download_url,
@@ -3428,62 +3434,24 @@ pub async fn pack_reinstall(
     .await
     .map_err(|e| e.to_string())??;
 
-    // 先把自己产生的临时目录挪出去，免得跟着实例一起被删。
-    let keep = instance_dir.join(".ybmcl-update-keep");
-    let _ = std::fs::create_dir_all(&keep);
-    let meta = launcher_core::pack_update::read_meta(&instance_dir);
-    let pack_files: std::collections::HashSet<String> = meta
-        .as_ref()
-        .map(|value| value.files.iter().map(|file| file.path.clone()).collect())
-        .unwrap_or_default();
-
-    let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-    for entry in [
-        "saves",
-        "screenshots",
-        "options.txt",
-        "servers.dat",
-    ] {
-        let from = instance_dir.join(entry);
-        if from.exists() {
-            let to = keep.join(entry);
-            if std::fs::rename(&from, &to).is_ok() {
-                moved.push((to, from));
-            }
+    // 重装不保留自加内容：只搬存档、截图、选项、服务器列表。
+    let _ = keep_custom;
+    let moved = launcher_core::pack_update::reinstall_move_out(&instance_dir, &workspace)
+        .map_err(|e| e.to_string())?;
+    let backup = match launcher_core::pack_update::reinstall_swap_old(&instance_dir, stamp) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let _ = launcher_core::pack_update::reinstall_put_back(&instance_dir, &moved);
+            let _ = std::fs::remove_dir_all(&workspace);
+            return Err(error.to_string());
         }
-    }
-    if keep_custom {
-        for dir_name in ["mods", "resourcepacks", "shaderpacks"] {
-            let from = instance_dir.join(dir_name);
-            if !from.is_dir() {
-                continue;
-            }
-            let to = keep.join(dir_name);
-            let _ = std::fs::create_dir_all(&to);
-            if let Ok(entries) = std::fs::read_dir(&from) {
-                for item in entries.flatten() {
-                    let path = item.path();
-                    if path.is_dir() {
-                        continue;
-                    }
-                    let Some(file_name) = path.file_name().and_then(|v| v.to_str()) else {
-                        continue;
-                    };
-                    let relative = format!("{dir_name}/{file_name}");
-                    if pack_files.contains(&relative) {
-                        continue;
-                    }
-                    let dest = to.join(file_name);
-                    if std::fs::rename(&path, &dest).is_ok() {
-                        moved.push((dest, path));
-                    }
-                }
-            }
-        }
-    }
+    };
 
-    let _ = std::fs::remove_dir_all(&instance_dir);
-
+    let name = instance_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("instance")
+        .to_owned();
     let request = launcher_core::modpack::ModpackRequest {
         game_dir: game_dir.clone(),
         url: None,
@@ -3496,7 +3464,7 @@ pub async fn pack_reinstall(
         icon_url: None,
     };
     let emitter = app.clone();
-    let summary = tauri::async_runtime::spawn_blocking(move || {
+    let install = tauri::async_runtime::spawn_blocking(move || {
         launcher_core::modpack::install_modpack(
             request,
             launcher_core::download::CancellationToken::default(),
@@ -3514,24 +3482,22 @@ pub async fn pack_reinstall(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())?;
 
-    // 把挪出来的用户数据放回新实例。
-    let restored: std::path::PathBuf = summary.path.clone().into();
-    for (from, original) in moved {
-        let relative = original
-            .strip_prefix(&instance_dir)
-            .map(|value| value.to_path_buf())
-            .unwrap_or_else(|_| original.clone());
-        let dest = restored.join(relative);
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    let summary = match install {
+        Ok(summary) => summary,
+        Err(error) => {
+            let _ = launcher_core::pack_update::reinstall_undo_old(&instance_dir, &backup);
+            let _ = launcher_core::pack_update::reinstall_put_back(&instance_dir, &moved);
+            let _ = std::fs::remove_dir_all(&workspace);
+            return Err(error);
         }
-        let _ = std::fs::rename(&from, &dest);
-    }
-    let instance_dir = restored.clone();
-    let _ = std::fs::remove_dir_all(instance_dir.join(".ybmcl").join("pack-reinstall"));
-    let _ = std::fs::remove_dir_all(instance_dir.join(".ybmcl-update-keep"));
+    };
+
+    let restored: std::path::PathBuf = summary.path.clone().into();
+    launcher_core::pack_update::reinstall_put_back(&restored, &moved).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&backup);
+    let _ = std::fs::remove_dir_all(&workspace);
     Ok(summary)
 }
 

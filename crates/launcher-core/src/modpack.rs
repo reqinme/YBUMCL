@@ -439,6 +439,7 @@ fn install_modpack_inner(
         let _ = crate::pack_update::record_install_from_plan(
             &instance_dir,
             &plan.pack,
+            &plan.version,
             &version_label,
             &plan.game_version,
             &plan.loaders,
