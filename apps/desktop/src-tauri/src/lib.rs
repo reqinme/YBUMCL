@@ -229,8 +229,15 @@ pub fn run() {
             // 每条实例的设置现在是实例文件夹里的 `ybmcl.json`，老的整体存储搬过去。
             versions::migrate_store_into_instances(paths.data_dir(), &game_folders::current(&paths));
 
-            // 心跳看门狗：界面连续 30 秒没报到就重载页面，避免整窗假死。
+            // 心跳看门狗：界面连续 30 秒没报到就重绘窗口，避免整窗假死。
             if let Some(window) = app.get_webview_window("main") {
+                // 初值给「现在」：前端要是启动时就卡住、一次心跳都没报，
+                // 也不能让看门狗因为 last == 0 而永远跳过。
+                let started = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|span| span.as_millis() as u64)
+                    .unwrap_or(0);
+                LAST_BEAT.store(started, std::sync::atomic::Ordering::Relaxed);
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(10));
                     let last = LAST_BEAT.load(std::sync::atomic::Ordering::Relaxed);
@@ -242,9 +249,21 @@ pub fn run() {
                         .map(|span| span.as_millis() as u64)
                         .unwrap_or(0);
                     if now.saturating_sub(last) > 30_000 {
-                        LAST_BEAT.store(0, std::sync::atomic::Ordering::Relaxed);
-                        eprintln!("界面心跳超时，重新加载 WebView");
-                        let _ = window.eval("location.reload()");
+                        // 先把计时推后，避免恢复失败时每 10 秒折腾一次窗口。
+                        LAST_BEAT.store(now, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("界面心跳超时，尝试重绘窗口");
+                        // 整窗假死时 reload 也没用：渲染进程的主线程卡住，eval 跑不动。
+                        // 手动验证过「最小化再还原」能强制 DWM 重新合成，就是这一下。
+                        let _ = window.minimize();
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                        // 还原后前端还没回暖的话，再补一次 reload；能跑就跑，跑不动也不会更糟。
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        if LAST_BEAT.load(std::sync::atomic::Ordering::Relaxed) == now {
+                            eprintln!("重绘后仍无心跳，reload 页面");
+                            let _ = window.eval("location.reload()");
+                        }
                     }
                 });
             }
