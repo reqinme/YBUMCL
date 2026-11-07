@@ -163,6 +163,21 @@
           ]}
         />
       </label>
+      <label>
+        <span>装模组时缺前置怎么办</span>
+        <Dropdown
+          value={String(settings.missingDepsMode)}
+          label="装模组时缺前置怎么办"
+          onchange={(next) => {
+            if (settings) settings.missingDepsMode = Number(next);
+          }}
+          options={[
+            { value: "0", label: "弹窗询问（默认）", hint: "装完列出缺的前置，可一起装" },
+            { value: "1", label: "直接下载前置", hint: "按目标版本和加载器自动挑文件装进 mods" },
+            { value: "2", label: "什么都不做", hint: "只在下載页详情里显示前置" }
+          ]}
+        />
+      </label>
       <label class="row">
         <input type="checkbox" bind:checked={settings.askSaveLocation} />
         <span>下载时询问保存位置</span>

@@ -3311,6 +3311,244 @@ pub async fn install_modpack(
     result
 }
 
+/// 查这个实例的整合包有没有新版本。
+#[tauri::command]
+pub async fn pack_update_check(
+    game_dir: String,
+    game_directory: Option<String>,
+) -> Result<Option<launcher_core::pack_update::UpdateInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::pack_update::check(&runtime).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 增量更新：备份 → 下载新增/替换 → 删除新包里没有的 → 写新记录。
+#[tauri::command]
+pub async fn pack_update_apply(
+    app: AppHandle,
+    game_dir: String,
+    game_directory: Option<String>,
+    keep_custom: bool,
+) -> Result<launcher_core::pack_update::PackMeta, String> {
+    let runtime = runtime_of(game_dir, game_directory)?;
+    let instance_dir = runtime.clone();
+    let info = tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::pack_update::check(&runtime)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "已经是最新版本了".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // 先把新包下载到临时目录，再读它的清单算差异。
+    let staging = instance_dir.join(".ybmcl").join("pack-update");
+    let _ = std::fs::create_dir_all(&staging);
+    let pack_path = staging.join(&info.latest_file_name);
+    let download_url = info.latest_url.clone();
+    let target = pack_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = launcher_core::download::fetch_file_bytes(
+            &download_url,
+            &launcher_core::download::CancellationToken::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(&target, &bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let next = launcher_core::modpack::read_pack_files(&pack_path).map_err(|e| e.to_string())?;
+    let meta = launcher_core::pack_update::read_meta(&instance_dir)
+        .ok_or_else(|| "这个实例没有整合包更新记录".to_string())?;
+    let emitter = app.clone();
+    let dir = instance_dir.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let outcome = launcher_core::pack_update::apply(
+            &dir,
+            &meta,
+            &next,
+            keep_custom,
+            &mut |stage: &str, done: u64, total: u64| {
+                let _ = emitter.emit(
+                    "pack-update-progress",
+                    serde_json::json!({ "stage": stage, "done": done, "total": total }),
+                );
+            },
+        )
+        .map_err(|e| e.to_string());
+        let _ = std::fs::remove_dir_all(dir.join(".ybmcl").join("pack-update"));
+        outcome
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    result
+}
+
+/// 重装更新：把用户数据（以及可选的自加内容）挪出来，删掉实例，按新包完整重建，再放回。
+#[tauri::command]
+pub async fn pack_reinstall(
+    app: AppHandle,
+    game_dir: String,
+    game_directory: Option<String>,
+    keep_custom: bool,
+) -> Result<launcher_core::modpack::ModpackSummary, String> {
+    let instance_dir = runtime_of(game_dir.clone(), game_directory.clone())?;
+    let name = instance_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "实例目录名不合法".to_string())?
+        .to_owned();
+    let info = tauri::async_runtime::spawn_blocking({
+        let instance_dir = instance_dir.clone();
+        move || {
+            launcher_core::pack_update::check(&instance_dir)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "已经是最新版本了".to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let staging = instance_dir.join(".ybmcl").join("pack-reinstall");
+    let _ = std::fs::create_dir_all(&staging);
+    let pack_path = staging.join(&info.latest_file_name);
+    let target = pack_path.clone();
+    let download_url = info.latest_url.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = launcher_core::download::fetch_file_bytes(
+            &download_url,
+            &launcher_core::download::CancellationToken::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(&target, &bytes).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // 先把自己产生的临时目录挪出去，免得跟着实例一起被删。
+    let keep = instance_dir.join(".ybmcl-update-keep");
+    let _ = std::fs::create_dir_all(&keep);
+    let meta = launcher_core::pack_update::read_meta(&instance_dir);
+    let pack_files: std::collections::HashSet<String> = meta
+        .as_ref()
+        .map(|value| value.files.iter().map(|file| file.path.clone()).collect())
+        .unwrap_or_default();
+
+    let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for entry in [
+        "saves",
+        "screenshots",
+        "options.txt",
+        "servers.dat",
+    ] {
+        let from = instance_dir.join(entry);
+        if from.exists() {
+            let to = keep.join(entry);
+            if std::fs::rename(&from, &to).is_ok() {
+                moved.push((to, from));
+            }
+        }
+    }
+    if keep_custom {
+        for dir_name in ["mods", "resourcepacks", "shaderpacks"] {
+            let from = instance_dir.join(dir_name);
+            if !from.is_dir() {
+                continue;
+            }
+            let to = keep.join(dir_name);
+            let _ = std::fs::create_dir_all(&to);
+            if let Ok(entries) = std::fs::read_dir(&from) {
+                for item in entries.flatten() {
+                    let path = item.path();
+                    if path.is_dir() {
+                        continue;
+                    }
+                    let Some(file_name) = path.file_name().and_then(|v| v.to_str()) else {
+                        continue;
+                    };
+                    let relative = format!("{dir_name}/{file_name}");
+                    if pack_files.contains(&relative) {
+                        continue;
+                    }
+                    let dest = to.join(file_name);
+                    if std::fs::rename(&path, &dest).is_ok() {
+                        moved.push((dest, path));
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&instance_dir);
+
+    let request = launcher_core::modpack::ModpackRequest {
+        game_dir: game_dir.clone(),
+        url: None,
+        path: Some(pack_path.to_string_lossy().to_string()),
+        file_name: Some(info.latest_file_name.clone()),
+        name: Some(name),
+        java_path: None,
+        strategy: Default::default(),
+        threads: None,
+        icon_url: None,
+    };
+    let emitter = app.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::modpack::install_modpack(
+            request,
+            launcher_core::download::CancellationToken::default(),
+            move |step: &launcher_core::modpack::Step| {
+                let _ = emitter.emit(
+                    "pack-update-progress",
+                    serde_json::json!({
+                        "stage": step.stage,
+                        "done": step.done,
+                        "total": step.total,
+                    }),
+                );
+            },
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // 把挪出来的用户数据放回新实例。
+    let restored: std::path::PathBuf = summary.path.clone().into();
+    for (from, original) in moved {
+        let relative = original
+            .strip_prefix(&instance_dir)
+            .map(|value| value.to_path_buf())
+            .unwrap_or_else(|_| original.clone());
+        let dest = restored.join(relative);
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(&from, &dest);
+    }
+    let instance_dir = restored.clone();
+    let _ = std::fs::remove_dir_all(instance_dir.join(".ybmcl").join("pack-reinstall"));
+    let _ = std::fs::remove_dir_all(instance_dir.join(".ybmcl-update-keep"));
+    Ok(summary)
+}
+
+/// 恢复上次整合包更新。
+#[tauri::command]
+pub async fn pack_update_restore(
+    game_dir: String,
+    game_directory: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        launcher_core::pack_update::restore(&runtime).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub fn instance_name_taken(game_dir: String, name: String) -> Result<bool, String> {
     launcher_core::instance::instance_name_taken(&game_dir, &name).map_err(|e| e.to_string())
@@ -4937,3 +5175,55 @@ pub async fn export_pack_pick_path(
         .blocking_save_file();
     Ok(picked.map(|value| value.to_string()))
 }
+
+/// 已安装模组提供的 modid 列表（`mods/*.jar` 的 fabric.mod.json / mods.toml / mcmod.info）。
+#[tauri::command]
+pub async fn installed_mod_ids(
+    game_dir: String,
+    game_directory: Option<String>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let runtime = runtime_of(game_dir, game_directory)?;
+        let mods_dir = runtime.join("mods");
+        let Ok(entries) = std::fs::read_dir(&mods_dir) else {
+            return Ok(Vec::new());
+        };
+        let mut ids = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !name.ends_with(".jar") {
+                continue;
+            }
+            if let Ok(meta) = launcher_core::mods::inspect_mod_jar(&path) {
+                if let Some(id) = meta.mod_id.filter(|value| !value.trim().is_empty()) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 按 Modrinth 项目 id 批量取项目名/图标（前置列表用）。
+#[tauri::command]
+pub async fn dependency_projects(
+    ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, launcher_core::modrinth::ProjectMeta>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::modrinth::project_meta(&ids).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+

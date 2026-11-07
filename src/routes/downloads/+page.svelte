@@ -1888,8 +1888,152 @@
 
   const mrVersionCache = new Map<string, MrVersion[]>();
 
+  /// 前置：项目信息、已装 modid、当前选中的版本、待补前置弹窗。
+  let depMeta = $state<Record<string, { title: string; slug: string; icon: string | null }>>({});
+  let depInstalled = $state<string[]>([]);
+  let pickedVersionId = $state<string | null>(null);
+  let depDialog = $state<DepItem[] | null>(null);
+  let depBusy = $state(false);
+
   /// 连点两个项目时，只让最后一次的结果落地（Modrinth 全量版本可能好几十秒）。
   let mrOpenSeq = 0;
+
+  /// 当前选中的版本（没点过就取最新的那个）。
+  function pickedVersion(): MrVersion | null {
+    return mrVersions.find((item) => item.id === pickedVersionId) ?? mrVersions[0] ?? null;
+  }
+
+  /// 已装 modid 只在第一次用到时读一次。
+  async function ensureInstalledMods() {
+    if (depInstalled.length > 0 || !gameDir) return;
+    try {
+      depInstalled = await api.installedModIds(gameDir, "");
+    } catch {
+      depInstalled = [];
+    }
+  }
+
+  /// 把版本里声明的必需前置补齐项目名，并判断本地有没有。
+  async function loadDeps(version: MrVersion | null | undefined) {
+    if (!version) return;
+    const ids = (version.dependencies ?? [])
+      .filter((dep) => dep.dependencyType === "required" && dep.projectId)
+      .map((dep) => dep.projectId as string);
+    const missingMeta = ids.filter((id) => !depMeta[id]);
+    try {
+      await ensureInstalledMods();
+      if (missingMeta.length > 0) {
+        const loaded = await api.dependencyProjects(missingMeta);
+        depMeta = { ...depMeta, ...loaded };
+      }
+    } catch {
+      // 名字取不到就退回显示 id。
+    }
+  }
+
+  type DepItem = { id: string; title: string; slug: string; installed: boolean };
+
+  /// 当前版本的必需前置（去重），带「本地是否已装」。
+  function requiredDeps(): DepItem[] {
+    const version = pickedVersion();
+    if (!version) return [];
+    const out: DepItem[] = [];
+    for (const dep of version.dependencies ?? []) {
+      if (dep.dependencyType !== "required") continue;
+      const id = dep.projectId ?? "";
+      if (!id || out.some((item) => item.id === id)) continue;
+      const meta = depMeta[id];
+      const slug = meta?.slug ?? "";
+      out.push({
+        id,
+        title: meta?.title ?? dep.fileName ?? id,
+        slug,
+        installed: depInstalled.includes(slug) || depInstalled.includes(id),
+      });
+    }
+    return out;
+  }
+
+  /// 点前置：右侧切到它的详情，左侧列表不动。
+  function openDependency(dep: { id: string; title: string; slug: string }) {
+    if (!dep.slug) return;
+    void mrOpen({
+      id: dep.id,
+      slug: dep.slug,
+      title: dep.title,
+      description: "",
+      iconUrl: depMeta[dep.id]?.icon ?? null,
+      downloads: 0,
+      author: "",
+      categories: [],
+      projectType: "mod",
+      loaders: [],
+      gameVersions: [],
+      chineseTitle: null,
+    });
+  }
+
+  /// 缺的前置里挑一个能装的版本（先按当前实例版本/加载器过滤）。
+  async function resolveDependencyFile(id: string): Promise<MrVersion | null> {
+    try {
+      const list = await api.modrinthVersions(id, selectedGame, activeLoader());
+      const usable = list.filter(
+        (item) =>
+          (!selectedGame || item.gameVersions.includes(selectedGame)) &&
+          (item.loaders.length === 0 || !activeLoader() || item.loaders.includes(activeLoader() as string))
+      );
+      const pool = usable.length > 0 ? usable : list;
+      const sorted = [...pool].sort((a, b) => {
+        const release = Number(b.versionType === "release") - Number(a.versionType === "release");
+        return release !== 0 ? release : b.datePublished.localeCompare(a.datePublished);
+      });
+      return sorted[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /// 按设置处理刚装完的模组的缺失前置：0 弹窗、1 直接装、2 不管。
+  async function afterModDownload(version: MrVersion) {
+    if (cat !== "mods" || !version.dependencies?.length) return;
+    const mode = settings?.missingDepsMode ?? 0;
+    if (mode === 2) return;
+    depInstalled = [];
+    await loadDeps(version);
+    const missing = requiredDeps().filter((item) => !item.installed);
+    if (missing.length === 0) return;
+    if (mode === 0) {
+      depDialog = missing;
+      return;
+    }
+    depBusy = true;
+    try {
+      for (const dep of missing) {
+        if (!dep.slug) continue;
+        const file = await resolveDependencyFile(dep.id);
+        if (file) await mrDownload(file, true);
+      }
+    } finally {
+      depBusy = false;
+    }
+  }
+
+  /// 把缺的前置逐个装上（先挑兼容版本）。
+  async function installMissingDeps(list: DepItem[]) {
+    const pending = list.filter((item) => !item.installed && item.slug);
+    if (pending.length === 0) return;
+    depBusy = true;
+    try {
+      for (const dep of pending) {
+        const file = await resolveDependencyFile(dep.id);
+        if (file) await mrDownload(file, true);
+      }
+    } finally {
+      depBusy = false;
+      depInstalled = [];
+      await ensureInstalledMods();
+    }
+  }
 
   async function mrOpen(project: MrProject) {
     const seq = ++mrOpenSeq;
@@ -1929,6 +2073,8 @@
             : await api.modrinthVersions(project.id, game, loader);
       if (seq !== mrOpenSeq) return;
       mrVersions = loaded;
+      pickedVersionId = loaded[0]?.id ?? null;
+      void loadDeps(loaded[0]);
       if (!cached && loaded.length > 0) mrVersionCache.set(cacheKey, loaded);
     } catch (e) {
       if (seq === mrOpenSeq) {
@@ -2123,7 +2269,7 @@
     packTaskId = task.id;
   }
 
-  async function mrDownload(version: MrVersion) {
+  async function mrDownload(version: MrVersion, fromDependency = false) {
     const dir = await prepareDir(targetDir(cat));
     const kind = CATEGORIES.find((item) => item.id === cat)?.label ?? cat;
     const title = `${kind} · ${mrProject?.title ?? "内容"} ${version.versionNumber}`;
@@ -2154,6 +2300,7 @@
       );
       return { note: `已保存 ${baseName(written)}`, output: { path: written, kind: "file" as const } };
     });
+    if (!fromDependency) void afterModDownload(version);
   }
 
   /// 世界一键安装：下载 zip，按设置解压进 `saves`，或者让你另存为（默认落在 `downloads`）。
@@ -3757,11 +3904,65 @@
             </div>
           {/if}
 
+          {#if cat === "mods" && mrProject}
+            {@const deps = requiredDeps()}
+            {#if deps.length > 0}
+              <section class="dep-card">
+                <div class="dep-head">
+                  前置{pickedVersion() ? `（${pickedVersion()?.versionNumber}）` : ""}
+                  {#if isCurseForge(mrProject)}<span class="dep-note">按最新版</span>{/if}
+                </div>
+                <div class="dep-list">
+                  {#each deps as dep (dep.id)}
+                    <button class="dep-item" onclick={() => openDependency(dep)}>
+                      <span class="dep-name">{dep.title}</span>
+                      <span class="dep-state" class:on={dep.installed}>{dep.installed ? "已装" : "未装"}</span>
+                    </button>
+                  {/each}
+                </div>
+                {#if deps.some((dep) => !dep.installed)}
+                  <button class="btn tiny" onclick={() => void installMissingDeps(deps)} disabled={depBusy}>
+                    下载缺失前置
+                  </button>
+                {/if}
+              </section>
+            {/if}
+          {/if}
+
+          {#if depDialog}
+            <div class="dep-backdrop" role="presentation" onclick={() => (depDialog = null)}>
+              <div class="dep-modal" role="dialog" onclick={(event) => event.stopPropagation()}>
+                <h3>这个模组需要前置</h3>
+                <p>还缺 {depDialog.length} 个前置，要一起装上吗？</p>
+                <ul class="dep-modal-list">
+                  {#each depDialog as dep (dep.id)}
+                    <li>{dep.title}</li>
+                  {/each}
+                </ul>
+                <div class="dep-modal-actions">
+                  <button class="btn" onclick={() => { const list = depDialog ?? []; depDialog = null; void installMissingDeps(list); }}>
+                    一起装
+                  </button>
+                  <button class="btn ghost" onclick={() => (depDialog = null)}>不装前置</button>
+                  <button class="btn ghost" onclick={() => (depDialog = null)}>取消</button>
+                </div>
+              </div>
+            </div>
+          {/if}
+
           {#snippet versionRows(items: FileVersion[])}
             <ul class="mr-versions">
               {#each items as item (item.id)}
-                <li>
-                  <div class="mr-version-text">
+                <li class:active={pickedVersionId === item.id}>
+                  <div
+                    class="mr-version-text"
+                    role="button"
+                    tabindex="0"
+                    onclick={() => {
+                      pickedVersionId = item.id;
+                      void loadDeps(item);
+                    }}
+                  >
                     <span class="mr-title">{item.versionNumber}</span>
                     <span class="mr-desc">{item.name}</span>
                     <span class="mr-meta">
@@ -5369,4 +5570,85 @@
     color: var(--text);
   }
 
+  .dep-card {
+    margin: 0 0 12px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .dep-head {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+  .dep-note {
+    margin-left: 6px;
+    font-size: 12px;
+    opacity: 0.7;
+  }
+  .dep-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .dep-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+  .dep-item:hover {
+    border-color: rgba(255, 255, 255, 0.28);
+  }
+  .dep-state {
+    font-size: 12px;
+    color: #e07a5f;
+  }
+  .dep-state.on {
+    color: var(--green, #7bc96f);
+  }
+  .dep-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: grid;
+    place-items: center;
+    z-index: 60;
+  }
+  .dep-modal {
+    width: min(460px, 86vw);
+    padding: 18px 20px;
+    border-radius: 14px;
+    background: #23262d;
+    color: var(--text, #e6e6e6);
+  }
+  .dep-modal h3 {
+    margin: 0 0 6px;
+    font-size: 15px;
+  }
+  .dep-modal p {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .dep-modal-list {
+    margin: 0 0 14px;
+    padding-left: 18px;
+    font-size: 13px;
+  }
+  .dep-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+  .mr-versions li.active {
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+  }
 </style>

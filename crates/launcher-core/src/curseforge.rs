@@ -13,6 +13,7 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 
 use crate::{
+    modrinth::MrDependency,
     modrinth::{ContentCategory, MrProject, MrVersion, SearchPage},
     CoreError, Result,
 };
@@ -480,6 +481,19 @@ fn version_from(value: &Value) -> MrVersion {
         file_name,
         file_url,
         file_size: number(value, "fileLength"),
+        dependencies: value["dependencies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|item| number(item, "relationType") == 3)
+            .map(|item| MrDependency {
+                version_id: None,
+                project_id: Some(number(item, "modId").to_string()),
+                file_name: None,
+                dependency_type: "required".to_owned(),
+            })
+            .collect(),
     }
 }
 

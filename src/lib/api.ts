@@ -430,6 +430,8 @@ export type Settings = {
   worldExtract: boolean;
   fileNameFormat: number;
   modNameLayout: number;
+  /** 装模组时缺失前置怎么办：0 弹窗 / 1 直接下载前置 / 2 不管。 */
+  missingDepsMode: number;
 };
 
 export type ModMetadata = {
@@ -565,6 +567,24 @@ export const api = {
     invoke<boolean>("quick_play_supported", { gameDir, id }),
   /// 资源包 / 光影包的项目信息（名字、中文名、图标）。
   /// 资源包/光影包自带的 `pack.png`（本地读，不联网），用来先把图标铺上。
+  installedModIds: (gameDir: string, gameDirectory: string): Promise<string[]> =>
+    invoke<string[]>("installed_mod_ids", { gameDir, gameDirectory }),
+  packUpdateCheck: (gameDir: string, gameDirectory: string) =>
+    invoke<PackUpdateInfo | null>("pack_update_check", { gameDir, gameDirectory }),
+  packUpdateApply: (gameDir: string, gameDirectory: string, keepCustom: boolean) =>
+    invoke<unknown>("pack_update_apply", { gameDir, gameDirectory, keepCustom }),
+  packReinstall: (gameDir: string, gameDirectory: string, keepCustom: boolean) =>
+    invoke<unknown>("pack_reinstall", { gameDir, gameDirectory, keepCustom }),
+  packUpdateRestore: (gameDir: string, gameDirectory: string) =>
+    invoke<void>("pack_update_restore", { gameDir, gameDirectory }),
+  dependencyProjects: (
+    ids: string[]
+  ): Promise<Record<string, { title: string; slug: string; icon: string | null }>> =>
+    invoke<Record<string, { title: string; slug: string; icon: string | null }>>(
+      "dependency_projects",
+      { ids }
+    ),
+
   packLocalIcons: (
     gameDir: string,
     gameDirectory: string | null,
@@ -1256,6 +1276,23 @@ export interface ContentCategory {
   icon: string | null;
 }
 
+export interface PackUpdateInfo {
+  source: string;
+  projectId: string;
+  currentVersion: string;
+  latestVersion: string;
+  latestVersionId: string;
+  latestUrl: string;
+  latestFileName: string;
+  gameVersion: string;
+}
+
+export interface PackUpdateProgress {
+  stage: string;
+  done: number;
+  total: number;
+}
+
 export interface MrVersion {
   id: string;
   name: string;
@@ -1270,6 +1307,13 @@ export interface MrVersion {
   fileName: string;
   fileUrl: string;
   fileSize: number;
+  /// 这个文件声明的前置（Modrinth 精确到版本；CurseForge 是最新文件的那份）。
+  dependencies?: {
+    versionId: string | null;
+    projectId: string | null;
+    fileName: string | null;
+    dependencyType: string;
+  }[];
 }
 
 /// 导出页的一个选项（分组标题或可勾选项）。

@@ -19,6 +19,46 @@ use crate::download::{self, CancellationToken, DownloadJob};
 use crate::instance::{install_instance, InstanceRequest, LoaderChoice};
 use crate::{world, CoreError, Result};
 
+/// 从整合包文件里读出来的清单（更新时用来算差异）。
+#[derive(Debug, Clone)]
+pub struct PackFiles {
+    pub name: String,
+    pub version: String,
+    pub game_version: String,
+    pub loaders: Vec<(String, String)>,
+    /// 相对路径、SHA1（CF 包没有）、下载地址、字节数。
+    pub entries: Vec<(String, Option<String>, Vec<String>, Option<u64>)>,
+    pub pack: PackOrigin,
+}
+
+/// 打开一个 `.mrpack` / CurseForge 整合包 zip，读出清单（不改动任何文件）。
+pub fn read_pack_files(path: &Path) -> Result<PackFiles> {
+    let file = fs::File::open(path).map_err(io_error)?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|error| CoreError::InvalidInput(format!("打开整合包失败：{error}")))?;
+    let root = pack_root(&mut zip).unwrap_or_default();
+    let plan = read_plan(&mut zip, &root)?;
+    Ok(PackFiles {
+        name: plan.name,
+        version: plan.version,
+        game_version: plan.game_version,
+        loaders: plan.loaders,
+        entries: plan
+            .files
+            .into_iter()
+            .map(|file| {
+                (
+                    file.relative.to_string_lossy().replace('\\', "/"),
+                    file.sha1,
+                    file.urls,
+                    file.size,
+                )
+            })
+            .collect(),
+        pack: plan.pack,
+    })
+}
+
 /// 一次整合包安装的请求。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -372,6 +412,39 @@ fn install_modpack_inner(
     // 版本列表就不用退回按版本类型画的方块图了。
     if let Some(url) = request.icon_url.as_deref() {
         save_pack_icon(url, &instance_dir);
+    }
+
+    // 记下这个实例的整合包身份与文件清单，之后「检查更新 / 增量更新 / 恢复」都靠它。
+    {
+        let entries: Vec<(String, Option<String>)> = plan
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.relative.to_string_lossy().replace('\\', "/"),
+                    file.sha1.clone(),
+                )
+            })
+            .collect();
+        let pack_file = request
+            .file_name
+            .clone()
+            .unwrap_or_else(|| plan.name.clone());
+        // 清单里声明的版本号优先于文件名（CurseForge 从 zip 装时 version_label 就是文件名）。
+        let version_label = if plan.version.trim().is_empty() {
+            plan.pack.version_label.clone()
+        } else {
+            plan.version.trim().to_owned()
+        };
+        let _ = crate::pack_update::record_install_from_plan(
+            &instance_dir,
+            &plan.pack,
+            &version_label,
+            &plan.game_version,
+            &plan.loaders,
+            &entries,
+            &pack_file,
+        );
     }
 
     Ok(ModpackSummary {

@@ -57,6 +57,9 @@ pub struct Settings {
     /// 实例模组列表的排版：0 = 名称在上、文件名在下（默认）；1 = 反过来。
     #[serde(default)]
     pub mod_name_layout: u8,
+    /// 装模组时缺失前置怎么办：0 弹窗（默认）/ 1 直接下载前置 / 2 不管。
+    #[serde(default)]
+    pub missing_deps_mode: u8,
     /// 内容列表每页条数（10..=100），与 PCL 的 compPageSize 类似，默认 40。
     pub page_size: u32,
     /// 内容页左栏宽度百分比（25..=65），默认 38。
@@ -124,6 +127,7 @@ impl Default for Settings {
             compat_warning: true,
             file_name_format: 4,
             mod_name_layout: 0,
+            missing_deps_mode: 0,
             ask_save_location: true,
             modpack_install: true,
             world_extract: true,
@@ -170,6 +174,9 @@ impl Settings {
         self.split_ratio = self.split_ratio.clamp(25, 65);
         self.versions_split_ratio = self.versions_split_ratio.clamp(12, 30);
         self.nav_slide_ms = self.nav_slide_ms.min(600);
+        if self.missing_deps_mode > 2 {
+            self.missing_deps_mode = 0;
+        }
         if self.mod_name_layout > 1 {
             self.mod_name_layout = 0;
         }

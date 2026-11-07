@@ -1004,6 +1004,54 @@ fn modified_epoch_millis(metadata: &fs::Metadata) -> i64 {
         .unwrap_or_default()
 }
 
+/// 更新后沿用旧文件的命名风格：把新旧文件名按 `-` 拆段，
+/// 剥掉前导与后导相同的段，只替换中间变掉的那一段。
+///
+/// `sodium-fabric-0.5.1.jar` + `sodium-fabric-0.5.2.jar` → `sodium-fabric-0.5.2.jar`
+/// `x-1.0.jar.disabled` + `x-2.0.jar` → `x-2.0.jar.disabled`
+pub fn merge_file_name(current: &str, newest: &str) -> String {
+    fn strip_suffixes(value: &str) -> String {
+        let mut text = value;
+        loop {
+            let mut trimmed = false;
+            for suffix in [".jar", ".old", ".disabled"] {
+                if let Some(rest) = text.strip_suffix(suffix) {
+                    text = rest;
+                    trimmed = true;
+                }
+            }
+            if !trimmed {
+                break;
+            }
+        }
+        text.to_owned()
+    }
+
+    let current_stem = strip_suffixes(current);
+    let newest_stem = strip_suffixes(newest);
+    if current_stem.is_empty() || newest_stem.is_empty() {
+        return newest.to_owned();
+    }
+    let left: Vec<&str> = current_stem.split('-').collect();
+    let right: Vec<&str> = newest_stem.split('-').collect();
+    let mut start = 0;
+    while start < left.len() && start < right.len() && left[start] == right[start] {
+        start += 1;
+    }
+    let mut left_end = left.len();
+    let mut right_end = right.len();
+    while left_end > start && right_end > start && left[left_end - 1] == right[right_end - 1] {
+        left_end -= 1;
+        right_end -= 1;
+    }
+    let current_diff = left[start..left_end].join("-");
+    let newest_diff = right[start..right_end].join("-");
+    if current_diff.is_empty() || newest_diff.is_empty() || !current.contains(&current_diff) {
+        return newest.to_owned();
+    }
+    current.replacen(&current_diff, &newest_diff, 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,5 +1895,36 @@ mod tests {
         let outcomes = import_mods(&runtime, &source_strings(&[first, second]), false).unwrap();
         assert_eq!(outcomes[0].status, "imported");
         assert_eq!(outcomes[1].status, "duplicate");
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_file_name;
+
+    #[test]
+    fn keeps_the_old_naming_style() {
+        assert_eq!(
+            merge_file_name("sodium-fabric-0.5.1.jar", "sodium-fabric-0.5.2.jar"),
+            "sodium-fabric-0.5.2.jar"
+        );
+        assert_eq!(
+            merge_file_name("jei-1.21.1-forge-19.0.0.jar", "jei-1.21.1-forge-19.1.0.jar"),
+            "jei-1.21.1-forge-19.1.0.jar"
+        );
+    }
+
+    #[test]
+    fn keeps_the_disabled_suffix() {
+        assert_eq!(
+            merge_file_name("x-1.0.jar.disabled", "x-2.0.jar"),
+            "x-2.0.jar.disabled"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_new_name() {
+        assert_eq!(merge_file_name("abc.jar", "def.jar"), "def.jar");
+        assert_eq!(merge_file_name("1.2-forge-2.jar", "1.3-forge-3.jar"), "1.3-forge-3.jar");
     }
 }

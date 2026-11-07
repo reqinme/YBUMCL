@@ -139,6 +139,20 @@ pub struct MrProject {
     pub chinese_title: Option<String>,
 }
 
+/// 版本声明的一个前置：`dependency_type` 是 `required` / `optional` / `incompatible` / `embedded`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MrDependency {
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub dependency_type: String,
+}
+
 /// 项目的一个版本（一个版本里可能有好几个文件，只取主文件）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +176,9 @@ pub struct MrVersion {
     pub file_name: String,
     pub file_url: String,
     pub file_size: u64,
+    /// 这个版本自己声明的依赖（Modrinth 的 `dependencies`；CurseForge 由 `relationType` 归一化）。
+    #[serde(default)]
+    pub dependencies: Vec<MrDependency>,
 }
 
 /// 一页搜索结果：条目 + 总数（界面据此判断还要不要继续「加载更多」）。
@@ -335,6 +352,25 @@ pub fn str_list(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 解析版本的 `dependencies` 数组（`project_id` / `version_id` / `dependency_type`）。
+fn dependencies(value: &Value) -> Vec<MrDependency> {
+    value
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| MrDependency {
+            version_id: item["version_id"].as_str().map(str::to_owned),
+            project_id: item["project_id"].as_str().map(str::to_owned),
+            file_name: item["file_name"].as_str().map(str::to_owned),
+            dependency_type: item["dependency_type"]
+                .as_str()
+                .unwrap_or("required")
+                .to_owned(),
+        })
+        .collect()
+}
+
 fn projects(hits: Vec<Value>) -> Vec<MrProject> {
     hits.into_iter()
         .map(|hit| MrProject {
@@ -502,6 +538,7 @@ pub fn versions(project: &str, game: Option<&str>, loader: Option<&str>) -> Resu
                 file_name: file["filename"].as_str().unwrap_or_default().to_owned(),
                 file_url: file["url"].as_str().unwrap_or_default().to_owned(),
                 file_size: file["size"].as_u64().unwrap_or(0),
+                dependencies: dependencies(&item["dependencies"]),
             })
         })
         .collect();
@@ -732,7 +769,8 @@ pub fn project_icon_urls(ids: &[String]) -> Result<HashMap<String, String>> {
 }
 
 /// `/v2/projects` 返回的项目元信息：图标、原始名与 slug（slug 用来查中文名表）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectMeta {
     pub title: String,
     pub slug: String,
@@ -844,4 +882,23 @@ pub fn update_version_files(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_dependency_entries() {
+        let value = serde_json::json!([
+            { "version_id": null, "project_id": "P7dR8mSH", "file_name": null, "dependency_type": "required" },
+            { "version_id": "abc", "project_id": null, "file_name": "x.jar", "dependency_type": "optional" }
+        ]);
+        let out = dependencies(&value);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].project_id.as_deref(), Some("P7dR8mSH"));
+        assert_eq!(out[0].dependency_type, "required");
+        assert_eq!(out[1].file_name.as_deref(), Some("x.jar"));
+        assert_eq!(out[1].dependency_type, "optional");
+    }
 }

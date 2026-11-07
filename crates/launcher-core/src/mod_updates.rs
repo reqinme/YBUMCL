@@ -309,8 +309,15 @@ pub fn apply(runtime_dir: &Path, update: &ModUpdate) -> Result<String, CoreError
         return Err(CoreError::InvalidInput("没有可下载的新版本".into()));
     }
     let dir = mods_dir(runtime_dir);
-    let target = unique_name(&dir, &update.latest_file_name);
-    let temp = dir.join(format!(".{}.ybmcl-new", update.latest_file_name));
+    // 沿用旧文件名风格，禁用状态也跟着走。
+    let mut merged = crate::mods::merge_file_name(&update.file_name, &update.latest_file_name);
+    if update.file_name.to_ascii_lowercase().ends_with(".disabled")
+        && !merged.to_ascii_lowercase().ends_with(".disabled")
+    {
+        merged.push_str(".disabled");
+    }
+    let target = unique_name(&dir, &merged);
+    let temp = dir.join(format!(".{merged}.ybmcl-new"));
     let _ = fs::remove_file(&temp);
 
     let client = reqwest::blocking::Client::builder()

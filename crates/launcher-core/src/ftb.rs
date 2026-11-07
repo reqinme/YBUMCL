@@ -325,6 +325,7 @@ fn version_of(pack: &Pack, version: &PackVersion) -> MrVersion {
         file_name: format!("{} {}.zip", pack.name, version.name),
         file_url: String::new(),
         file_size: 0,
+        dependencies: Vec::new(),
     }
 }
 

@@ -41,6 +41,7 @@ pub mod modrinth;
 pub mod modicons;
 pub mod mods;
 pub mod names;
+pub mod pack_update;
 pub mod packages;
 /// 读 `servers.dat`（服务器列表标签页用）。
 pub mod servers;

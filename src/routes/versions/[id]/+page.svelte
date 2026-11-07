@@ -33,6 +33,7 @@
     type ModProjectInfo,
     type ModUpdate,
     type SaveEntry,
+    type PackUpdateInfo,
   type ShaderConfig,
   type ShaderOption,
     type UpdateReport,
@@ -149,6 +150,8 @@
   let modDetail = $state<ModEntry | null>(null);
   /// 批量更新前的风险确认。
   let updateConfirm = $state(false);
+  /// 批量更新时的进度文案，例如「正在更新 2/5」。
+  let modUpdateLabel = $state("");
 
   /// 自定义图标的图片数据（`icon` 是 custom 时才有）。
   let iconUrl = $state<string | null>(null);
@@ -229,6 +232,74 @@
     memory ? Math.min(32768, Math.max(1024, Math.round(memory.totalMb / 2 / 256) * 256)) : 32768
   );
   const gameDirectory = $derived(version?.isolated ? `versions/${version.id}` : null);
+
+  // 整合包更新：检查、增量/重装两种模式、恢复上次更新。
+  let packUpdate = $state<PackUpdateInfo | null>(null);
+  let packChecking = $state(false);
+  let packDialog = $state(false);
+  let packMode = $state<"incremental" | "reinstall">("incremental");
+  let packKeepCustom = $state(true);
+  let packReminder = $state(false);
+  let packBusy = $state(false);
+  let packLabel = $state("");
+  let packCanRestore = $state(false);
+  let packCheckedOnce = false;
+
+  async function checkPackUpdate(force = false) {
+    if (!version?.pack || !gameDirectory || packChecking) return;
+    packChecking = true;
+    try {
+      packUpdate = await api.packUpdateCheck(gameDir, gameDirectory);
+      if (force && !packUpdate) announce("整合包已经是最新版本");
+    } catch (e) {
+      if (force) showError("检查整合包更新失败", "没能取到最新版本信息。", String(e));
+    } finally {
+      packChecking = false;
+    }
+  }
+
+  async function runPackUpdate() {
+    packReminder = false;
+    if (!gameDirectory || packBusy) return;
+    packBusy = true;
+    packLabel = packMode === "incremental" ? "正在增量更新…" : "正在重装…";
+    try {
+      if (packMode === "incremental") {
+        await api.packUpdateApply(gameDir, gameDirectory, packKeepCustom);
+        packCanRestore = true;
+        announce("整合包已更新");
+      } else {
+        await api.packReinstall(gameDir, gameDirectory, packKeepCustom);
+        packCanRestore = false;
+        announce("整合包已重装");
+      }
+      packDialog = false;
+      packUpdate = null;
+      await load();
+    } catch (e) {
+      showError("整合包更新失败", "没能更新这个实例。", String(e));
+    } finally {
+      packBusy = false;
+      packLabel = "";
+    }
+  }
+
+  async function restorePackUpdate() {
+    if (!gameDirectory || packBusy) return;
+    packBusy = true;
+    packLabel = "正在恢复上次更新…";
+    try {
+      await api.packUpdateRestore(gameDir, gameDirectory);
+      packCanRestore = false;
+      announce("已恢复到更新前的状态");
+      await load();
+    } catch (e) {
+      showError("恢复失败", "没有可恢复的更新记录，或者文件被占用。", String(e));
+    } finally {
+      packBusy = false;
+      packLabel = "";
+    }
+  }
 
   /// 卡片和概览页共用：实例目录里的图标（自定义或整合包带来的）优先，
   /// 其次是内置方块图或按状态自动挑的那张。
@@ -333,6 +404,14 @@
     saveDownloadsState(next);
     void goto("/downloads");
   }
+
+  // 进概览页自动查一次整合包更新（失败静默），右上角还留着手动「检查更新」。
+  $effect(() => {
+    if (tab === "overview" && version?.pack && gameDirectory && !packCheckedOnce) {
+      packCheckedOnce = true;
+      void checkPackUpdate();
+    }
+  });
 
   async function load() {
     try {
@@ -756,7 +835,7 @@
     updateConfirm = true;
   }
 
-  /// 更新选中的模组：先警告再替换，一次一个，失败就停。
+  /// 更新选中的模组：一次一个，失败的记下来继续装下一个。
   async function batchUpdate() {
     if (!version || selectedMods.size === 0) return;
     const targets = [...selectedMods]
@@ -767,23 +846,31 @@
       return;
     }
     busy = "mods";
+    const failures: string[] = [];
     let done = 0;
     try {
-      for (const update of targets) {
-        await api.applyModUpdate(gameDir, gameDirectory, update);
-        done += 1;
+      for (const [index, update] of targets.entries()) {
+        modUpdateLabel = `正在更新 ${index + 1}/${targets.length}`;
+        try {
+          await api.applyModUpdate(gameDir, gameDirectory, update);
+          done += 1;
+        } catch (e) {
+          failures.push(`${update.fileName}：${String(e)}`);
+        }
       }
       selectedMods = new Set();
       await loadMods();
-      announce(`已更新 ${done} 个模组`);
-    } catch (e) {
-      showError(
-        "更新模组失败",
-        done > 0 ? `已更新 ${done} 个，剩下的没换成功。` : "新版本没下载下来，旧文件还在。",
-        String(e)
-      );
-      await loadMods();
+      if (failures.length === 0) {
+        announce(`已更新 ${done} 个模组`);
+      } else {
+        showError(
+          "部分模组没更新成功",
+          `已更新 ${done} 个，${failures.length} 个失败（旧文件还在）。`,
+          failures.join("； ")
+        );
+      }
     } finally {
+      modUpdateLabel = "";
       busy = "";
     }
   }
@@ -1923,9 +2010,72 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         <div class="strip-main">
           <strong>{version.pack.projectName || version.id}</strong>
           <p class="dim" title={version.pack.summary}>{version.pack.summary || "—"}</p>
+          {#if version.pack.versionLabel}
+            <p class="dim">整合包版本：{version.pack.versionLabel}</p>
+          {/if}
+        </div>
+        <div class="row pack-update-actions">
+          {#if packLabel}
+            <span class="dim">{packLabel}</span>
+          {:else}
+            {#if packUpdate}
+              <span class="dim">有新版 {packUpdate.latestVersion}</span>
+              <button class="btn" onclick={() => (packDialog = true)}>更新</button>
+            {/if}
+            <button class="btn tiny" disabled={packChecking} onclick={() => void checkPackUpdate(true)}>
+              {packChecking ? "检查中…" : "检查更新"}
+            </button>
+            {#if packCanRestore}
+              <button class="btn tiny" disabled={packBusy} onclick={() => void restorePackUpdate()}>恢复上次更新</button>
+            {/if}
+          {/if}
         </div>
       </section>
     {/if}
+
+    {#if packDialog && packUpdate}
+      <Modal
+        open
+        title={`更新 ${version.pack?.projectName ?? version.id}`}
+        onclose={() => (packDialog = false)}
+      >
+        <div class="pack-modes">
+          <label class="mode">
+            <input type="radio" bind:group={packMode} value="incremental" />
+            <span>
+              <strong>增量更新</strong>
+              <small class="dim">按新包清单增删改文件，保留存档、设置与截图。</small>
+            </span>
+          </label>
+          <label class="mode">
+            <input type="radio" bind:group={packMode} value="reinstall" />
+            <span>
+              <strong>重装更新</strong>
+              <small class="dim">只保留存档与截图，其余按新包完整重建。</small>
+            </span>
+          </label>
+        </div>
+        <label class="keep">
+          <input type="checkbox" bind:checked={packKeepCustom} disabled={packMode === "reinstall"} />
+          <span>保留我加的 mod、资源包和光影包{packMode === "reinstall" ? "（重装不保留）" : ""}</span>
+        </label>
+        <p class="dim">
+          当前 {packUpdate.currentVersion} → 新版 {packUpdate.latestVersion}（{packUpdate.latestFileName}）
+        </p>
+        <div class="row">
+          <button class="btn" disabled={packBusy} onclick={() => (packReminder = true)}>开始更新</button>
+          <button class="btn" disabled={packBusy} onclick={() => (packDialog = false)}>取消</button>
+        </div>
+      </Modal>
+    {/if}
+
+    <ConfirmDialog
+      open={packReminder}
+      message="更新后可能导致实例无法正常启动，你确定要更新吗"
+      confirmLabel="开始更新"
+      onconfirm={() => void runPackUpdate()}
+      oncancel={() => (packReminder = false)}
+    />
 
     <section class="panel" class:compact={!version.pack}>
       {#snippet headBody(v: VersionView)}
@@ -2173,7 +2323,9 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         </div>
         {#if selectedMods.size > 0}
           <div class="mod-bar">
-            <span class="dim">已选 {selectedMods.size} 个文件</span>
+            <span class="dim"
+              >{#if modUpdateLabel}{modUpdateLabel}{:else}已选 {selectedMods.size} 个文件{/if}</span
+            >
             <div class="mod-bar-actions">
               <button
                 class="btn"
@@ -2913,8 +3065,8 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 
 <ConfirmDialog
   open={updateConfirm}
-  message="更新会先下载新版本，再替换掉旧文件。新版本可能不再兼容现在的存档或其他模组；装坏了可以从回收站找回旧文件。要继续吗？"
-  confirmLabel="继续更新"
+  message="更新后可能导致实例无法正常启动，你确定要更新吗"
+  confirmLabel="更新"
   oncancel={() => (updateConfirm = false)}
   onconfirm={() => {
     updateConfirm = false;
@@ -3424,6 +3576,47 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     border-radius: 8px;
     image-rendering: pixelated;
   }
+  .pack-update-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .pack-modes {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+
+  .pack-modes .mode {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--surface-2, rgba(255, 255, 255, 0.04));
+    cursor: pointer;
+  }
+
+  .pack-modes .mode span {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .pack-modes .mode small {
+    line-height: 1.4;
+  }
+
+  .keep {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
   .strip-main {
     display: flex;
     flex-direction: column;
