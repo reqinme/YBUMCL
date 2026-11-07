@@ -1221,6 +1221,8 @@ export type ModpackProgress = {
   done: number;
   total: number;
   bytes: number;
+  /// 这一步总共要下多少字节；0 表示未知（比如解压、装加载器）。
+  totalBytes?: number;
   file: string | null;
 };
 export function onModpackProgress(

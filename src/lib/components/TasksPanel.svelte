@@ -169,7 +169,9 @@
                     <span>{task.note}</span>
                   {/if}
                   {#if task.total !== null}
-                    <span class="dim">{bytes(task.received)} / {bytes(task.total)}</span>
+                    <span class="dim"
+                      >{bytes(task.received)} / {bytes(task.total)} · {Math.floor(task.percent)}%</span
+                    >
                   {/if}
                 </div>
               {/if}
@@ -320,7 +322,7 @@
     margin-top: 2px;
   }
   .live .bar {
-    height: 6px;
+    height: 8px;
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.1);
     overflow: hidden;

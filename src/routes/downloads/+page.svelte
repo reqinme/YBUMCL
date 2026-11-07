@@ -15,6 +15,7 @@
     setTaskResume,
     submitTask,
     setTaskNote,
+    setTaskProgress,
     takeStop,
     type Task,
     type TaskResult
@@ -3012,6 +3013,12 @@
         if (event.bytes > 0) parts.push(formatBytes(event.bytes));
         if (event.file) parts.push(event.file);
         setTaskNote(packTaskId, parts.join(" · "));
+        // 只有知道总量时卡片才能画真进度条（否则是 indeterminate 的滑动条）：
+        // 下包、下内容这两步都会带 totalBytes，装上就能看到「已下 / 总量」。
+        const totalBytes = event.totalBytes ?? 0;
+        if (totalBytes > 0 && event.bytes >= 0) {
+          setTaskProgress(packTaskId, event.bytes, totalBytes);
+        }
       })
     );
 

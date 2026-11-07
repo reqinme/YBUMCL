@@ -2541,6 +2541,7 @@ pub async fn install_ftb_modpack(
                         "done": step.done,
                         "total": step.total,
                         "bytes": step.bytes,
+                        "totalBytes": step.total_bytes,
                         "file": step.file,
                     }),
                 );
@@ -3288,6 +3289,7 @@ pub async fn install_modpack(
                         "done": step.done,
                         "total": step.total,
                         "bytes": step.bytes,
+                        "totalBytes": step.total_bytes,
                         "file": step.file,
                     }),
                 );

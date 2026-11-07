@@ -168,6 +168,8 @@ pub struct Step<'a> {
     pub done: u64,
     pub total: u64,
     pub bytes: u64,
+    /// 这一步总共要下多少字节；0 表示这步不是下载、或者还不知道总量。
+    pub total_bytes: u64,
     pub file: Option<&'a str>,
 }
 
@@ -178,6 +180,7 @@ fn step(stage: &str, done: u64, total: u64) -> Step<'_> {
         done,
         total,
         bytes: 0,
+        total_bytes: 0,
         file: None,
     }
 }
@@ -229,6 +232,7 @@ fn install_modpack_inner(
                 done: 0,
                 total: 1,
                 bytes: 0,
+                total_bytes: 0,
                 file: None,
             });
             download::fetch_pack_archive(
@@ -242,6 +246,7 @@ fn install_modpack_inner(
                         done: batch.done as u64,
                         total: batch.total.max(1) as u64,
                         bytes: batch.bytes,
+                        total_bytes: batch.total_bytes,
                         file: None,
                     });
                 },
@@ -304,6 +309,7 @@ fn install_modpack_inner(
         done: 0,
         total,
         bytes: 0,
+        total_bytes: 0,
         file: None,
     });
 
@@ -338,6 +344,7 @@ fn install_modpack_inner(
                     done: item.completed_files,
                     total: item.total_files.max(1),
                     bytes: item.downloaded_bytes,
+                    total_bytes: item.total_bytes,
                     file: Some(&item.path),
                 });
             })
@@ -349,6 +356,7 @@ fn install_modpack_inner(
                 done: batch.done as u64,
                 total: batch.total as u64,
                 bytes: batch.bytes,
+                total_bytes: batch.total_bytes,
                 file: Some(&batch.file),
             });
         });

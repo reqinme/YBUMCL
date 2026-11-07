@@ -1205,6 +1205,14 @@ pub fn fetch_pack_archive(
             urls.push(mirror);
         }
     }
+    // 安装整合包时只有下载地址、没有文件大小；先探一次 `Content-Length`
+    // 再去下，否则 `chunk_ranges` 因为缺 size 只能单流跑（45 MB 的包能差十倍速度）。
+    let size = match size {
+        Some(size) => Some(size),
+        None => Http::new(strategy())
+            .ok()
+            .and_then(|http| http.probe_size(url).ok().flatten()),
+    };
     let job = DownloadJob {
         urls,
         dest: dest.to_path_buf(),
@@ -1278,6 +1286,8 @@ pub struct BatchProgress {
     pub done: usize,
     pub total: usize,
     pub bytes: u64,
+    /// 这批里已知大小的文件加起来多大；界面拿它算「已下 / 总量」。
+    pub total_bytes: u64,
     pub file: String,
 }
 
@@ -1527,6 +1537,7 @@ pub fn fetch_files_to(
     let last = Mutex::new(Instant::now() - Duration::from_secs(1));
     let failed: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
     let total = jobs.len();
+    let total_bytes = jobs.iter().filter_map(|job| job.size).sum::<u64>();
     // 线程数由设置决定（1–256，实际 2–257，默认 65）；比文件数多没意义。
     let workers = threads.clamp(1, 257).min(total).max(1);
     let health = Health::new(workers);
@@ -1550,6 +1561,7 @@ pub fn fetch_files_to(
                 done: done.load(Ordering::Relaxed),
                 total,
                 bytes: bytes.load(Ordering::Relaxed),
+                total_bytes,
                 file: file.to_owned(),
             });
         }
@@ -1644,6 +1656,7 @@ pub fn fetch_files_to(
                                 done: finished,
                                 total,
                                 bytes: bytes.load(Ordering::Relaxed),
+                                total_bytes,
                                 file: name,
                             });
                         }
