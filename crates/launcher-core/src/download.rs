@@ -41,14 +41,17 @@ const FILE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 /// 默认并发数：既要跑满小文件吞吐，又不至于把校园网出口打爆。
 const PARALLEL_DOWNLOADS: usize = 16;
 /// 上限：再高只会把 TLS 握手和 302 跳转的延迟放大。
-/// 整合包并发下载的默认线程数（PCL 默认 64），实际值由设置项决定。
-const MODPACK_PARALLEL: usize = 64;
 /// 设置里「最大线程数」的上限（PCL 同款 1..=256）。
 const MAX_PARALLEL_DOWNLOADS: u32 = 256;
-/// 超过这个体积的文件切成多段并发 Range 拉取，避免一条连接吃不满带宽。
-const CHUNK_THRESHOLD: u64 = 256 * 1024;
+/// 小于这个体积的文件不分段：256 KiB 一段的话，握手加慢启动就吃掉大半时间。
+const CHUNK_MIN_FILE: u64 = 2 * 1024 * 1024;
+/// 每段至少这么大，一条连接才有足够的连续传输窗口。
+const CHUNK_MIN_PART: u64 = 2 * 1024 * 1024;
 const CHUNK_MIN_PARTS: usize = 2;
 const CHUNK_MAX_PARTS: usize = 8;
+/// 同时活着的下载连接上限。PCL 用「线程数」（默认 9）收敛并发；我们把线程当
+/// 「同时处理的文件数」，再用这个预算管住真正在跑的连接，避免每个文件都切段失控。
+const MAX_LIVE_CONNECTIONS: usize = 64;
 /// 单连接速率低于这个值并持续 `SLOW_WINDOW`，判定为源不通畅，换另一条源重试。
 #[cfg(not(test))]
 const SLOW_WINDOW: Duration = Duration::from_secs(4);
@@ -195,6 +198,61 @@ impl Rate {
 }
 
 /// 起始下限：PCL 是 256 KB/s，但限速比它还低时按下限本身算，否则永不达标。
+/// 连接数许可：抢不到就排队或退回单流，绝不为多开连接而卡死。
+pub(crate) struct Budget {
+    total: usize,
+    used: Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+impl Budget {
+    fn new(total: usize) -> Self {
+        Self {
+            total: total.max(1),
+            used: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn available(&self) -> usize {
+        let used = self.used.lock().map(|n| *n).unwrap_or(self.total);
+        self.total.saturating_sub(used)
+    }
+
+    /// 阻塞等一个空位：每个下载文件的第一个连接用这个。
+    fn acquire(&self) -> Permit<'_> {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used >= self.total {
+            used = self.cv.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += 1;
+        Permit { budget: self }
+    }
+
+    /// 分段时用：拿不到就不切了，退回单流，不阻塞。
+    fn try_acquire(&self) -> Option<Permit<'_>> {
+        let mut used = self.used.lock().ok()?;
+        if *used >= self.total {
+            return None;
+        }
+        *used += 1;
+        Some(Permit { budget: self })
+    }
+}
+
+pub(crate) struct Permit<'a> {
+    budget: &'a Budget,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut used) = self.budget.used.lock() {
+            *used = used.saturating_sub(1);
+        }
+        self.budget.cv.notify_one();
+    }
+}
+
 fn initial_low(limit: u64) -> u64 {
     if limit == 0 {
         SLOW_CEILING_BYTES_PER_SEC
@@ -528,8 +586,14 @@ struct Ranked {
 const RANK_TTL: Duration = Duration::from_secs(600);
 /// 单条路的测速只读这么点字节，够判断快慢又不浪费流量。
 const PROBE_BYTES: usize = 64 * 1024;
-/// 竞速时先读到这么多字节再定胜负：小文件一次读完，大文件只多花这么点。
-const RACE_PREFETCH: usize = 64 * 1024;
+/// 竞速时先读到这么多字节再定胜负。
+///
+/// 原来取 64 KiB：每段 Range 都要等最慢的那条路读满 64 KiB 才能开始用，
+/// 弱网下一条 50 KB/s 的线路就能让每个文件多等一秒多。8 KiB 足够区分快慢，
+/// 又让赢家几乎立刻可用。
+const RACE_PREFETCH: usize = 8 * 1024;
+/// 竞速等第一个候选的最长时间；超时就当没有可用的竞速结果，走串行。
+const RACE_WAIT: Duration = Duration::from_secs(20);
 /// 同时竞速的候选数。
 const RACE_WIDTH: usize = 3;
 
@@ -671,6 +735,8 @@ pub fn strategy() -> DownloadStrategy {
 
 struct Http {
     client: Client,
+    /// 走 HTTP/1.1 的备用客户端：某些 Cloudflare 边缘在 h2 上握不上手。
+    h1: Client,
     strategy: DownloadStrategy,
     /// 本任务的限速桶：整批下载共用一份，任务之间互不影响。
     rate: Rate,
@@ -681,8 +747,45 @@ struct Http {
     rank: Mutex<HashMap<&'static str, Ranked>>,
     probing: Mutex<BTreeSet<&'static str>>,
     edge: Mutex<Option<String>>,
+    /// 被证明「h2 不稳」的站点，之后一律走 1.1。
+    flaky: Mutex<HashSet<String>>,
 }
 impl Http {
+    /// 这个站点在 HTTP/2 上握不上手，记下来改走 1.1。
+    fn note_flaky(&self, host: &str) {
+        if let Ok(mut flaky) = self.flaky.lock() {
+            flaky.insert(host.to_owned());
+        }
+    }
+    /// 发一个 GET：先用默认客户端（允许 h2），失败就把该站点记成「h2 不稳」，
+    /// 再用 HTTP/1.1 客户端重试一次。legacyfabric / labymod 那几家就是这样：
+    /// h2 握手挂死，1.1 一切正常。
+    fn get(
+        &self,
+        target: &Url,
+        build: impl Fn(&Client) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<reqwest::blocking::Response> {
+        let host = target.host_str().unwrap_or("").to_owned();
+        let flaky = self
+            .flaky
+            .lock()
+            .map(|known| known.contains(&host))
+            .unwrap_or(false);
+        if flaky {
+            return build(&self.h1)
+                .send()
+                .map_err(|e| DownloadError::Network(e.to_string()));
+        }
+        match build(&self.client).send() {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.note_flaky(&host);
+                build(&self.h1).send().map_err(|fallback| {
+                    DownloadError::Network(format!("{error}；改走 HTTP/1.1 仍失败：{fallback}"))
+                })
+            }
+        }
+    }
     /// 告诉这层「现在装的是哪个版本」，用来补原版 jar 的镜像地址。
     fn with_version(mut self, version: &str) -> Self {
         self.version = Some(version.to_owned());
@@ -700,55 +803,67 @@ impl Http {
     /// 超时二选一：`timeout` 是整条请求的总时长（元数据、小文件），
     /// `read` 是「多久没收到数据算超时」（边下边写的大文件只该用这个）。
     fn build(strategy: DownloadStrategy, timeout: Option<Duration>) -> Result<Self> {
-        let mut builder = Client::builder()
-            .https_only(true)
-            // 有的站（legacyfabric / labymod 这类 Cloudflare 边缘）对 HTTP/2 握手不友好，
-            // 走 HTTP/1.1 稳定得多；我们并发靠线程池，不依赖 h2 的多路复用。
-            .http1_only()
-            // 部分 Cloudflare 边缘（legacyfabric 那几家）在 TLS 1.3 上会握手卡死，
-            // 降到 1.2 一切正常；1.2 是我们的全部下载源都支持的版本。
-            .max_tls_version(reqwest::tls::Version::TLS_1_2)
-            // 允许跳转，但每一跳都必须落在白名单主机上（镜像会 302 到自家 CDN）。
-            .redirect(Policy::custom(|attempt| {
-                // BMCLAPI 会 302 到各家高校镜像，跳转后的路径里保留着 /bmclapi/。
-                let mirror_path = attempt.url().path().contains("/bmclapi/");
-                if attempt.previous().len() >= 5 {
-                    attempt.error("too many redirects")
-                } else if attempt.url().host_str().is_some_and(host_allowed) || mirror_path {
-                    attempt.follow()
-                } else {
-                    attempt.error("redirect to untrusted host")
-                }
-            }))
-            .connect_timeout(Duration::from_secs(20))
-            // 国内 IPv6 路由常常连上即被重置，优先用 IPv4。
-            .local_address(if cfg!(windows) {
-                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-            } else {
-                None
-            })
-            // 复用连接：资源文件成千上万，握手开销比传输本身还贵。
-            // keep-alive 池留久一点，HTTP/2 下同一条连接可以并行多条流。
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(MAX_PARALLEL_DOWNLOADS as usize)
-            .tcp_nodelay(true)
-            .user_agent("YBUMCL/0.1");
-        if let Some(timeout) = timeout {
-            builder = builder.timeout(timeout);
-        }
-        builder
-            .build()
-            .map(|client| Self {
-                client,
-                strategy,
-                rate: Rate::new(speed_limit()),
-                version: None,
-                rank: Mutex::new(HashMap::new()),
-                probing: Mutex::new(BTreeSet::new()),
-                edge: Mutex::new(None),
-            })
-            .map_err(|e| DownloadError::Network(e.to_string()))
+        // 默认走 HTTP/1.1：实测同一台 forgecdn 边缘，h2 单连接只有 ~0.2 MB/s，
+        // h1 能到 ~8.7 MB/s（PCL 用的 .NET HttpClient 默认也是 h1）。`YBUMCL_HTTP2=1`
+        // 可以换回 h2 做对比，只在排查时用。
+        let use_h2 = std::env::var("YBUMCL_HTTP2").is_ok();
+        Ok(Self {
+            client: build_client(timeout, !use_h2)?,
+            h1: build_client(timeout, true)?,
+            strategy,
+            rate: Rate::new(speed_limit()),
+            version: None,
+            rank: Mutex::new(HashMap::new()),
+            probing: Mutex::new(BTreeSet::new()),
+            edge: Mutex::new(None),
+            flaky: Mutex::new(HashSet::new()),
+        })
     }
+}
+
+/// 建一个 reqwest 客户端：TLS 版本、IPv4 优先、连接池这些参数所有链路共用。
+fn build_client(timeout: Option<Duration>, http1: bool) -> Result<Client> {
+    let mut builder = Client::builder()
+        .https_only(true)
+        // 部分 Cloudflare 边缘（legacyfabric 那几家）在 TLS 1.3 上会握手卡死，
+        // 降到 1.2 一切正常；1.2 是我们的全部下载源都支持的版本。
+        .max_tls_version(reqwest::tls::Version::TLS_1_2)
+        // 允许跳转，但每一跳都必须落在白名单主机上（镜像会 302 到自家 CDN）。
+        .redirect(Policy::custom(|attempt| {
+            // BMCLAPI 会 302 到各家高校镜像，跳转后的路径里保留着 /bmclapi/。
+            let mirror_path = attempt.url().path().contains("/bmclapi/");
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if attempt.url().host_str().is_some_and(host_allowed) || mirror_path {
+                attempt.follow()
+            } else {
+                attempt.error("redirect to untrusted host")
+            }
+        }))
+        .connect_timeout(Duration::from_secs(20))
+        // 国内 IPv6 路由常常连上即被重置，优先用 IPv4。
+        .local_address(if cfg!(windows) {
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        } else {
+            None
+        })
+        // 复用连接：资源文件成千上万，握手开销比传输本身还贵。
+        // keep-alive 池留久一点，HTTP/2 下同一条连接可以并行多条流。
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(MAX_PARALLEL_DOWNLOADS as usize)
+        .tcp_nodelay(true)
+        .user_agent("YBUMCL/0.1");
+    // 默认放开 HTTP/2：一条连接能并行多条流，省掉大量握手。只有被记成
+    // 「h2 不稳」的站点（见 `Http::get` 的自动回退）才用 http1 客户端。
+    if http1 {
+        builder = builder.http1_only();
+    }
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder
+        .build()
+        .map_err(|e| DownloadError::Network(e.to_string()))
 }
 impl Http {
     fn request(
@@ -765,16 +880,18 @@ impl Http {
         timeout: Option<Duration>,
     ) -> Result<(reqwest::blocking::Response, bool)> {
         let target = self.route(trusted_url(url)?);
-        let mut request = self.client.get(target.clone());
-        if let Some(timeout) = timeout {
-            request = request.timeout(timeout);
-        }
-        if let Some(offset) = range_start.filter(|offset| *offset > 0) {
-            request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
-        }
-        let response = request
-            .send()
-            .and_then(|r| r.error_for_status())
+        let response = self
+            .get(&target, |client| {
+                let mut request = client.get(target.clone());
+                if let Some(timeout) = timeout {
+                    request = request.timeout(timeout);
+                }
+                if let Some(offset) = range_start.filter(|offset| *offset > 0) {
+                    request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+                }
+                request
+            })?
+            .error_for_status()
             .map_err(|e| DownloadError::Network(e.to_string()))?;
         let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         self.remember_edge(&target, &response);
@@ -792,11 +909,12 @@ impl Http {
     ) -> Result<(reqwest::blocking::Response, bool)> {
         let target = self.route(trusted_url(url)?);
         let response = self
-            .client
-            .get(target.clone())
-            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-            .send()
-            .and_then(|r| r.error_for_status())
+            .get(&target, |client| {
+                client
+                    .get(target.clone())
+                    .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+            })?
+            .error_for_status()
             .map_err(|e| DownloadError::Network(e.to_string()))?;
         let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         self.remember_edge(&target, &response);
@@ -807,11 +925,12 @@ impl Http {
     fn probe_size(&self, url: &str) -> Result<Option<u64>> {
         let target = self.route(trusted_url(url)?);
         let response = self
-            .client
-            .get(target.clone())
-            .header(reqwest::header::RANGE, "bytes=0-0")
-            .send()
-            .and_then(|r| r.error_for_status())
+            .get(&target, |client| {
+                client
+                    .get(target.clone())
+                    .header(reqwest::header::RANGE, "bytes=0-0")
+            })?
+            .error_for_status()
             .map_err(|e| DownloadError::Network(e.to_string()))?;
         self.remember_edge(&target, &response);
         let total = response
@@ -822,6 +941,50 @@ impl Http {
             .and_then(|tail| tail.trim().parse::<u64>().ok());
         Ok(total.or_else(|| response.content_length()))
     }
+    /// 预热连接：安装开始时先给几个主要主机各发一个 8 KiB 的小请求，把
+    /// TCP + TLS 握手提前做掉，省得第一波文件全卡在握手上。
+    fn preheat(&self, urls: &[String]) {
+        let mut hosts: Vec<Url> = Vec::new();
+        for url in urls {
+            if hosts.len() >= 4 {
+                break;
+            }
+            let Ok(target) = trusted_url(url) else {
+                continue;
+            };
+            let Some(host) = target.host_str().map(str::to_owned) else {
+                continue;
+            };
+            if hosts
+                .iter()
+                .any(|known| known.host_str() == Some(host.as_str()))
+            {
+                continue;
+            }
+            hosts.push(target);
+        }
+        if hosts.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        // 后台做，不耽误文件开工；失败也无所谓，正式请求会自己握手。
+        thread::spawn(move || {
+            thread::scope(|scope| {
+                for target in &hosts {
+                    let client = client.clone();
+                    scope.spawn(move || {
+                        let _ = client
+                            .get(target.clone())
+                            .header(reqwest::header::RANGE, "bytes=0-1")
+                            .timeout(Duration::from_secs(6))
+                            .send()
+                            .map(drop);
+                    });
+                }
+            });
+        });
+    }
+
     /// 镜像把请求 302 到边缘节点后，后续文件直接走那条连接，省掉每文件一次跳转。
     fn remember_edge(&self, requested: &Url, response: &reqwest::blocking::Response) {
         let Some(host) = response.url().host_str() else {
@@ -895,18 +1058,6 @@ impl Http {
                     .map(|entry| entry.speeds.clone())
             })
             .unwrap_or_default()
-    }
-    /// 按实测速度把候选地址排好序，没测过的排在后面（用先验值兜底）。
-    fn arrange(&self, key: &'static str, mut all: Vec<(Route, Url)>) -> Vec<Url> {
-        let speeds = self.speeds(key);
-        let score = |route: Route| {
-            speeds
-                .iter()
-                .find(|(candidate, _)| *candidate == route)
-                .map_or(route.prior(), |(_, speed)| *speed)
-        };
-        all.sort_by(|a, b| score(b.0).total_cmp(&score(a.0)));
-        all.into_iter().map(|(_, url)| url).collect()
     }
     /// 同时打每条路，谁先读完 `PROBE_BYTES` 谁快。同一组坐标只比一次，其余线程照常用先验顺序。
     fn probe(&self, key: &'static str, all: &[(Route, Url)]) {
@@ -1035,48 +1186,57 @@ impl Http {
             return None;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        thread::scope(|scope| {
-            for (route, candidate) in candidates.into_iter().take(RACE_WIDTH) {
-                let tx = tx.clone();
-                let client = self.client.clone();
-                let route_url = self.route(candidate.clone());
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    let mut request = client.get(route_url.clone());
-                    if offset > 0 {
-                        request =
-                            request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
-                    }
-                    let Ok(response) = request.send().and_then(|r| r.error_for_status()) else {
-                        return;
-                    };
-                    let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-                    let mut reader = response;
-                    let mut head = Vec::with_capacity(RACE_PREFETCH);
-                    let mut chunk = [0u8; 16 * 1024];
-                    while head.len() < RACE_PREFETCH {
-                        match reader.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(n) => head.extend_from_slice(&chunk[..n]),
-                            Err(_) => return,
-                        }
-                    }
-                    if head.is_empty() {
+        // 谁先读满预读量谁赢；输家看到这个旗子就停手，不再白读。
+        let settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for (route, candidate) in candidates.into_iter().take(RACE_WIDTH) {
+            let tx = tx.clone();
+            let client = self.client.clone();
+            let route_url = self.route(candidate.clone());
+            let settled = settled.clone();
+            // 不 join：赢家一投递就能用，慢的那条路在后台自己退出。
+            // 用 `thread::scope` 会等所有候选读完才 `recv`，等于让最慢的那条路
+            // 决定每个文件的起步时间（安装原版时每个文件都要等一次）。
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let mut request = client.get(route_url.clone());
+                if offset > 0 {
+                    request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+                }
+                let Ok(response) = request.send().and_then(|r| r.error_for_status()) else {
+                    return;
+                };
+                let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+                let mut reader = response;
+                let mut head = Vec::with_capacity(RACE_PREFETCH);
+                let mut chunk = [0u8; 16 * 1024];
+                while head.len() < RACE_PREFETCH {
+                    if settled.load(Ordering::Relaxed) {
                         return;
                     }
-                    let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                    let _ = tx.send((
-                        route,
-                        partial,
-                        head,
-                        elapsed,
-                        Box::new(reader) as Box<dyn Read + Send>,
-                    ));
-                });
-            }
-            drop(tx);
-        });
-        let (winner, partial, head, elapsed, rest) = rx.recv().ok()?;
+                    match reader.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                        Err(_) => return,
+                    }
+                }
+                if head.is_empty() {
+                    return;
+                }
+                if settled.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+                let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                let _ = tx.send((
+                    route,
+                    partial,
+                    head,
+                    elapsed,
+                    Box::new(reader) as Box<dyn Read + Send>,
+                ));
+            });
+        }
+        drop(tx);
+        let (winner, partial, head, elapsed, rest) = rx.recv_timeout(RACE_WAIT).ok()?;
         // 赢家的实测速度记进排名，后面的文件可以直接按它排。
         if let Ok(parsed) = trusted_url(url) {
             let key = family(&parsed);
@@ -1223,7 +1383,8 @@ pub fn fetch_pack_archive(
         &[job],
         cancel,
         4,
-        DownloadStrategy::OfficialFirst,
+        // 以前写死官方优先：用户在设置里选了竞速/镜像也不生效，国内线路慢时特别明显。
+        strategy(),
         progress,
     )?;
     if let Some(reason) = failed.into_iter().next() {
@@ -1236,6 +1397,49 @@ pub fn fetch_file_bytes(url: &str, cancel: &CancellationToken) -> Result<Vec<u8>
     const FILE_LIMIT: u64 = 512 * 1024 * 1024;
     let source = Http::new(strategy())?;
     fetch_limited(&source, url, cancel, FILE_LIMIT)
+}
+
+/// 图标这类「一张一张、一次几十张」的小图共用的客户端。
+///
+/// 每张图各建一个 `Client` 的时候连接池等于没有：每张图都要重新 TCP + TLS 握手，
+/// 列表页一屏就够把首屏拖成好几秒。这里只建一次，之后所有图标共享连接池。
+static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
+
+fn shared_client() -> Result<Client> {
+    if let Some(client) = SHARED_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = build_client(Some(Duration::from_secs(30)), false)?;
+    Ok(SHARED_CLIENT.get_or_init(|| client).clone())
+}
+
+/// 取一张网络图片（图标）。
+///
+/// 和下载走同一套地址校验与客户端参数，但用共享连接池；上限 8 MB，图标不该这么大。
+pub fn fetch_icon_bytes(url: &str) -> Result<Vec<u8>> {
+    const ICON_LIMIT: u64 = 8 * 1024 * 1024;
+    let target = trusted_url(url)?;
+    let mut response = shared_client()?
+        .get(target)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .map_err(|e| DownloadError::Network(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(DownloadError::Network(format!(
+            "icon {url}: HTTP {}",
+            response.status()
+        )));
+    }
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(ICON_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| DownloadError::Network(e.to_string()))?;
+    if bytes.len() as u64 > ICON_LIMIT {
+        return Err(DownloadError::Invalid("icon too large".into()));
+    }
+    Ok(bytes)
 }
 
 /// 同上，但带上版本号，让 `piston-data` 这类地址也能生成 BMCLAPI 镜像候选。
@@ -1289,6 +1493,8 @@ pub struct BatchProgress {
     /// 这批里已知大小的文件加起来多大；界面拿它算「已下 / 总量」。
     pub total_bytes: u64,
     pub file: String,
+    /// 整批当前速度（字节/秒），界面拿来显示「1.2 MB/s · 还剩 3 分」。
+    pub speed: u64,
 }
 
 /// 一批文件里的一个：多个候选地址（官方 + 镜像）按顺序试，可选 SHA1 校验。
@@ -1505,8 +1711,8 @@ fn is_hard_failure(message: &str, url: &str) -> bool {
 /// 把一批文件下到磁盘：复用同一个连接池、并行抓取，失败的文件只记下来不中断整批。
 ///
 /// 整合包动辄上百个文件，逐个 `fetch_file_bytes` 会为每个文件重建 client（重新
-/// DNS + TLS 握手 + 镜像探测），实测慢到 20 秒一个；这里共用 [`Http`] 并开
-/// [`MODPACK_PARALLEL`] 个线程。
+/// DNS + TLS 握手 + 镜像探测），实测慢到 20 秒一个；这里共用 [`Http`]，按调用方
+/// 给的线程数并发。
 ///
 /// 走 [`fetch_into_part`] 而不是整包读进内存：单个文件边下边写 `<name>.part`，
 /// 断了能接着下，且只设读超时——7 MB 的 jar 在慢速校园网要下两分钟，
@@ -1532,14 +1738,27 @@ pub fn fetch_files_to(
     } else {
         items
     };
+    // 先把几个主要 CDN 的连接预热出来（后台线程，不阻塞下面的 worker）。
+    {
+        let seeds: Vec<String> = jobs
+            .iter()
+            .take(8)
+            .filter_map(|job| job.urls.first().cloned())
+            .collect();
+        source.preheat(&seeds);
+    }
     let done = AtomicUsize::new(0);
     let bytes = AtomicU64::new(0);
+    // 统计线程每 100 ms 采一次整批速度，界面直接读这里。
+    let speed = AtomicU64::new(0);
     let last = Mutex::new(Instant::now() - Duration::from_secs(1));
     let failed: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
     let total = jobs.len();
     let total_bytes = jobs.iter().filter_map(|job| job.size).sum::<u64>();
     // 线程数由设置决定（1–256，实际 2–257，默认 65）；比文件数多没意义。
     let workers = threads.clamp(1, 257).min(total).max(1);
+    // 真正同时在跑的连接数另设上限：线程再多，连接也只放这么多。
+    let budget = Budget::new(MAX_LIVE_CONNECTIONS);
     let health = Health::new(workers);
 
     // 一个文件里每读 64 KB 都会回调一次，全量转发会把 IPC 打爆；
@@ -1563,14 +1782,14 @@ pub fn fetch_files_to(
                 bytes: bytes.load(Ordering::Relaxed),
                 total_bytes,
                 file: file.to_owned(),
+                speed: speed.load(Ordering::Relaxed),
             });
         }
     };
 
     {
-        // 一轮下载：`order` 里的下标交给 workers 抢着做。`count` 为 false 时不再累加
-        // 「已完成个数」——补下轮不该让进度条从中间再走一遍。
-        let run_pass = |order: &[usize], count: bool| {
+        // 一轮下载：`order` 里的下标交给 workers 抢着做。
+        let run_pass = |order: &[usize]| {
             let next = AtomicUsize::new(0);
             // 正在处理的文件数：统计线程靠它判断这一轮是不是真的空了。
             let busy = AtomicUsize::new(0);
@@ -1592,11 +1811,12 @@ pub fn fetch_files_to(
                         let now = Instant::now();
                         let current = counted.load(Ordering::Relaxed);
                         let elapsed = now.duration_since(last_at).as_secs_f64().max(0.001);
-                        let speed = (current.saturating_sub(last_bytes) as f64 / elapsed) as u64;
+                        let now_speed = (current.saturating_sub(last_bytes) as f64 / elapsed) as u64;
                         last_bytes = current;
                         last_at = now;
-                        source.rate.set_speed(speed);
-                        samples.push_back(speed);
+                        speed.store(now_speed, Ordering::Relaxed);
+                        source.rate.set_speed(now_speed);
+                        samples.push_back(now_speed);
                         if samples.len() > 30 {
                             samples.pop_front();
                         }
@@ -1634,6 +1854,8 @@ pub fn fetch_files_to(
                             cancel,
                             &source,
                             &bytes,
+                            &budget,
+                            &speed,
                             health,
                             &name,
                             strategy,
@@ -1641,7 +1863,18 @@ pub fn fetch_files_to(
                         );
                         busy.fetch_sub(1, Ordering::Relaxed);
                         match result {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                // 两轮都算：补下成功的文件也要让进度走到 100%。
+                                let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+                                progress(&BatchProgress {
+                                    done: finished,
+                                    total,
+                                    bytes: bytes.load(Ordering::Relaxed),
+                                    total_bytes,
+                                    file: name,
+                                    speed: speed.load(Ordering::Relaxed),
+                                });
+                            }
                             Err(DownloadError::Cancelled) => return,
                             Err(error) => {
                                 let url = job.urls.first().cloned().unwrap_or_default();
@@ -1650,23 +1883,13 @@ pub fn fetch_files_to(
                                 }
                             }
                         }
-                        if count {
-                            let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
-                            progress(&BatchProgress {
-                                done: finished,
-                                total,
-                                bytes: bytes.load(Ordering::Relaxed),
-                                total_bytes,
-                                file: name,
-                            });
-                        }
                     });
                 }
             });
         };
 
         let order: Vec<usize> = (0..total).collect();
-        run_pass(&order, true);
+        run_pass(&order);
 
         // 整包几十上百个文件，一两个超时不该让用户从头再来：失败的那几个再补一轮，
         // 补下时进度只更新「正在下哪个文件」，不重复计数。
@@ -1678,7 +1901,7 @@ pub fn fetch_files_to(
             if let Ok(mut list) = failed.lock() {
                 list.clear();
             }
-            run_pass(&retry, false);
+            run_pass(&retry);
         }
     }
 
@@ -1689,93 +1912,15 @@ pub fn fetch_files_to(
         .into_iter()
         .map(|(_, message)| message)
         .collect();
-    let written = total.saturating_sub(failures.len());
+    // 暂停和取消都是「这一批没下完」：这里必须报错，否则调用方会拿
+    // 「0 个失败」当成功，继续往下搬文件 / 替换旧版本。
+    if cancel.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
+    let written = done.load(Ordering::Relaxed);
     Ok((written, failures))
 }
 
-/// 两个地址同时下同一个文件，先完成的赢；输掉的立刻取消。
-fn race_job(
-    job: &DownloadJob,
-    cancel: &CancellationToken,
-    source: &Http,
-    bytes: &AtomicU64,
-    health: &Health,
-    name: &str,
-    tick: &(impl Fn() + Sync),
-) -> Result<()> {
-    let racers = job.urls.len().min(2);
-    let winner: Mutex<Option<usize>> = Mutex::new(None);
-    let tokens: Vec<CancellationToken> = (0..racers).map(|_| CancellationToken::default()).collect();
-    let parts: Vec<std::path::PathBuf> = (0..racers)
-        .map(|index| job.dest.with_extension(format!("race{index}.part")))
-        .collect();
-
-    thread::scope(|scope| {
-        for (index, url) in job.urls.iter().take(racers).enumerate() {
-            let token = tokens[index].clone();
-            let part = parts[index].clone();
-            let winner = &winner;
-            let tokens = &tokens;
-            scope.spawn(move || {
-                let timeout = transfer_timeout(job.size);
-                // 两条路各记各的字节：都往共享计数里加会让进度凭空翻倍，
-                // 赢家定了才把这一个文件真正收到的字节并进批次。
-                let mine = AtomicU64::new(0);
-                let done = stream_to(url, &part, job.size, &token, source, &mine, timeout, tick)
-                    .and_then(|()| match job.sha1.as_deref() {
-                        Some(expected) => match file_sha1(&part) {
-                            Ok(actual) if actual.eq_ignore_ascii_case(expected) => Ok(()),
-                            Ok(actual) => Err(DownloadError::Integrity(format!(
-                                "{name}: 校验不通过（期望 {expected}，实际 {actual}）"
-                            ))),
-                            Err(error) => Err(error),
-                        },
-                        None => Ok(()),
-                    });
-                match &done {
-                    // 硬错误（404 / 不支持分段）说明这条地址对这个文件没戏了：整批停用。
-                    Err(DownloadError::Cancelled) => {}
-                    Err(error) => health.failed(url, error),
-                    Ok(()) => {}
-                }
-                if done.is_ok() {
-                    // 第一个成功的人点名，其他人立刻停手
-                    if let Ok(mut slot) = winner.lock() {
-                        if slot.is_none() {
-                            *slot = Some(index);
-                            bytes.fetch_add(mine.load(Ordering::Relaxed), Ordering::Relaxed);
-                            for (other, token) in tokens.iter().enumerate() {
-                                if other != index {
-                                    token.cancel();
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    let picked = winner.lock().ok().and_then(|slot| *slot);
-    let Some(index) = picked else {
-        for part in &parts {
-            let _ = fs::remove_file(part);
-        }
-        return Err(DownloadError::Network(format!("{name}: 竞速的两条线路都没下成")));
-    };
-    if let Some(parent) = job.dest.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let moved = fs::rename(&parts[index], &job.dest)
-        .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", job.dest.display())));
-    for (other, part) in parts.iter().enumerate() {
-        if other != index {
-            let _ = fs::remove_file(part);
-        }
-    }
-    cancel.check()?;
-    moved
-}
 
 /// 一个文件：按候选地址顺序试，下完校验 SHA1；全失败才记一次失败。
 fn fetch_job(
@@ -1783,6 +1928,8 @@ fn fetch_job(
     cancel: &CancellationToken,
     source: &Http,
     bytes: &AtomicU64,
+    budget: &Budget,
+    speed: &AtomicU64,
     health: &Health,
     name: &str,
     strategy: DownloadStrategy,
@@ -1803,22 +1950,17 @@ fn fetch_job(
             }
         }
     }
-    // 竞速策略下，凡是有两条候选（官方 + 镜像）的文件都同时开下，谁先到用谁。
-    // 只串行重试的话，遇到「不报错但很慢」的线路要等满超时。
-    let usable = job.urls.iter().filter(|url| health.usable(url)).count();
-    if strategy == DownloadStrategy::Race && usable >= 2 {
-        match race_job(job, cancel, source, bytes, health, name, &tick) {
-            Ok(()) => return Ok(()),
-            Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
-            Err(_) => {} // 竞速没成功就退回串行，串行还有完整重试
-        }
-    }
+    // 不再整文件竞速：那等于把每个大文件下两遍（96 MB 的整合包 = 192 MB 流量），
+    // 而下载过程中字节只在一个赢家跑完才记账，进度条会一直停在 0。
+    // 选路交给 Http::race 的预读竞速（8 KiB）与分段下载里的候选回退，PCL 也是单路 +
+    // 多线程这一套。
+    let _ = strategy;
     let mut last: Option<DownloadError> = None;
     for url in &job.urls {
         if !health.usable(url) {
             continue;
         }
-        match download_to(url, &job.dest, job.size, cancel, source, bytes, || tick()) {
+        match download_to(url, &job.dest, job.size, cancel, source, bytes, budget, speed, || tick()) {
             Ok(()) => {
                 if let Some(expected) = job.sha1.as_deref() {
                     match file_sha1(&job.dest) {
@@ -1860,12 +2002,16 @@ fn download_to(
     cancel: &CancellationToken,
     source: &Http,
     bytes: &AtomicU64,
+    budget: &Budget,
+    speed: &AtomicU64,
     tick: impl Fn() + Sync,
 ) -> Result<()> {
+    // 一个文件至少占一个连接名额；256 个 worker 在这里排队，而不是一拥而上。
+    let _permit = budget.acquire();
     // 大文件先走 Range 分块（每块两条路竞速）；服务器不支持分段或失败就退回单流。
     // 整批速度已经到下限（PCL 的 Low）时不再分块：多开连接只是抢同一条带宽。
     if !source.saturated() {
-        match fetch_chunked_to(url, dest, size, cancel, source, bytes, &tick) {
+        match fetch_chunked_to(url, dest, size, cancel, source, bytes, budget, speed, &tick) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
@@ -1895,6 +2041,7 @@ fn download_to(
             Err(error) => {
                 let network = matches!(error, DownloadError::Network(_));
                 if !network || attempt >= MAX_ATTEMPTS {
+                    let _ = fs::remove_file(&part);
                     return Err(error);
                 }
                 thread::sleep(Duration::from_millis(500u64 << (attempt - 1).min(3)));
@@ -1908,13 +2055,26 @@ const CHUNK_RACERS: usize = 2;
 
 /// 把文件切成互不重叠、覆盖 `[0, size)` 的闭区间。
 ///
-/// 小于阈值返回空（表示不要分块）；块数按 `CHUNK_THRESHOLD` 折算并夹在
+/// 小于阈值返回空（表示不要分块）；块数按 `CHUNK_MIN_PART` 折算并夹在
 /// `CHUNK_MIN_PARTS`..`CHUNK_MAX_PARTS`，末块一定以 `size - 1` 结束。
+/// 自适应分段的最小文件（更小的文件单流更快，握手比传输还贵）。
+const ADAPT_MIN_FILE: u64 = 4 * 1024 * 1024;
+/// 一段至少这么长才值得再切。
+const ADAPT_MIN_PIECE: u64 = 2 * 1024 * 1024;
+/// 一个文件最多开几条线程。
+const ADAPT_MAX_PIECES: usize = 8;
+/// 每次 Range 请求的跨度：管理器收回段尾最多滞后这么多字节。
+const ADAPT_REQUEST: u64 = 4 * 1024 * 1024;
+/// 管理器的采样间隔。
+const ADAPT_INTERVAL: Duration = Duration::from_millis(300);
+/// 速度下限：低于它才考虑加线程。
+const ADAPT_FLOOR: u64 = 1024 * 1024;
+
 pub(crate) fn plan_chunks(size: u64) -> Vec<(u64, u64)> {
-    if size < CHUNK_THRESHOLD {
+    if size < CHUNK_MIN_FILE {
         return Vec::new();
     }
-    let count = ((size / CHUNK_THRESHOLD) as usize).clamp(CHUNK_MIN_PARTS, CHUNK_MAX_PARTS);
+    let count = ((size / CHUNK_MIN_PART) as usize).clamp(CHUNK_MIN_PARTS, CHUNK_MAX_PARTS);
     let step = size.div_ceil(count as u64);
     let mut chunks = Vec::with_capacity(count);
     let mut start = 0u64;
@@ -1934,42 +2094,56 @@ fn span_to(
     end: u64,
     path: &Path,
     cancel: &CancellationToken,
+    bytes: &AtomicU64,
+    tick: &(impl Fn() + Sync),
 ) -> Result<u64> {
-    let (mut response, partial) = source.request_span(url, start, end)?;
-    if !partial {
-        return Err(DownloadError::Invalid(format!(
-            "{url}: 服务器不支持分段下载"
-        )));
-    }
-    let mut file = File::create(path)
-        .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
-    let want = end - start + 1;
-    let mut chunk = [0u8; 262144];
-    let mut written = 0u64;
-    loop {
-        cancel.check()?;
-        let read = response
-            .read(&mut chunk)
-            .map_err(|e| DownloadError::Network(e.to_string()))?;
-        if read == 0 {
-            break;
+    let mut counted = 0u64;
+    let outcome = (|| -> Result<u64> {
+        let (mut response, partial) = source.request_span(url, start, end)?;
+        if !partial {
+            return Err(DownloadError::Invalid(format!(
+                "{url}: 服务器不支持分段下载"
+            )));
         }
-        source.throttle(read as u64);
-        written += read as u64;
-        if written > want {
-            return Err(DownloadError::Integrity(url.to_owned()));
-        }
-        file.write_all(&chunk[..read])
+        let mut file = File::create(path)
             .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
+        let want = end - start + 1;
+        let mut chunk = [0u8; 262144];
+        let mut written = 0u64;
+        loop {
+            cancel.check()?;
+            let read = response
+                .read(&mut chunk)
+                .map_err(|e| DownloadError::Network(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            source.throttle(read as u64);
+            written += read as u64;
+            if written > want {
+                return Err(DownloadError::Integrity(url.to_owned()));
+            }
+            file.write_all(&chunk[..read])
+                .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
+            // 边下边记账：以前要等整段结束才 count，几十 MB 的分段下载中途进度条不动。
+            counted += read as u64;
+            bytes.fetch_add(read as u64, Ordering::Relaxed);
+            tick();
+        }
+        file.flush()
+            .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
+        if written != want {
+            return Err(DownloadError::Network(format!(
+                "{url}: 分段只收到 {written}/{want} 字节"
+            )));
+        }
+        Ok(written)
+    })();
+    if outcome.is_err() && counted > 0 {
+        // 这一段没成，把刚记的字节退回去，免得进度条冲过 100% 或虚高。
+        bytes.fetch_sub(counted, Ordering::Relaxed);
     }
-    file.flush()
-        .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
-    if written != want {
-        return Err(DownloadError::Network(format!(
-            "{url}: 分段只收到 {written}/{want} 字节"
-        )));
-    }
-    Ok(written)
+    outcome
 }
 
 /// 分块临时文件：`<part>.c{块号}r{路号}`，成功后逐个删掉。
@@ -2235,11 +2409,163 @@ fn fetch_chunked_bytes_counted(
     Ok(Some(out))
 }
 
-/// 大文件分块下载：每块独立 Range 请求，块内对前两条路（官方 / 镜像）竞速，
-/// 先下完的那条生效；全部块到齐后按偏移拼成 `part`，再改名成目标文件。
+/// 分块下载到 `dest`：每段一条线路、多段并行，字节边下边记账。
 ///
 /// 返回 `Ok(true)` 表示已经写成 `dest`；`Ok(false)` 表示「不支持 / 失败」，
-/// 调用方退回原来的单流下载（不报错，免得因为服务器不认 Range 就装不了）。
+/// 调用方退回单流下载（不报错，免得服务器不认 Range 就装不了）。
+/// PCL 式自适应分段：一开始只开一条线程，速度掉到峰值 85% 以下才把
+/// 剩余最大的那段再从尾部切 40% 出去交给新线程（`ModNet.vb:863-865`）。
+/// 文件小、线路快的时候自然只开一两条，不会像「按大小均分 8 段」那样
+/// 白开一堆连接。
+struct Piece {
+    start: u64,
+    /// 可被管理器往回收（变小）。
+    end: AtomicU64,
+    /// 已经下到哪（闭区间的下一个字节）。
+    cursor: AtomicU64,
+    temp: PathBuf,
+    route: AtomicUsize,
+}
+
+impl Piece {
+    fn remaining(&self) -> u64 {
+        let cursor = self.cursor.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Relaxed);
+        if cursor > end {
+            0
+        } else {
+            end - cursor + 1
+        }
+    }
+    fn finished(&self) -> bool {
+        self.cursor.load(Ordering::Relaxed) > self.end.load(Ordering::Relaxed)
+    }
+}
+
+/// 往段文件尾部追加 `[start, end]`。段文件只按自己的起点顺序增长，
+/// 失败时把这一截截掉并退回已记的字节，拼包时不会留下错位内容。
+fn span_append(
+    source: &Http,
+    url: &str,
+    start: u64,
+    end: u64,
+    path: &Path,
+    base: u64,
+    cancel: &CancellationToken,
+    bytes: &AtomicU64,
+    tick: &(impl Fn() + Sync),
+) -> Result<()> {
+    let mut counted = 0u64;
+    let outcome = (|| -> Result<()> {
+        let (mut response, partial) = source.request_span(url, start, end)?;
+        if !partial {
+            return Err(DownloadError::Invalid(format!(
+                "{url}: 服务器不支持分段下载"
+            )));
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
+        let want = end - start + 1;
+        let mut chunk = vec![0u8; 262144];
+        let mut written = 0u64;
+        loop {
+            cancel.check()?;
+            let read = response
+                .read(&mut chunk)
+                .map_err(|e| DownloadError::Network(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            source.throttle(read as u64);
+            written += read as u64;
+            if written > want {
+                return Err(DownloadError::Integrity(url.to_owned()));
+            }
+            file.write_all(&chunk[..read])
+                .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
+            counted += read as u64;
+            bytes.fetch_add(read as u64, Ordering::Relaxed);
+            tick();
+        }
+        file.flush()
+            .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", path.display())))?;
+        if written != want {
+            return Err(DownloadError::Network(format!(
+                "{url}: 分段只收到 {written}/{want} 字节"
+            )));
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        if counted > 0 {
+            bytes.fetch_sub(counted, Ordering::Relaxed);
+            if let Ok(file) = OpenOptions::new().write(true).open(path) {
+                let _ = file.set_len(base);
+            }
+        }
+    }
+    outcome
+}
+
+/// 一条线程负责一段：每次只请求不超过 `ADAPT_REQUEST`，这样管理器把段尾收回去时，
+/// 最多多下一小截（内容相同，拼包时会被覆盖），不会一直占着已经切出去的部分。
+fn run_piece(
+    piece: &Piece,
+    candidates: &[Url],
+    source: &Http,
+    cancel: &CancellationToken,
+    bytes: &AtomicU64,
+    failed: &AtomicBool,
+    tick: &(impl Fn() + Sync),
+) {
+    let mut route = piece
+        .route
+        .load(Ordering::Relaxed)
+        .min(candidates.len().saturating_sub(1));
+    loop {
+        if failed.load(Ordering::Relaxed) || cancel.is_cancelled() {
+            return;
+        }
+        let cursor = piece.cursor.load(Ordering::Relaxed);
+        let end = piece.end.load(Ordering::Relaxed);
+        if cursor > end {
+            return;
+        }
+        let request_end = (cursor + ADAPT_REQUEST - 1).min(end);
+        let base = cursor - piece.start;
+        let mut done = false;
+        while route < candidates.len() {
+            match span_append(
+                source,
+                candidates[route].as_str(),
+                cursor,
+                request_end,
+                &piece.temp,
+                base,
+                cancel,
+                bytes,
+                tick,
+            ) {
+                Ok(()) => {
+                    piece.route.store(route, Ordering::Relaxed);
+                    done = true;
+                    break;
+                }
+                Err(DownloadError::Cancelled) => return,
+                Err(_) => route += 1,
+            }
+        }
+        if !done {
+            failed.store(true, Ordering::Relaxed);
+            return;
+        }
+        piece.cursor.store(request_end + 1, Ordering::Relaxed);
+    }
+}
+
 fn fetch_chunked_to(
     url: &str,
     dest: &Path,
@@ -2247,73 +2573,109 @@ fn fetch_chunked_to(
     cancel: &CancellationToken,
     source: &Http,
     bytes: &AtomicU64,
+    budget: &Budget,
+    speed: &AtomicU64,
     tick: &(impl Fn() + Sync),
 ) -> Result<bool> {
     let total = match size {
-        Some(size) if size >= CHUNK_THRESHOLD => size,
+        Some(size) if size >= ADAPT_MIN_FILE => size,
         _ => match source.probe_size(url)? {
-            Some(size) if size >= CHUNK_THRESHOLD => size,
+            Some(size) if size >= ADAPT_MIN_FILE => size,
             _ => return Ok(false),
         },
     };
-    let chunks = plan_chunks(total);
-    if chunks.len() < 2 {
-        return Ok(false);
-    }
     let candidates = source.candidates(url)?;
     if candidates.is_empty() {
         return Ok(false);
     }
-    let racers = candidates.len().min(CHUNK_RACERS);
     let part = part_path(dest);
     if let Some(parent) = part.parent() {
         fs::create_dir_all(parent).map_err(|e| DownloadError::Core(io_error(parent, e)))?;
     }
-    let winners: Vec<AtomicUsize> = (0..chunks.len())
-        .map(|_| AtomicUsize::new(usize::MAX))
-        .collect();
     let failed = AtomicBool::new(false);
+    let next_id = AtomicUsize::new(0);
+    let mut pieces: Vec<Arc<Piece>> = Vec::new();
+    let mut permits: Vec<Permit> = Vec::new();
+    let new_piece = |start: u64, end: u64| {
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Piece {
+            start,
+            end: AtomicU64::new(end),
+            cursor: AtomicU64::new(start),
+            temp: chunk_temp(&part, id, 0),
+            route: AtomicUsize::new(0),
+        })
+    };
     thread::scope(|scope| {
-        for (index, (start, end)) in chunks.iter().copied().enumerate() {
-            for (racer, candidate) in candidates.iter().take(racers).enumerate() {
-                let winners = &winners;
-                let failed = &failed;
-                let temp = chunk_temp(&part, index, racer);
-                let url = candidate.as_str().to_owned();
-                scope.spawn(move || {
-                    if failed.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    match span_to(source, &url, start, end, &temp, cancel) {
-                        Ok(written) => {
-                            let won = winners[index]
-                                .compare_exchange(
-                                    usize::MAX,
-                                    racer,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                )
-                                .is_ok();
-                            if won {
-                                // 只把赢下来的那条路的字节计进进度，输家不计，免得虚高。
-                                bytes.fetch_add(written, Ordering::Relaxed);
-                            } else {
-                                let _ = fs::remove_file(&temp);
-                            }
-                        }
-                        Err(_) => {
-                            let _ = fs::remove_file(&temp);
-                        }
-                    }
-                });
+        let first = new_piece(0, total - 1);
+        pieces.push(first.clone());
+        let spawn = |piece: Arc<Piece>| {
+            let failed = &failed;
+            let candidates = &candidates;
+            scope.spawn(move || run_piece(&piece, candidates, source, cancel, bytes, failed, tick));
+        };
+        spawn(first);
+        // 管理器：每 300 ms 看一次整批速度。速度低于「峰值 85%」说明带宽没跑满，
+        // 就把剩余最多的那段从尾部切 40% 出去；到 8 条或没连接名额就停手。
+        let mut peak = 0u64;
+        loop {
+            if cancel.is_cancelled() || failed.load(Ordering::Relaxed) {
+                break;
             }
+            if pieces.iter().all(|piece| piece.finished()) {
+                break;
+            }
+            thread::sleep(ADAPT_INTERVAL);
+            let current = speed.load(Ordering::Relaxed);
+            peak = peak.max(current);
+            let gate = (peak * 85 / 100).max(ADAPT_FLOOR);
+            if current >= gate || pieces.len() >= ADAPT_MAX_PIECES {
+                continue;
+            }
+            let remaining = pieces
+                .iter()
+                .map(|piece| piece.remaining())
+                .max()
+                .unwrap_or(0);
+            if remaining < 2 * ADAPT_MIN_PIECE {
+                continue;
+            }
+            let Some(permit) = budget.try_acquire() else {
+                continue;
+            };
+            let Some(target) = pieces
+                .iter()
+                .filter(|piece| !piece.finished())
+                .max_by_key(|piece| piece.remaining())
+                .cloned()
+            else {
+                continue;
+            };
+            let remaining = target.remaining();
+            if remaining < 2 * ADAPT_MIN_PIECE {
+                continue;
+            }
+            let carve = remaining * 4 / 10;
+            let old_end = target.end.load(Ordering::Relaxed);
+            // 只切「还没下到」的部分：如果这条线程已经越过切分点，就从它的
+            // 游标处开始，否则两块会重叠下载，进度记两遍、冲过 100%。
+            let cursor = target.cursor.load(Ordering::Relaxed);
+            // 这条线程正在下的那一段最多读到 `cursor + ADAPT_REQUEST - 1`，
+            // 所以切分点必须让开它，否则两块内容重复、进度也会记两遍。
+            let new_start = (old_end - carve + 1).max(cursor + ADAPT_REQUEST);
+            if old_end - new_start + 1 < ADAPT_MIN_PIECE {
+                continue;
+            }
+            target.end.store(new_start - 1, Ordering::Relaxed);
+            let piece = new_piece(new_start, old_end);
+            pieces.push(piece.clone());
+            permits.push(permit);
+            spawn(piece);
         }
     });
     let cleanup = || {
-        for index in 0..chunks.len() {
-            for racer in 0..racers {
-                let _ = fs::remove_file(chunk_temp(&part, index, racer));
-            }
+        for piece in &pieces {
+            let _ = fs::remove_file(&piece.temp);
         }
     };
     if cancel.is_cancelled() {
@@ -2321,15 +2683,13 @@ fn fetch_chunked_to(
         let _ = fs::remove_file(&part);
         cancel.check()?;
     }
-    if failed.load(Ordering::Relaxed)
-        || winners
-            .iter()
-            .any(|winner| winner.load(Ordering::Relaxed) == usize::MAX)
-    {
+    if failed.load(Ordering::Relaxed) || pieces.iter().any(|piece| !piece.finished()) {
         cleanup();
         let _ = fs::remove_file(&part);
         return Ok(false);
     }
+    let mut ordered: Vec<&Arc<Piece>> = pieces.iter().collect();
+    ordered.sort_by_key(|piece| piece.start);
     let mut out = OpenOptions::new()
         .write(true)
         .create(true)
@@ -2338,21 +2698,20 @@ fn fetch_chunked_to(
         .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", part.display())))?;
     out.set_len(total)
         .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", part.display())))?;
-    for (index, (start, _end)) in chunks.iter().enumerate() {
-        let racer = winners[index].load(Ordering::Relaxed);
-        let temp = chunk_temp(&part, index, racer);
-        let mut chunk = File::open(&temp)
-            .map_err(|e| DownloadError::Invalid(format!("读取 {} 失败：{e}", temp.display())))?;
-        out.seek(SeekFrom::Start(*start))
+    for piece in ordered {
+        let mut chunk = File::open(&piece.temp).map_err(|e| {
+            DownloadError::Invalid(format!("读取 {} 失败：{e}", piece.temp.display()))
+        })?;
+        out.seek(SeekFrom::Start(piece.start))
             .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", part.display())))?;
         std::io::copy(&mut chunk, &mut out)
             .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", part.display())))?;
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(&piece.temp);
     }
     out.flush()
         .map_err(|e| DownloadError::Invalid(format!("写入 {} 失败：{e}", part.display())))?;
     drop(out);
-    cleanup();
+    drop(permits);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| DownloadError::Core(io_error(parent, e)))?;
     }
@@ -2365,7 +2724,6 @@ fn fetch_chunked_to(
 /// 删掉目标文件和它的临时文件（校验不通过时用）。
 fn discard(dest: &Path) {
     let _ = fs::remove_file(dest);
-    let _ = fs::remove_file(part_path(dest));
 }
 
 /// 单个文件的总超时：留给「慢但一直在动」的链接，又不至于卡到天荒地老。
@@ -2448,6 +2806,16 @@ fn stream_to(
         tick();
     }
     cancel.check()?;
+    // 有 Content-Length / 清单长度就核对一遍：无校验和的任务（整合包压缩包）靠它兜底，
+    // 否则连接提前断开会被当成下完了。
+    if let Some(expected) = size {
+        if written != expected {
+            let _ = fs::remove_file(part);
+            return Err(DownloadError::Network(format!(
+                "{url} 连接提前结束（{written}/{expected} 字节）"
+            )));
+        }
+    }
     // 这里以前每个文件都 sync_all()（fsync），一个整合包上千个文件就等于上千次刷盘，
     // 白等十几秒。写完交给操作系统的页缓存就行：真正的完整性靠后面的 SHA1 校验。
     file.flush()
@@ -3013,14 +3381,19 @@ fn cache_file(
         _ => Ok(None),
     }
 }
-/// 目标文件旁边的 `<name>.part`：同一份文件在进程重启后仍可接着下。
+/// 每次下载独占一个临时文件：`<name>.<进程号>-<序号>.part`。
+///
+/// 以前是固定名 `<name>.part`，两个安装同时写同一个目标（比如两个整合包都依赖
+/// `versions/1.21.11` 的加载器描述）时，Windows 上后到的那个直接报「拒绝访问」。
+/// PCL 也是给每个下载线程发一个唯一临时名（`ModNet.vb:984`），这里跟它一致。
 fn part_path(path: &Path) -> PathBuf {
-    let mut name = path
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
         .file_name()
-        .map(|name| name.to_os_string())
+        .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.push(".part");
-    path.with_file_name(name)
+    path.with_file_name(format!("{name}.{}-{seq}.part", std::process::id()))
 }
 /// 单文件最多尝试次数（首次 + 2 次重试）。
 const MAX_ATTEMPTS: u32 = 3;
@@ -3028,8 +3401,10 @@ const MAX_ATTEMPTS: u32 = 3;
 /// 把 `part` 原子发布到目标位置。Windows 的 rename 不能覆盖已存在文件。
 fn publish(root: &Path, path: &Path, part: &Path) -> Result<()> {
     inside(root, path)?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| io_error(path, e))?;
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error(path, e).into()),
     }
     fs::rename(part, path).map_err(|e| io_error(path, e))?;
     Ok(())
@@ -3225,12 +3600,13 @@ fn fetch_chunked<S: Source + Sync>(
     let Some(size) = a.size else {
         return Ok(false);
     };
-    if size < CHUNK_THRESHOLD {
+    if size < CHUNK_MIN_FILE {
         return Ok(false);
     }
-    let parts = ((size / CHUNK_THRESHOLD) as usize).clamp(CHUNK_MIN_PARTS, CHUNK_MAX_PARTS);
+    let parts = ((size / CHUNK_MIN_PART) as usize).clamp(CHUNK_MIN_PARTS, CHUNK_MAX_PARTS);
     let segment = size.div_ceil(parts as u64);
     let unsupported = AtomicBool::new(false);
+    let cancelled = AtomicBool::new(false);
     thread::scope(|scope| {
         for index in 0..parts {
             let start = index as u64 * segment;
@@ -3239,6 +3615,7 @@ fn fetch_chunked<S: Source + Sync>(
                 continue;
             }
             let unsupported = &unsupported;
+            let cancelled = &cancelled;
             scope.spawn(move || {
                 if unsupported.load(Ordering::Relaxed) {
                     return;
@@ -3254,22 +3631,34 @@ fn fetch_chunked<S: Source + Sync>(
                 ) {
                     Ok(true) => {}
                     Ok(false) => unsupported.store(true, Ordering::Relaxed),
-                    Err(error) => {
-                        if !matches!(error, DownloadError::Slow(_)) {
-                            unsupported.store(true, Ordering::Relaxed);
-                        }
-                    }
+                    // 取消/暂停要往上抛，不能当成「不支持分段」悄悄退回单流。
+                    Err(DownloadError::Cancelled) => cancelled.store(true, Ordering::Relaxed),
+                    // `Slow` 也算失败：以前把它当没事，缺一段拼出来的文件
+                    // 必然校验不过，整个文件直接失败，而不是退回单流重下。
+                    Err(_) => unsupported.store(true, Ordering::Relaxed),
                 }
             });
         }
     });
+    if cancelled.load(Ordering::Relaxed) {
+        for index in 0..parts {
+            let _ = fs::remove_file(segment_path(part, index));
+        }
+        return Err(DownloadError::Cancelled);
+    }
     if unsupported.load(Ordering::Relaxed) {
         for index in 0..parts {
             let _ = fs::remove_file(segment_path(part, index));
         }
         return Ok(false);
     }
-    join_segments(part, parts, a, cancel)?;
+    if !join_segments(part, parts, segment, size, a, cancel)? {
+        for index in 0..parts {
+            let _ = fs::remove_file(segment_path(part, index));
+        }
+        let _ = fs::remove_file(part);
+        return Ok(false);
+    }
     Ok(true)
 }
 /// Streams one byte range into `target`. Returns false when the server ignored the Range header.
@@ -3308,21 +3697,33 @@ fn write_segment<S: Source>(
     file.sync_all().map_err(|e| io_error(target, e))?;
     Ok(true)
 }
+/// 把分段文件按顺序拼成一个包并校验。返回 `false` 表示段不全或校验不过，
+/// 调用方应当删掉残包、退回单流重下；这里不再把「缺段」当没事拼下去。
 fn join_segments(
     part: &Path,
     parts: usize,
+    segment: u64,
+    size: u64,
     a: &Artifact,
     cancel: &CancellationToken,
-) -> Result<()> {
+) -> Result<bool> {
+    // 先按预期长度逐段核对：短段、缺段都直接放弃分块。
+    for index in 0..parts {
+        let start = index as u64 * segment;
+        let end = (start + segment).min(size);
+        let want = end.saturating_sub(start);
+        let path = segment_path(part, index);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() == want && want > 0 => {}
+            _ => return Ok(false),
+        }
+    }
     let mut file = File::create(part).map_err(|e| io_error(part, e))?;
     let mut hash = Sha1::new();
-    let mut size = 0u64;
+    let mut written = 0u64;
     let mut chunk = vec![0u8; 65536];
     for index in 0..parts {
         let path = segment_path(part, index);
-        if !path.is_file() {
-            continue;
-        }
         let mut segment = File::open(&path).map_err(|e| io_error(&path, e))?;
         loop {
             cancel.check()?;
@@ -3330,14 +3731,17 @@ fn join_segments(
             if n == 0 {
                 break;
             }
-            size += n as u64;
+            written += n as u64;
             hash.update(&chunk[..n]);
             file.write_all(&chunk[..n]).map_err(|e| io_error(part, e))?;
         }
         let _ = fs::remove_file(&path);
     }
     file.sync_all().map_err(|e| io_error(part, e))?;
-    verify(a, &format!("{:x}", hash.finalize()), size)
+    match verify(a, &format!("{:x}", hash.finalize()), written) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 /// Downloads one artifact into place: stream to `.part`, verify, publish.
 /// Returns whether network bytes were spent (false when an already-valid file was reused).

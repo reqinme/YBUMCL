@@ -35,6 +35,15 @@
     return `${size < 10 && unit > 0 ? size.toFixed(1) : Math.round(size)} ${units[unit]}`;
   }
 
+  /// 剩余时间：只在下得动、而且知道总量时才写，免得卡片上出现「还剩 —」。
+  function eta(received: number, total: number | null, speed: number | null): string {
+    if (!speed || speed <= 0 || total === null || total <= received) return "";
+    const left = Math.round((total - received) / speed);
+    if (left < 60) return ` · 还剩 ${left} 秒`;
+    if (left < 3600) return ` · 还剩 ${Math.round(left / 60)} 分`;
+    return ` · 还剩 ${(left / 3600).toFixed(1)} 小时`;
+  }
+
   function time(value: number | null): string {
     if (!value) return "";
     const date = new Date(value);
@@ -163,15 +172,19 @@
               <div class="bar" class:indeterminate={task.total === null}>
                 <span style:width={task.total ? `${task.percent}%` : "40%"}></span>
               </div>
-              {#if task.note || task.total !== null}
+              {#if task.note || task.total !== null || task.speed}
                 <div class="live-meta">
                   {#if task.note}
                     <span>{task.note}</span>
                   {/if}
-                  {#if task.total !== null}
-                    <span class="dim"
-                      >{bytes(task.received)} / {bytes(task.total)} · {Math.floor(task.percent)}%</span
-                    >
+                  {#if task.total !== null || task.speed}
+                    <span class="dim">
+                      {#if task.total !== null}{bytes(task.received)} / {bytes(task.total)} · {Math.floor(
+                          task.percent,
+                        )}%{/if}{#if task.speed}{#if task.total !== null} · {/if}{bytes(
+                          task.speed,
+                        )}/s{eta(task.received, task.total, task.speed)}{/if}
+                    </span>
                   {/if}
                 </div>
               {/if}

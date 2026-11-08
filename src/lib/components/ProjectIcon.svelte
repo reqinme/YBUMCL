@@ -5,14 +5,15 @@
   let { project, size = 44 }: { project: { id: string; title: string; iconUrl?: string | null }; size?: number } =
     $props();
 
-  /// 结果按 url 缓存：翻页、切分类回来不用重新取一次。
+  /// 结果按 url 缓存在模块级：列表和详情面板是两个实例，翻页、切分类回来也不用重新取。
+  /// 进程内是第一次命中；跨启动靠后端 `YBUMCL\icon-cache` 的磁盘缓存。
   const cache = new Map<string, string | null>();
   /// loading 时先放启动器 logo，拿到图再换；确认没有图标才显示项目名。
   let phase = $state<"loading" | "image" | "missing">("loading");
   let dataUrl = $state<string | null>(null);
 
   /// 单个图标最多等这么久；超时只是这次不显示，下次进页面还会再试。
-  const TIMEOUT = 12000;
+  const TIMEOUT = 20000;
 
   /// 换项目时组件会被复用（详情面板没重建），所以跟着 iconUrl 走，不能只在 onMount 里取一次。
   let token = 0;

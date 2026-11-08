@@ -1,8 +1,10 @@
+mod caches;
 mod categories;
 mod clipboard_files;
 mod commands;
 mod favorites;
 mod game_folders;
+mod icon_cache;
 mod instance_cache;
 mod mod_projects;
 mod instances;
@@ -44,6 +46,16 @@ fn heartbeat() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 退出时拉起的清理器：等主进程退出、WebView2 放锁后删缓存，删完直接返回，
+    // 不建窗口也不进单实例逻辑。
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some(caches::CLEAN_FLAG) {
+        if let Some(dir) = args.next() {
+            caches::run_cleaner(std::path::Path::new(&dir));
+        }
+        return;
+    }
+
     // 数据目录要先解析出来：单实例互斥键就是它（同一份数据只许一个进程，
     // 两份 exe 指向不同数据目录时仍可同时开）。
     let paths = match portable::Paths::resolve() {
@@ -71,6 +83,8 @@ pub fn run() {
             commands::instance_root,
         commands::list_entries,
         commands::read_text_file,
+        commands::search_files,
+        commands::stop_search,
         commands::image_data_url,
         commands::read_servers,
         commands::export_instance_zip,
@@ -212,6 +226,17 @@ pub fn run() {
             heartbeat,
         ])
         .setup(move |app| {
+            // 缓存本该在退出时删；上次是崩溃、强杀还是断电没走到那一步的，
+            // 这里补一次，保证每次启动都从干净状态开始。
+            caches::clear(paths.data_dir());
+            // 每次下载的临时名都带进程号，崩溃或强杀留下的 `.part` 没人再认领，
+            // 后台扫一遍（只删一天以前的，别碰正在下的）。
+            {
+                let root = paths.game_dir();
+                std::thread::spawn(move || {
+                    caches::sweep_parts(&root, std::time::Duration::from_secs(24 * 3600));
+                });
+            }
             paths.write_startup_log(env!("CARGO_PKG_VERSION"));
             // 搜索/版本列表的 HTTP 缓存（对应 PCL 的 CacheCow），放在数据目录下。
             launcher_core::httpcache::init(paths.data_dir().join("http-cache"));
@@ -337,14 +362,19 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // 退出时把 HTTP 缓存删掉：它只用来加速同一次会话里的重复请求，
-    // 留着只会越堆越多（PCL 也是把缓存放临时目录里随用随清）。
+    // 退出时把缓存清掉，下次启动等同首次启动。
+    //
+    // 分两处做：
+    // - 这里（进程还在）只删没被 WebView2 占着的（HTTP 缓存、业务缓存的 json）；
+    // - Local Storage 的 LevelDB 这时还锁着，交给退出后拉起的清理器（同一个 exe，
+    //   带 `--clean-caches`）在主进程结束后删。
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
-            // 暂停过的半成品不等下次启动，关窗口就删（整合包的 `.ybmcl/modpack` 也在表里）。
+            // 暂停过的半成品不等下次启动，关窗口就删（整合包的 `.ybumcl/modpack` 也在表里）。
             sweep::cleanup_paused_on_exit();
             if let Some(paths) = handle.try_state::<portable::Paths>() {
-                let _ = std::fs::remove_dir_all(paths.data_dir().join("http-cache"));
+                caches::clear_quick(paths.data_dir());
+                caches::spawn_cleaner(paths.data_dir());
             }
         }
     });

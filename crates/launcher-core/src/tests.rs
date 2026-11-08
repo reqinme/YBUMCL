@@ -1509,45 +1509,6 @@ fn ftb_plan_zip_is_readable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 手工冒烟：同一个文件给两个地址，竞速应该只留一份、内容对得上。
-#[test]
-#[ignore]
-fn race_download_keeps_one_file() {
-    let fixture = Fixture::new();
-    let versions = crate::modrinth::versions("1KVo5zza", Some("26.3"), Some("fabric"))
-        .expect("取版本列表");
-    let version = versions.first().expect("至少一个版本").clone();
-    let dest = fixture.root.join(&version.file_name);
-    let job = crate::download::DownloadJob {
-        // 同一个直链给两次，就相当于两条线路同时开工。
-        urls: vec![version.file_url.clone(), version.file_url.clone()],
-        dest: dest.clone(),
-        size: Some(version.file_size),
-        sha1: None,
-    };
-    let cancel = crate::download::CancellationToken::default();
-    let (written, failed) = crate::download::fetch_files_to(
-        &[job],
-        &cancel,
-        2,
-        crate::download::DownloadStrategy::default(),
-        |_| {},
-    )
-        .expect("下载不该报错");
-    assert_eq!(written, 1, "应该算完成一个文件");
-    assert!(failed.is_empty(), "竞速不该留下失败记录：{failed:?}");
-    let size = std::fs::metadata(&dest).expect("文件应该存在").len();
-    assert_eq!(size, version.file_size, "大小要和清单一致");
-    // 竞速用的临时文件都要清干净。
-    let leftovers: Vec<_> = std::fs::read_dir(&fixture.root)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains("race"))
-        .collect();
-    assert!(leftovers.is_empty(), "不该留下 {leftovers:?}");
-}
-
 #[test]
 fn sweep_parts_only_removes_half_downloaded_files() {
     let fixture = Fixture::new();
@@ -1605,17 +1566,17 @@ fn relative_library_files_reads_local_libraries() {
 
 #[test]
 fn plan_chunks_covers_the_file_without_gaps() {
-    // 小于阈值不分块（阈值 256 KiB）
-    assert!(download::plan_chunks(256 * 1024 - 1).is_empty());
+    // 小于阈值不分块（阈值 2 MiB，1–2 MiB 的小文件单流反而更快）
+    assert!(download::plan_chunks(2 * 1024 * 1024 - 1).is_empty());
 
-    // 413 KB 这类小文件也要分块（至少两块，避免单连接被限速拖住）
-    let small = 413 * 1024;
+    // 3 MiB 切成两块
+    let small = 3 * 1024 * 1024;
     let small_chunks = download::plan_chunks(small);
     assert!(small_chunks.len() >= 2);
     assert_eq!(small_chunks[0].0, 0);
     assert_eq!(small_chunks.last().unwrap().1, small - 1);
 
-    // 11 MB → 至少两块，且首块从 0 开始、末块以 size-1 结束、中间无缝
+    // 11 MiB → 至少两块，且首块从 0 开始、末块以 size-1 结束、中间无缝
     let size = 11 * 1024 * 1024;
     let chunks = download::plan_chunks(size);
     assert!(chunks.len() >= 2);
@@ -1627,11 +1588,13 @@ fn plan_chunks_covers_the_file_without_gaps() {
 
     // 大文件块数封顶，且总量仍然对齐
     let big = 256 * 1024 * 1024;
-    let chunks = download::plan_chunks(big);
-    assert!(chunks.len() <= 8);
-    assert_eq!(chunks.last().unwrap().1, big - 1);
-    let covered: u64 = chunks.iter().map(|(start, end)| end - start + 1).sum();
-    assert_eq!(covered, big);
+    let big_chunks = download::plan_chunks(big);
+    assert_eq!(big_chunks.len(), 8);
+    assert_eq!(big_chunks[0].0, 0);
+    assert_eq!(big_chunks.last().unwrap().1, big - 1);
+    for pair in big_chunks.windows(2) {
+        assert_eq!(pair[0].1 + 1, pair[1].0, "块之间不能有空隙");
+    }
 }
 
 #[test]

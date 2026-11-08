@@ -41,6 +41,21 @@ pub fn inspect(bytes: &[u8]) -> Option<(&'static str, bool)> {
     Some((mime, max - min < FLAT_SPAN))
 }
 
+/// 网络图标在磁盘缓存里的文件名：URL 的 SHA1。
+///
+/// 直接拿 URL 当文件名会撞上长度限制和 `?`、`:` 这些非法字符；同一个 URL
+/// 永远得到同一个名字，换图（CDN 路径里带指纹）自然就是新文件。
+pub fn url_key(url: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(url.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// 简单的 base64，避免为了一个图标再加依赖。
 pub fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

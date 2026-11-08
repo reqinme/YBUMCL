@@ -154,7 +154,7 @@ impl Drop for Fixture {
 #[test]
 fn large_artifact_is_fetched_with_parallel_ranges() {
     let mut f = Fixture::new();
-    let size = (CHUNK_THRESHOLD + 1024 * 1024) as usize;
+    let size = (CHUNK_MIN_FILE + 1024 * 1024) as usize;
     let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
     let url = "https://piston-data.mojang.com/big.jar";
     let mut artifact = f.artifact(url, &body);
@@ -184,7 +184,7 @@ fn large_artifact_is_fetched_with_parallel_ranges() {
 #[test]
 fn chunked_fetch_falls_back_when_server_ignores_ranges() {
     let f = Fixture::new();
-    let artifact = json!({"url":"https://piston-data.mojang.com/big.jar","sha1":hash(&vec![0u8; CHUNK_THRESHOLD as usize + 8]),"size":CHUNK_THRESHOLD as usize + 8});
+    let artifact = json!({"url":"https://piston-data.mojang.com/big.jar","sha1":hash(&vec![0u8; CHUNK_MIN_FILE as usize + 8]),"size":CHUNK_MIN_FILE as usize + 8});
     let a = Artifact::new(
         "big.jar".into(),
         &artifact,
@@ -752,7 +752,9 @@ fn network_blip_is_retried_until_the_file_arrives() {
 }
 
 #[test]
-fn partial_file_resumes_without_refetching_finished_bytes() {
+fn leftover_part_from_an_earlier_run_is_not_trusted() {
+    // 临时名现在带进程号和序号（两个安装同时写同一个目标也不撞），所以上次运行
+    // 留下的 `<名>.part` 认不出来：这次整份重下，旧文件留给启动时的清扫。
     let f = Fixture::new();
     let part = f.root.join("versions/test/test.jar.part");
     fs::create_dir_all(part.parent().unwrap()).unwrap();
@@ -762,7 +764,7 @@ fn partial_file_resumes_without_refetching_finished_bytes() {
         fs::read(f.root.join("versions/test/test.jar")).unwrap(),
         b"client"
     );
-    assert!(!part.exists());
+    assert!(part.exists());
 }
 
 #[test]

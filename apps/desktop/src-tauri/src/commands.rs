@@ -3,7 +3,7 @@
 //! 约定：所有命令都返回 `Result<T, String>`，前端直接把字符串当错误提示展示。
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1289,7 +1289,7 @@ pub async fn diagnose_crash_report(
     tauri::async_runtime::spawn_blocking(move || {
         let path = std::path::Path::new(&dir).join(&file);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let text = String::from_utf8_lossy(&bytes);
+        let text = decode_text(&bytes);
         Ok(launcher_core::crash::diagnose(&text))
     })
     .await
@@ -2092,7 +2092,7 @@ pub async fn launch_version(
                             &runtime,
                             LogLine {
                                 stream: stream.into(),
-                                text: String::from_utf8_lossy(&bytes).trim_end().to_string(),
+                                text: decode_text(&bytes).trim_end().to_string(),
                             },
                         ),
                     }
@@ -2526,23 +2526,31 @@ pub async fn install_ftb_modpack(
                 url: None,
                 path: Some(plan.display().to_string()),
                 file_name: None,
+                size: None,
                 name,
                 java_path,
                 strategy,
                 threads: None,
                 icon_url,
+                // FTB 的整合包由我们自己写 .mrpack，来源是确定的，直接带进实例记录。
+                source: Some("ftb".into()),
+                project_id: Some(project.clone()),
+                project_name: None,
             },
             token,
             move |step: &launcher_core::modpack::Step| {
                 let _ = emitter.emit(
                     "modpack-progress",
                     serde_json::json!({
+                        "installId": install_id,
                         "stage": step.stage,
                         "done": step.done,
                         "total": step.total,
                         "bytes": step.bytes,
                         "totalBytes": step.total_bytes,
                         "file": step.file,
+                        "overall": step.overall,
+                        "speed": step.speed,
                     }),
                 );
             },
@@ -2666,7 +2674,7 @@ fn icon_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, O
 }
 
 #[tauri::command]
-pub async fn fetch_icon(url: String) -> Result<Option<String>, String> {
+pub async fn fetch_icon(paths: State<'_, Paths>, url: String) -> Result<Option<String>, String> {
     if !url.starts_with("https://") {
         return Err("Invalid input: icon url must be https".into());
     }
@@ -2677,24 +2685,15 @@ pub async fn fetch_icon(url: String) -> Result<Option<String>, String> {
     {
         return Ok(hit);
     }
+    // 磁盘缓存 + 联网都放到阻塞线程：解码图片和写文件都是 CPU/IO 活。
+    let dir = paths.data_dir().join("icon-cache");
     let key = url.clone();
-    let bytes = tauri::async_runtime::spawn_blocking(move || {
-        launcher_core::download::fetch_file_bytes(&key, &CancellationToken::default())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())?;
-    let icon = match launcher_core::icons::inspect(&bytes) {
-        Some((_mime, true)) => None,
-        Some((mime, false)) => Some(format!(
-            "data:image/{mime};base64,{}",
-            launcher_core::icons::base64(&bytes)
-        )),
-        None => None,
-    };
+    let icon = tauri::async_runtime::spawn_blocking(move || crate::icon_cache::load_or_fetch(&dir, &key))
+        .await
+        .map_err(|error| error.to_string())??;
     if let Ok(mut cache) = icon_cache().lock() {
-        // 图标都很小，缓存 512 个足够翻很久；超了直接清空重来。
-        if cache.len() > 512 {
+        // 图标都很小，缓存 2048 个足够翻很久；超了直接清空重来。
+        if cache.len() > 2048 {
             cache.clear();
         }
         cache.insert(url, icon.clone());
@@ -3285,12 +3284,15 @@ pub async fn install_modpack(
                 let _ = emitter.emit(
                     "modpack-progress",
                     serde_json::json!({
+                        "installId": install_id,
                         "stage": step.stage,
                         "done": step.done,
                         "total": step.total,
                         "bytes": step.bytes,
                         "totalBytes": step.total_bytes,
                         "file": step.file,
+                        "overall": step.overall,
+                        "speed": step.speed,
                     }),
                 );
             },
@@ -3515,16 +3517,27 @@ pub async fn pack_reinstall(
         .and_then(|value| value.to_str())
         .unwrap_or("instance")
         .to_owned();
+    // 重装是用新下载的包重新铺一遍：包里依然没有项目 id，沿用实例原来记的来源，
+    // 否则重装一次「检查更新」就再也认不出这个包了。
+    let kept = launcher_core::pack_update::read_meta(&instance_dir);
+    let (kept_source, kept_project) = kept
+        .as_ref()
+        .map(|meta| (meta.source.clone(), meta.project_id.clone()))
+        .unwrap_or_default();
     let request = launcher_core::modpack::ModpackRequest {
         game_dir: game_dir.clone(),
         url: None,
         path: Some(pack_path.to_string_lossy().to_string()),
         file_name: Some(info.latest_file_name.clone()),
+        size: None,
         name: Some(name),
         java_path: None,
         strategy: Default::default(),
         threads: None,
         icon_url: None,
+        source: (!kept_source.trim().is_empty() && kept_source != "zip").then_some(kept_source),
+        project_id: (!kept_project.trim().is_empty()).then_some(kept_project),
+        project_name: None,
     };
     let emitter = app.clone();
     let install = tauri::async_runtime::spawn_blocking(move || {
@@ -3936,17 +3949,9 @@ pub async fn mod_project_icons(
     tauri::async_runtime::spawn_blocking(move || {
         let runtime = runtime_of(game_dir, game_directory)?;
         let mods_dir = runtime.join("mods");
-        let mut keys = Vec::new();
-        for file_name in files {
-            let path = mods_dir.join(&file_name);
-            if !path.is_file() {
-                continue;
-            }
-            match launcher_core::modicons::key_of(&path, &file_name) {
-                Ok(key) => keys.push(key),
-                Err(_) => continue,
-            }
-        }
+        // 一次读盘同时算 SHA1 和指纹：文件大小/修改时间没变就走 `mods-hashes.json`
+        // 的缓存，不必每次启动都把几百个 jar 整份重读一遍（665 MB 的整合包就是几秒）。
+        let keys = launcher_core::modicons::keys_of(&data_dir, "mods-hashes.json", &mods_dir, &files);
         if keys.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -4852,18 +4857,249 @@ pub fn list_entries(path: String) -> Result<Vec<EntryInfo>, String> {
     Ok(items)
 }
 
-/// 读文本文件（日志、崩溃报告用）；超过 `limit` 字节只留开头。
+/// 读文本文件（日志、崩溃报告用）。
+///
+/// - 默认只留开头 `limit` 字节；`tail = true` 时留**末尾**——日志的错误都在最后，
+///   按开头截断等于把要看的那段扔了。
+/// - `.gz`（MC 自动压缩的老日志）先解压再截断，解压上限 16 MB，防止压缩炸弹。
 #[tauri::command]
-pub fn read_text_file(path: String, limit: Option<usize>) -> Result<String, String> {
+pub fn read_text_file(
+    path: String,
+    limit: Option<usize>,
+    tail: Option<bool>,
+) -> Result<String, String> {
     let file = PathBuf::from(&path);
+    if file.is_dir() {
+        return Err(format!("{path}: 这是文件夹，不是文件"));
+    }
     let max = limit.unwrap_or(512 * 1024);
+    let tail = tail.unwrap_or(false);
+    let bytes = if file
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
+    {
+        read_gzip(&file, max, tail)?
+    } else if tail {
+        read_tail(&file, max)?
+    } else {
+        read_head(&file, max)?
+    };
+    Ok(decode_text(&bytes))
+}
+
+/// 把日志/文本的字节解成字符串。
+///
+/// 不是所有日志都是 UTF-8：NeoForge 在中文 Windows 上按系统代码页（GBK）写，
+/// 日期里的「月」之类会变成两个非法字节，直接 `from_utf8_lossy` 就显示成 `�`。
+/// 所以先严格按 UTF-8 试，不行再按 GBK 解；顺带认 BOM（UTF-16 的日志）。
+fn decode_text(bytes: &[u8]) -> String {
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(bytes) {
+        let (text, _) = encoding.decode_without_bom_handling(&bytes[bom_len..]);
+        return text.into_owned();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    // 只读末尾时可能正好切在一个多字节字符中间：跳过开头的续字节再试一次，
+    // 免得把 UTF-8 的日志误判成 GBK。
+    let mut start = 0;
+    while start < bytes.len() && start < 3 && bytes[start] & 0xC0 == 0x80 {
+        start += 1;
+    }
+    if start > 0 {
+        if let Ok(text) = std::str::from_utf8(&bytes[start..]) {
+            return text.to_owned();
+        }
+    }
+    let (text, _, _) = encoding_rs::GBK.decode(bytes);
+    text.into_owned()
+}
+
+fn read_head(file: &Path, max: usize) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    std::fs::File::open(&file)
-        .map_err(|error| format!("{path}: {error}"))?
+    std::fs::File::open(file)
+        .map_err(|error| format!("{}: {error}", file.display()))?
         .take(max as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("{path}: {error}"))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+        .map_err(|error| format!("{}: {error}", file.display()))?;
+    Ok(bytes)
+}
+
+fn read_tail(file: &Path, max: usize) -> Result<Vec<u8>, String> {
+    let mut handle =
+        std::fs::File::open(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let len = handle
+        .metadata()
+        .map_err(|error| format!("{}: {error}", file.display()))?
+        .len();
+    let from = len.saturating_sub(max as u64);
+    if from > 0 {
+        handle
+            .seek(std::io::SeekFrom::Start(from))
+            .map_err(|error| format!("{}: {error}", file.display()))?;
+    }
+    let mut bytes = Vec::new();
+    handle
+        .take(max as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{}: {error}", file.display()))?;
+    Ok(bytes)
+}
+
+fn read_gzip(file: &Path, max: usize, tail: bool) -> Result<Vec<u8>, String> {
+    /// 解压上限：日志再大也不该超过这个数，超了说明不是正常日志。
+    const CEILING: u64 = 16 * 1024 * 1024;
+    let raw = std::fs::File::open(file).map_err(|error| format!("{}: {error}", file.display()))?;
+    let mut text = Vec::new();
+    flate2::read::GzDecoder::new(raw)
+        .take(CEILING)
+        .read_to_end(&mut text)
+        .map_err(|error| format!("{}: {error}", file.display()))?;
+    if text.len() > max {
+        if tail {
+            text = text.split_off(text.len() - max);
+        } else {
+            text.truncate(max);
+        }
+    }
+    Ok(text)
+}
+
+/// 递归搜索的一条结果。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub modified_ms: u64,
+}
+
+/// 递归搜索的一次进度：同一 token 的多批结果按到达顺序追加。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchProgress {
+    pub token: String,
+    pub hits: Vec<SearchHit>,
+    pub scanned: u32,
+    pub done: bool,
+}
+
+/// 进行中的搜索，按 token 存停止标志。
+static SEARCH_STOPS: OnceLock<Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> =
+    OnceLock::new();
+
+fn search_stops() -> &'static Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>> {
+    SEARCH_STOPS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 在 `root` 下按文件名找 `needle`（不区分大小写），边找边用 `file-search` 事件推结果。
+/// 只扫文件和目录，跳过 junction/符号链接防止成环，深度上限 8 层。
+#[tauri::command]
+pub fn search_files(
+    app: AppHandle,
+    token: String,
+    root: String,
+    needle: String,
+    limit: Option<usize>,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = Arc::new(AtomicBool::new(false));
+    search_stops()
+        .lock()
+        .unwrap()
+        .insert(token.clone(), stop.clone());
+    let limit = limit.unwrap_or(500).max(1);
+    let pattern = needle.trim().to_lowercase();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut scanned = 0u32;
+        let mut stack = vec![(PathBuf::from(&root), 0u32)];
+        let mut last_flush = std::time::Instant::now();
+        let mut finished = false;
+        while let Some((dir, depth)) = stack.pop() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut subdirs = Vec::new();
+            for entry in entries.flatten() {
+                if stop.load(Ordering::Relaxed) {
+                    finished = true;
+                    break;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                if meta.is_dir() {
+                    let linked = entry
+                        .file_type()
+                        .map(|kind| kind.is_symlink())
+                        .unwrap_or(false);
+                    if depth < 8 && !linked {
+                        subdirs.push((path, depth + 1));
+                    }
+                    continue;
+                }
+                scanned += 1;
+                if name.to_lowercase().contains(&pattern) {
+                    hits.push(SearchHit {
+                        path: path.to_string_lossy().into_owned(),
+                        name,
+                        size: meta.len(),
+                        modified_ms: modified_ms(&meta),
+                    });
+                    if hits.len() >= limit {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            // 目录名按字母序往下走，结果读起来更稳。
+            subdirs.sort_by(|a, b| a.0.cmp(&b.0));
+            for item in subdirs.into_iter().rev() {
+                stack.push(item);
+            }
+            if finished {
+                break;
+            }
+            if last_flush.elapsed() >= Duration::from_millis(150) {
+                let _ = app.emit(
+                    "file-search",
+                    SearchProgress {
+                        token: token.clone(),
+                        hits: std::mem::take(&mut hits),
+                        scanned,
+                        done: false,
+                    },
+                );
+                last_flush = std::time::Instant::now();
+            }
+        }
+        let _ = app.emit(
+            "file-search",
+            SearchProgress {
+                token: token.clone(),
+                hits,
+                scanned,
+                done: true,
+            },
+        );
+        search_stops().lock().unwrap().remove(&token);
+    });
+    Ok(())
+}
+
+/// 停掉一次进行中的搜索（关闭搜索或离开标签时调）。
+#[tauri::command]
+pub fn stop_search(token: String) {
+    if let Some(stop) = search_stops().lock().unwrap().get(&token) {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// 图片读成 `data:` URL（截图缩略图用）。
@@ -5286,5 +5522,30 @@ pub async fn dependency_projects(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod text_decoding {
+    use super::decode_text;
+
+    #[test]
+    fn utf8_stays_utf8() {
+        assert_eq!(decode_text("日志 abc".as_bytes()), "日志 abc");
+    }
+
+    #[test]
+    fn gbk_falls_back() {
+        // 「月」的 GBK 两个字节，按 UTF-8 解不开——之前会显示成 `��`。
+        let mut bytes = b"[0511".to_vec();
+        bytes.extend_from_slice(&[0xD4, 0xC2]);
+        bytes.extend_from_slice(b"2026 19:22:39.863]");
+        assert_eq!(decode_text(&bytes), "[0511月2026 19:22:39.863]");
+    }
+
+    #[test]
+    fn partial_head_is_not_mistaken_for_gbk() {
+        let full = "日志".as_bytes();
+        assert_eq!(decode_text(&full[1..]), "志");
+    }
 }
 

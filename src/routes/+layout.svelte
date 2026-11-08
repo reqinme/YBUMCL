@@ -4,6 +4,7 @@
   import { startPrefetch } from "$lib/detect";
   import { api } from "$lib/api";
   import { setTaskProgress } from "$lib/tasks.svelte";
+  import { watchPackProgress } from "$lib/pack-live";
   import { listen } from "@tauri-apps/api/event";
   import { page } from "$app/state";
   import TitleBar from "$lib/components/TitleBar.svelte";
@@ -15,6 +16,10 @@
 
   // 启动后在后台把版本清单和 Java 列表预热好，进「下载」页就不用等。
   onMount(startPrefetch);
+  // 整合包安装的阶段进度全程订阅（换页也不能断，否则卡片会停在旧数值）。
+  onMount(() => {
+    void watchPackProgress();
+  });
 
   // 下载器按 120 ms 推一次字节进度，这里转给任务队列画进度环。
   onMount(() => {

@@ -161,7 +161,20 @@ fn call(path: &str, body: Option<&Value>) -> Result<Value> {
     Err(last.unwrap_or_else(|| CoreError::InvalidInput("CurseForge 没有可用的接口".into())))
 }
 
-/// 按模组 id 批量取 `logo.thumbnailUrl`。
+/// 取项目的 logo：优先缩略图。CurseForge 的 WebP logo 常常没有生成缩略图
+/// （`thumbnailUrl` 是空串），这时退回原图 `url`，否则界面只能显示白底项目名。
+fn logo_icon(logo: &Value) -> Option<String> {
+    let pick = |key: &str| {
+        logo[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+    };
+    pick("thumbnailUrl").or_else(|| pick("url"))
+}
+
+/// 按模组 id 批量取项目图标（`thumbnailUrl`，缺失时用原图 URL）。
 pub fn project_icons(mod_ids: &[u64]) -> Result<std::collections::HashMap<u64, String>> {
     use std::collections::HashMap;
     let mut out: HashMap<u64, String> = HashMap::new();
@@ -177,13 +190,12 @@ pub fn project_icons(mod_ids: &[u64]) -> Result<std::collections::HashMap<u64, S
             continue;
         };
         for item in mods {
-            let (Some(id), Some(icon)) = (
-                item["id"].as_u64(),
-                item["logo"]["thumbnailUrl"].as_str(),
-            ) else {
+            let Some(id) = item["id"].as_u64() else {
                 continue;
             };
-            out.insert(id, icon.to_owned());
+            if let Some(icon) = logo_icon(&item["logo"]) {
+                out.insert(id, icon);
+            }
         }
     }
     Ok(out)
@@ -221,7 +233,7 @@ pub fn project_meta(mod_ids: &[u64]) -> Result<std::collections::HashMap<u64, Cf
                 CfProjectMeta {
                     name: item["name"].as_str().unwrap_or_default().to_owned(),
                     slug: item["slug"].as_str().unwrap_or_default().to_owned(),
-                    icon: item["logo"]["thumbnailUrl"].as_str().map(str::to_owned),
+                    icon: logo_icon(&item["logo"]),
                 },
             );
         }
@@ -313,7 +325,7 @@ fn project_from(value: &Value, kind: &str) -> MrProject {
         slug,
         title: text(value, "name"),
         description: text(value, "summary"),
-        icon_url: value["logo"]["thumbnailUrl"].as_str().map(str::to_owned),
+        icon_url: logo_icon(&value["logo"]),
         downloads: number(value, "downloadCount"),
         author,
         categories,
@@ -677,6 +689,41 @@ mod tests {
         assert_eq!(sort_field("newest"), 11);
         assert_eq!(sort_field("updated"), 3);
         assert_eq!(sort_field("relevance"), 2);
+    }
+
+    #[test]
+    fn logo_icon_falls_back_to_original_url() {
+        // Prominence II 这类 WebP logo：CF 没生成缩略图，thumbnailUrl 是空串。
+        let logo = serde_json::json!({
+            "title": "639217114177376898.webp",
+            "thumbnailUrl": "",
+            "url": "https://media.forgecdn.net/avatars/1969/863/639217114177376898.webp"
+        });
+        assert_eq!(
+            logo_icon(&logo).as_deref(),
+            Some("https://media.forgecdn.net/avatars/1969/863/639217114177376898.webp")
+        );
+    }
+
+    #[test]
+    fn logo_icon_prefers_thumbnail() {
+        let logo = serde_json::json!({
+            "thumbnailUrl": "https://media.forgecdn.net/avatars/thumbnails/238/713/256/256/636248086650307178.png",
+            "url": "https://media.forgecdn.net/avatars/238/713/636248086650307178.png"
+        });
+        assert_eq!(
+            logo_icon(&logo).as_deref(),
+            Some("https://media.forgecdn.net/avatars/thumbnails/238/713/256/256/636248086650307178.png")
+        );
+    }
+
+    #[test]
+    fn logo_icon_returns_none_without_urls() {
+        assert_eq!(logo_icon(&serde_json::json!({})), None);
+        assert_eq!(
+            logo_icon(&serde_json::json!({ "thumbnailUrl": " ", "url": "" })),
+            None
+        );
     }
 }
 

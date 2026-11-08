@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use serde::Deserialize;
@@ -74,6 +75,9 @@ pub struct ModpackRequest {
     /// 文件名，仅用于临时文件与取默认实例名。
     #[serde(default)]
     pub file_name: Option<String>,
+    /// 整合包文件多大（来源已知时带上，省掉下载前的 Content-Length 探测）。
+    #[serde(default)]
+    pub size: Option<u64>,
     /// 用户指定的实例名，留空则用「整合包名 版本」。
     #[serde(default)]
     pub name: Option<String>,
@@ -88,6 +92,43 @@ pub struct ModpackRequest {
     /// 资源站上这个整合包的图标地址；装完顺手存成实例图标。
     #[serde(default)]
     pub icon_url: Option<String>,
+    /// 从搜索页装过来时，项目所在站点（`curseforge` / `modrinth` / `ftb`）。
+    /// CurseForge 的 `manifest.json` 里没有项目 id，只能由调用方补上。
+    #[serde(default)]
+    pub source: Option<String>,
+    /// 资源站上的项目 id（CF 是数字，Modrinth 是 base62）。
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// 资源站上的项目名，用来覆盖包里写的名字。
+    #[serde(default)]
+    pub project_name: Option<String>,
+}
+
+/// 包里认不出项目（CurseForge 的 manifest 没有项目 id）时，用调用方给的来源补上。
+fn adopt_request_origin(pack: &mut PackOrigin, request: &ModpackRequest) {
+    // 已经知道来源（Modrinth 能反查到项目、FTB 自己写）就不要覆盖。
+    if pack.source != "zip" {
+        return;
+    }
+    let source = request.source.as_deref().map(str::trim).unwrap_or("");
+    let project = request
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("");
+    if !matches!(source, "curseforge" | "modrinth" | "ftb") || project.is_empty() {
+        return;
+    }
+    pack.source = source.to_owned();
+    pack.project_id = project.to_owned();
+    if let Some(name) = request
+        .project_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        pack.project_name = name.to_owned();
+    }
 }
 
 /// 安装结果。
@@ -163,6 +204,9 @@ impl PackOrigin {
 ///
 /// `stage` 是阶段名，`done/total` 是这一阶段完成的份数，`bytes` 是已下载字节，
 /// `file` 是当前正在下的文件名（界面拿它显示，卡住时能看出卡在哪个文件）。
+///
+/// `overall` 是整体百分比：把各阶段按 PCL 的方式折算成一条连续曲线，界面直接拿它
+/// 画进度条——否则并行跑的两段互相覆盖、解压阶段又没有分母，进度条会卡在段边界。
 pub struct Step<'a> {
     pub stage: &'a str,
     pub done: u64,
@@ -171,18 +215,51 @@ pub struct Step<'a> {
     /// 这一步总共要下多少字节；0 表示这步不是下载、或者还不知道总量。
     pub total_bytes: u64,
     pub file: Option<&'a str>,
+    /// 整体完成度，0–100。
+    pub overall: f64,
+    /// 当前下载速度（字节/秒）；非下载阶段是 0。
+    pub speed: u64,
 }
 
-/// 只报阶段、不带文件列表的进度（下载包本身、装加载器、解压覆盖这几步）。
-fn step(stage: &str, done: u64, total: u64) -> Step<'_> {
-    Step {
-        stage,
-        done,
-        total,
-        bytes: 0,
-        total_bytes: 0,
-        file: None,
+/// 各阶段在整体进度里占的区间（单位 %，左闭右开）。
+const SPAN_PACK: (f64, f64) = (0.0, 6.0);
+const SPAN_MAIN: (f64, f64) = (6.0, 86.0);
+const SPAN_MOVE: (f64, f64) = (86.0, 90.0);
+const SPAN_UNZIP: (f64, f64) = (90.0, 99.0);
+
+/// 把阶段内完成度（0–1）映射到整体百分比。
+fn overall_in(span: (f64, f64), fraction: f64) -> f64 {
+    span.0 + (span.1 - span.0) * fraction.clamp(0.0, 1.0)
+}
+
+/// 只前进不后退：并行跑的两段（装游戏、下内容）各自报进度，取最大值。
+fn overall_peak(peak: &AtomicU64, value: f64) -> f64 {
+    let millis = (value.clamp(0.0, 100.0) * 1000.0) as u64;
+    let best = peak.fetch_max(millis, Ordering::Relaxed).max(millis);
+    best as f64 / 1000.0
+}
+
+/// 把本地整合包拷到暂存目录，按块回报进度（几十上百 MB 的包不至于看起来没动静）。
+fn copy_with_progress(
+    from: &Path,
+    to: &Path,
+    total: u64,
+    mut report: impl FnMut(u64, u64),
+) -> Result<()> {
+    let mut source = fs::File::open(from).map_err(io_error)?;
+    let mut target = fs::File::create(to).map_err(io_error)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let read = source.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read]).map_err(io_error)?;
+        copied += read as u64;
+        report(copied, total);
     }
+    Ok(())
 }
 
 /// 下载（或读入本地文件）并安装一个整合包。
@@ -217,9 +294,34 @@ fn install_modpack_inner(
 
     match request.path.as_deref().filter(|path| !path.is_empty()) {
         Some(path) => {
-            progress(&step("读取整合包", 0, 1));
-            fs::copy(path, &archive).map_err(io_error)?;
-            progress(&step("读取整合包", 1, 1));
+            let total_bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            progress(&Step {
+                stage: "读取整合包",
+                done: 0,
+                total: total_bytes.max(1),
+                bytes: 0,
+                total_bytes,
+                file: None,
+                overall: overall_in(SPAN_PACK, 0.0),
+                speed: 0,
+            });
+            copy_with_progress(Path::new(path), &archive, total_bytes, |done, total| {
+                let fraction = if total > 0 {
+                    done as f64 / total as f64
+                } else {
+                    1.0
+                };
+                progress(&Step {
+                    stage: "读取整合包",
+                    done,
+                    total: total.max(1),
+                    bytes: done,
+                    total_bytes: total,
+                    file: None,
+                    overall: overall_in(SPAN_PACK, fraction),
+                    speed: 0,
+                });
+            })?;
         }
         None => {
             let url = request
@@ -227,34 +329,54 @@ fn install_modpack_inner(
                 .clone()
                 .filter(|url| !url.is_empty())
                 .ok_or_else(|| CoreError::InvalidInput("没有整合包地址".into()))?;
+            // 资源站给了文件大小就直接用，省掉一次 Range 探测，进度条一开始就有分母。
+            let size_hint = request.size;
             progress(&Step {
                 stage: "下载整合包",
                 done: 0,
                 total: 1,
                 bytes: 0,
-                total_bytes: 0,
+                total_bytes: size_hint.unwrap_or(0),
                 file: None,
+                overall: overall_in(SPAN_PACK, 0.0),
+                speed: 0,
             });
             download::fetch_pack_archive(
                 &url,
                 &archive,
-                None,
+                size_hint,
                 &cancel,
                 |batch| {
+                    let fraction = if batch.total_bytes > 0 {
+                        batch.bytes as f64 / batch.total_bytes as f64
+                    } else {
+                        batch.done as f64 / batch.total.max(1) as f64
+                    };
                     progress(&Step {
                         stage: "下载整合包",
                         done: batch.done as u64,
                         total: batch.total.max(1) as u64,
                         bytes: batch.bytes,
                         total_bytes: batch.total_bytes,
-                        file: None,
+                        file: Some(&batch.file),
+                        overall: overall_in(SPAN_PACK, fraction),
+                        speed: batch.speed,
                     });
                 },
             )
             .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
-            progress(&step("下载整合包", 1, 1));
         }
     }
+    progress(&Step {
+        stage: "下载整合包",
+        done: 1,
+        total: 1,
+        bytes: 0,
+        total_bytes: 0,
+        file: None,
+        overall: SPAN_PACK.1,
+        speed: 0,
+    });
 
     let mut zip = zip::ZipArchive::new(fs::File::open(&archive).map_err(io_error)?)
         .map_err(|e| CoreError::InvalidInput(format!("整合包不是有效的 zip：{e}")))?;
@@ -262,16 +384,16 @@ fn install_modpack_inner(
     // 有的整合包会把内容再套一层文件夹，PCL 叫它 ArchiveBaseFolder。
     let root = pack_root(&mut zip)
         .ok_or_else(|| CoreError::InvalidInput("不认识的整合包格式（没有 manifest.json 或 modrinth.index.json）".into()))?;
-    let plan = read_plan(&mut zip, &root)?;
+    let mut plan = read_plan(&mut zip, &root)?;
+    // 从搜索页装的 CurseForge 包：包里只有名字和版本号，项目 id 得由调用方补。
+    adopt_request_origin(&mut plan.pack, &request);
 
-    let instance_name = unique_name(
-        &game_dir,
-        &request
-            .name
-            .clone()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| default_name(&plan.name, &plan.version, &request.file_name)),
-    );
+    // 用户自己起的名字也过一遍清洗：宁可换个字，也不要装到一半报「名字不安全」。
+    let base = match request.name.clone().filter(|name| !name.trim().is_empty()) {
+        Some(name) => crate::sanitize_component(name.trim()),
+        None => default_name(&plan.name, &plan.version, &request.file_name),
+    };
+    let instance_name = unique_name(&game_dir, &base);
     let instance_dir = game_dir.join("versions").join(&instance_name);
     // 文件先下到暂存目录：`install_instance` 用「实例目录里有没有东西」判断重名，
     // 边装边往实例目录写会被它当成同名实例，直接报「已存在」。
@@ -304,13 +426,16 @@ fn install_modpack_inner(
     }
 
     let total = jobs.len() as u64;
+    let total_bytes = jobs.iter().filter_map(|job| job.size).sum::<u64>();
     progress(&Step {
         stage: "下载整合包内容",
         done: 0,
         total,
         bytes: 0,
-        total_bytes: 0,
+        total_bytes,
         file: None,
+        overall: SPAN_MAIN.0,
+        speed: 0,
     });
 
     let install_request = InstanceRequest {
@@ -335,10 +460,23 @@ fn install_modpack_inner(
     // 慢网络下能省掉一整段等待。
     let install_cancel = cancel.clone();
     let download_cancel = cancel.clone();
-    let progress_ref = &progress;
+    let progress_ref = progress;
+    // 两段并行各有自己的完成度，整体进度取较大者：否则事件交错时进度条会来回跳。
+    let peak = AtomicU64::new((SPAN_MAIN.0 * 1000.0) as u64);
+    let peak_ref = &peak;
     let (install_result, download_result) = thread::scope(|scope| {
         let install = scope.spawn(move || {
             install_instance(install_request, install_cancel, |item| {
+                // install_instance 已经按「分析 / 支持库 / 资源」算好了加权百分比，
+                // 以前在这里把它扔掉、只报文件数，大版本装到一半才发现还早。
+                let fraction = match item.percent {
+                    Some(percent) => percent / 100.0,
+                    None if item.total_bytes > 0 => {
+                        item.downloaded_bytes as f64 / item.total_bytes as f64
+                    }
+                    None => item.completed_files as f64 / item.total_files.max(1) as f64,
+                };
+                let overall = overall_peak(peak_ref, overall_in(SPAN_MAIN, fraction));
                 progress_ref(&Step {
                     stage: "安装游戏与加载器",
                     done: item.completed_files,
@@ -346,18 +484,30 @@ fn install_modpack_inner(
                     bytes: item.downloaded_bytes,
                     total_bytes: item.total_bytes,
                     file: Some(&item.path),
+                    overall,
+                    speed: 0,
                 });
             })
         });
-        let threads = request.threads.unwrap_or(64) as usize;
+        // modpack 里有几百个小文件：线程数给到 64 再叠上竞速，等于上百条连接打同一个
+        // CDN，容易被限速，反而不如 24 条稳。
+        let threads = request.threads.unwrap_or(24).clamp(1, 256) as usize;
         let download = download::fetch_files_to(&jobs, &download_cancel, threads, request.strategy, |batch| {
-            progress(&Step {
+            let fraction = if batch.total_bytes > 0 {
+                batch.bytes as f64 / batch.total_bytes as f64
+            } else {
+                batch.done as f64 / batch.total.max(1) as f64
+            };
+            let overall = overall_peak(peak_ref, overall_in(SPAN_MAIN, fraction));
+            progress_ref(&Step {
                 stage: "下载整合包内容",
                 done: batch.done as u64,
-                total: batch.total as u64,
+                total: batch.total.max(1) as u64,
                 bytes: batch.bytes,
                 total_bytes: batch.total_bytes,
                 file: Some(&batch.file),
+                overall,
+                speed: batch.speed,
             });
         });
         let install = install.join();
@@ -370,16 +520,33 @@ fn install_modpack_inner(
     if cancel.is_cancelled() {
         return Err(CoreError::InvalidInput("安装已取消".into()));
     }
-    let written = written as u64;
-    if written == 0 && !jobs.is_empty() {
+    // 少一个文件也算失败：以前只在「一个都没下成」时报错，剩下的静默跳过，
+    // 用户拿到的整合包缺模组，界面却显示安装成功。
+    if !failures.is_empty() {
         return Err(CoreError::InvalidInput(format!(
-            "整合包内容下载失败：{}",
-            failures.first().cloned().unwrap_or_default()
+            "有 {} 个文件没下成功：{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("；")
         )));
     }
-    progress(&step("安装游戏与加载器", 1, 1));
+    progress(&Step {
+        stage: "安装游戏与加载器",
+        done: 1,
+        total: 1,
+        bytes: 0,
+        total_bytes: 0,
+        file: None,
+        overall: SPAN_MAIN.1,
+        speed: 0,
+    });
     // 下载完再搬进实例目录，此时 install_instance 已经把实例建好了。
-    for file in &plan.files {
+    let moving = plan.files.len().max(1) as u64;
+    for (index, file) in plan.files.iter().enumerate() {
         let from = staging.join(&file.relative);
         if !from.is_file() {
             continue;
@@ -392,11 +559,51 @@ fn install_modpack_inner(
             fs::copy(&from, &to).map(|_| ()).and_then(|()| fs::remove_file(&from))
         })
         .map_err(io_error)?;
+        if index % 32 == 0 {
+            let name = file.relative.to_string_lossy().into_owned();
+            progress(&Step {
+                stage: "整理文件",
+                done: index as u64 + 1,
+                total: moving,
+                bytes: 0,
+                total_bytes: 0,
+                file: Some(&name),
+                overall: overall_in(SPAN_MOVE, (index + 1) as f64 / moving as f64),
+                speed: 0,
+            });
+        }
     }
     let _ = fs::remove_dir_all(&staging);
 
     // overrides 直接展开到实例目录，和前一步一样都是实例内的相对路径。
-    progress(&step("解压覆盖文件", 0, 1));
+    // 先把要解压多少算出来（zip 中央目录里有 uncompressed size）：几千个文件的
+    // overrides 要解好几分钟，没有分母的话进度条只能停在上一阶段的数值上。
+    let mut entries_total = 0u64;
+    let mut bytes_total = 0u64;
+    for index in 0..zip.len() {
+        let Ok(entry) = zip.by_index_raw(index) else {
+            continue;
+        };
+        if entry.is_dir() || override_path(entry.name(), &root).is_none() {
+            continue;
+        }
+        entries_total += 1;
+        bytes_total += entry.size();
+    }
+    progress(&Step {
+        stage: "解压覆盖文件",
+        done: 0,
+        total: entries_total,
+        bytes: 0,
+        total_bytes: bytes_total,
+        file: None,
+        overall: SPAN_UNZIP.0,
+        speed: 0,
+    });
+    let mut unpacked_bytes = 0u64;
+    let mut unpacked_entries = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut next_report = 1024 * 1024u64;
     for index in 0..zip.len() {
         let mut entry = zip
             .by_index(index)
@@ -413,14 +620,71 @@ fn install_modpack_inner(
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(io_error)?;
         }
-        let mut buffer = Vec::new();
-        entry.read_to_end(&mut buffer).map_err(io_error)?;
-        fs::write(&dest, &buffer).map_err(io_error)?;
+        // 边读边写：`read_to_end` 会把整个 overrides 逐个读进内存，几 GB 的包直接顶满。
+        let mut out = std::io::BufWriter::new(fs::File::create(&dest).map_err(io_error)?);
+        loop {
+            let read = entry.read(&mut buffer).map_err(io_error)?;
+            if read == 0 {
+                break;
+            }
+            out.write_all(&buffer[..read]).map_err(io_error)?;
+            unpacked_bytes += read as u64;
+            if unpacked_bytes >= next_report {
+                next_report = unpacked_bytes + 1024 * 1024;
+                let fraction = if bytes_total > 0 {
+                    unpacked_bytes as f64 / bytes_total as f64
+                } else {
+                    unpacked_entries as f64 / entries_total.max(1) as f64
+                };
+                progress(&Step {
+                    stage: "解压覆盖文件",
+                    done: unpacked_entries,
+                    total: entries_total,
+                    bytes: unpacked_bytes,
+                    total_bytes: bytes_total,
+                    file: Some(relative.to_string_lossy().as_ref()),
+                    overall: overall_in(SPAN_UNZIP, fraction),
+                    speed: 0,
+                });
+            }
+        }
+        out.flush().map_err(io_error)?;
+        drop(out);
+        unpacked_entries += 1;
     }
-    progress(&step("解压覆盖文件", 1, 1));
+    progress(&Step {
+        stage: "解压覆盖文件",
+        done: entries_total,
+        total: entries_total,
+        bytes: unpacked_bytes,
+        total_bytes: bytes_total.max(unpacked_bytes),
+        file: None,
+        overall: SPAN_UNZIP.1,
+        speed: 0,
+    });
 
     // 整合包习惯把地图以 zip 形式放在 saves/ 里，PCL 装完会顺手解开。
+    progress(&Step {
+        stage: "解压存档",
+        done: 0,
+        total: 1,
+        bytes: 0,
+        total_bytes: 0,
+        file: None,
+        overall: 99.0,
+        speed: 0,
+    });
     unpack_saves(&instance_dir);
+    progress(&Step {
+        stage: "解压存档",
+        done: 1,
+        total: 1,
+        bytes: 0,
+        total_bytes: 0,
+        file: None,
+        overall: 100.0,
+        speed: 0,
+    });
 
     let _ = fs::remove_file(&archive);
     // 装完把 `.ybmcl/modpack` 整块删掉：`staging/` 与已装好的包 zip 都不该留在游戏目录里
@@ -476,7 +740,7 @@ fn install_modpack_inner(
             .iter()
             .map(|(loader, _)| loader.clone())
             .collect(),
-        files: written,
+        files: written as u64,
         failed: failures.len(),
         missing: plan.missing,
         pack: Some(plan.pack),
@@ -754,10 +1018,12 @@ fn default_name(name: &str, version: &str, file_name: &Option<String>) -> String
     } else {
         name.trim().to_string()
     };
+    // 包名里常带 `:`、`|`、`™` 之类，直接拿来当目录名会失败（Windows 不允许）。
+    let base = crate::sanitize_component(&base);
     if version.trim().is_empty() {
         base
     } else {
-        format!("{base} {version}")
+        format!("{base} {}", crate::sanitize_component(version.trim()))
     }
 }
 
@@ -919,6 +1185,16 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn pack_name_with_illegal_chars_is_sanitized() {
+        let name = default_name("Prominence™ II: Hasturian Era", "v4.1.6", &None);
+        assert!(!name.contains(':'), "{name}");
+        assert!(name.contains("Hasturian Era"), "{name}");
+        assert_eq!(crate::sanitize_component(r"  a\b|c  "), "a_b_c");
+        assert_eq!(crate::sanitize_component("..."), "整合包");
+        assert_eq!(crate::sanitize_component("con"), "con_");
+    }
+
     fn unique_name_appends_a_number_instead_of_failing() {
         let dir = temp_dir("unique");
         let versions = dir.join("versions");

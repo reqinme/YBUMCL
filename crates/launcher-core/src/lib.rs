@@ -245,6 +245,48 @@ fn required_file(path: &Path) -> Result<()> {
 ///
 /// 允许中文和空格（PCL 的整合包实例就是这么命名的），只挡掉 Windows 不允许的
 /// `< > : " / \ | ? *`、控制字符，以及结尾的点/空格和设备名。
+/// 把任意名字改成能当文件夹名的一段：非法字符换成下划线、压缩空白、
+/// 去掉结尾的点与空格、截到 120 字符、避开 CON/PRN 这类设备名。
+///
+/// 整合包名里常见 `™`、`:`、`|`（例如 `Prominence™ II: Hasturian Era`），
+/// 直接拿来做目录名会失败，因此「从包名推实例名」的地方都先过这里。
+pub(crate) fn sanitize_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_space = false;
+    for c in value.chars() {
+        let k = if (c as u32) < 0x20 || (r#"<>:"/\|?*"#).contains(c) {
+            '_'
+        } else {
+            c
+        };
+        if k == '_' && out.ends_with('_') {
+            continue;
+        }
+        if k.is_whitespace() {
+            if last_space || out.is_empty() {
+                continue;
+            }
+            out.push(' ');
+            last_space = true;
+            continue;
+        }
+        last_space = false;
+        out.push(k);
+    }
+    let mut trimmed = out.trim().trim_end_matches(['.', ' ']).to_owned();
+    if trimmed.chars().count() > 120 {
+        trimmed = trimmed.chars().take(120).collect();
+        trimmed = trimmed.trim_end_matches(['.', ' ']).to_owned();
+    }
+    if trimmed.is_empty() {
+        return "整合包".into();
+    }
+    if is_device(&trimmed) {
+        trimmed.push('_');
+    }
+    trimmed
+}
+
 pub(crate) fn safe_component(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 200

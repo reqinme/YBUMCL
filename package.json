@@ -1,7 +1,7 @@
 {
   "name": "ybumcl",
   "private": true,
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "延边大学我的世界启动器 / Yanbian University Minecraft Launcher",
   "type": "module",
   "scripts": {

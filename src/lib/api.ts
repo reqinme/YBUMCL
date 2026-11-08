@@ -779,8 +779,13 @@ export const api = {
   /** 实例实际用的根目录（隔离实例是 `versions/<id>`）。 */
   instanceRoot: (id: string) => invoke<string>("instance_root", { id }),
   listEntries: (path: string) => invoke<EntryInfo[]>("list_entries", { path }),
-  readTextFile: (path: string, limit?: number) =>
-    invoke<string>("read_text_file", { path, limit }),
+  /** 读文本；`tail` 为真时取末尾 `limit` 字节（日志用）。 */
+  readTextFile: (path: string, limit?: number, tail?: boolean) =>
+    invoke<string>("read_text_file", { path, limit, tail }),
+  /** 递归搜文件名，结果从 `file-search` 事件里追加。 */
+  searchFiles: (token: string, root: string, needle: string, limit?: number) =>
+    invoke<void>("search_files", { token, root, needle, limit }),
+  stopSearch: (token: string) => invoke<void>("stop_search", { token }),
   imageDataUrl: (path: string) => invoke<string>("image_data_url", { path }),
   readServers: (path: string) =>
     invoke<ServerEntry[]>("read_servers", { path }),
@@ -1152,6 +1157,12 @@ export const api = {
     threads?: number;
     /** 资源站上这个整合包的图标地址；装完由后端存成实例图标。 */
     iconUrl?: string | null;
+    /** 整合包文件大小；带上就不用在下载前发一次 Range 探测。 */
+    size?: number;
+    /** 从搜索页装过来时项目所在的站点，用来给实例补上来源（包内 manifest 没有项目 id）。 */
+    source?: "curseforge" | "modrinth" | "ftb" | null;
+    projectId?: string | null;
+    projectName?: string | null;
   }, installId?: number) =>
     invoke<{
       versionId: string;
@@ -1201,6 +1212,30 @@ export function onGameLog(
   return listen<LogLine>("game-log", (event) => handler(event.payload));
 }
 
+/// 递归搜索的一条结果。
+export type FileHit = {
+  path: string;
+  name: string;
+  size: number;
+  modifiedMs: number;
+};
+
+/// 递归搜索的进度：同一 token 的多批结果按到达顺序追加，`done` 为真时结束。
+export type FileSearchProgress = {
+  token: string;
+  hits: FileHit[];
+  scanned: number;
+  done: boolean;
+};
+
+export function onFileSearch(
+  handler: (progress: FileSearchProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<FileSearchProgress>("file-search", (event) =>
+    handler(event.payload),
+  );
+}
+
 export function onGameExit(
   handler: (code: number | null) => void,
 ): Promise<UnlistenFn> {
@@ -1217,6 +1252,8 @@ export function onInstallProgress(
 
 /// 整合包安装的阶段性进度：阶段名、完成份数、已下字节、当前文件名。
 export type ModpackProgress = {
+  /// 哪一次安装发的事件（前端任务卡的 id）；多张卡同时在跑时靠它写回各自的卡。
+  installId?: number;
   stage: string;
   done: number;
   total: number;
@@ -1224,6 +1261,10 @@ export type ModpackProgress = {
   /// 这一步总共要下多少字节；0 表示未知（比如解压、装加载器）。
   totalBytes?: number;
   file: string | null;
+  /// 整体百分比（0–100）：后端把各阶段加权折成一条连续曲线，界面直接用。
+  overall?: number;
+  /// 当前速度（字节/秒）；没有下载动作的阶段是 0。
+  speed?: number;
 };
 export function onModpackProgress(
   handler: (progress: ModpackProgress) => void,

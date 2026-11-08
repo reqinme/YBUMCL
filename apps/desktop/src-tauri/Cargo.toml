@@ -1,6 +1,6 @@
 [package]
 name = "ybumcl-desktop"
-version = "0.2.4"
+version = "0.2.5"
 description = "延边大学我的世界启动器 / Yanbian University Minecraft Launcher"
 authors = ["YBUMCL"]
 edition = "2024"
@@ -47,3 +47,7 @@ tauri-plugin-clipboard-manager = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"
+# 日志页读 `*.log.gz`：只解 gzip，不引整套压缩栈（和 launcher-core 用同一个版本）。
+flate2 = "1"
+# 中文 Windows 上的整合包会把日志按 GBK 写（月份名等），读的时候得能认出来。
+encoding_rs = "0.8"

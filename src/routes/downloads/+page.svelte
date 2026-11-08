@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { trackPack, untrackPack } from "$lib/pack-live";
   import { onMount, onDestroy, tick } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { cachedJava, cachedManifest, forgetScan } from "$lib/detect";
@@ -15,7 +16,9 @@
     setTaskResume,
     submitTask,
     setTaskNote,
+    setTaskPercent,
     setTaskProgress,
+    setTaskSpeed,
     takeStop,
     type Task,
     type TaskResult
@@ -48,7 +51,6 @@
   import {
     api,
     type DownloadStrategy,
-    onModpackProgress,
     type FabricLoaderVersion,
     type InstallSummary,
     type InstanceLoader,
@@ -2212,12 +2214,13 @@
             javaPath: null,
             strategy,
             threads
-          });
+          }, task.id);
           // 来源由后端照包里的 manifest 写进实例，这里不再拿手头正开着的项目去冒充。
           await loadManifest(true);
           return reportPack(summary);
         } finally {
           packTaskId = null;
+          untrackPack();
         }
       }
     );
@@ -2238,6 +2241,14 @@
       async () => {
         try {
           const ftb = mrProject ? isFtb(mrProject) : false;
+          // 数字 id 是 CurseForge，其余是 Modrinth；FTB 走另一条命令。装进实例后靠这份
+          // 来源信息「检查更新」，包里自己的 manifest 认不出来。
+          const projectId = mrProject?.id ?? null;
+          const projectSource = ftb
+            ? "ftb"
+            : projectId && /^\d+$/.test(projectId)
+              ? "curseforge"
+              : "modrinth";
           const summary = ftb
             ? await api.installFtb({
                 gameDir: dir,
@@ -2247,7 +2258,7 @@
                 javaPath: null,
                 strategy,
                 iconUrl: mrProject?.iconUrl ?? null
-              }, packTaskId ?? undefined)
+              }, task.id)
             : await api.installModpack({
                 gameDir: dir,
                 url: version.fileUrl,
@@ -2257,13 +2268,18 @@
                 javaPath: null,
                 strategy,
                 threads,
-                iconUrl: mrProject?.iconUrl ?? null
-              }, packTaskId ?? undefined);
+                iconUrl: mrProject?.iconUrl ?? null,
+                size: version.fileSize,
+                source: mrProject ? projectSource : null,
+                projectId,
+                projectName: mrProject?.title ?? null
+              }, task.id);
           await rememberPack(summary.versionId, version.versionNumber);
           await loadManifest(true);
           return reportPack(summary);
         } finally {
           packTaskId = null;
+          untrackPack();
         }
       }
     );
@@ -3003,25 +3019,6 @@
   onMount(async () => {
     window.addEventListener("keydown", onEscape, true);
     document.addEventListener("pointerdown", onDocPointer);
-    // 整合包安装分好几步（下包、装加载器、下内容、解压覆盖），这里把后台推来的
-    // 阶段写进任务卡片——否则 40 多个文件下十分钟，界面只有一个「进行中」。
-    unlisten.push(
-      await onModpackProgress((event) => {
-        if (packTaskId === null) return;
-        const parts = [event.stage];
-        if (event.total > 1 || event.done > 0) parts.push(`${event.done}/${event.total}`);
-        if (event.bytes > 0) parts.push(formatBytes(event.bytes));
-        if (event.file) parts.push(event.file);
-        setTaskNote(packTaskId, parts.join(" · "));
-        // 只有知道总量时卡片才能画真进度条（否则是 indeterminate 的滑动条）：
-        // 下包、下内容这两步都会带 totalBytes，装上就能看到「已下 / 总量」。
-        const totalBytes = event.totalBytes ?? 0;
-        if (totalBytes > 0 && event.bytes >= 0) {
-          setTaskProgress(packTaskId, event.bytes, totalBytes);
-        }
-      })
-    );
-
     const saved = downloadsState.value;
     if (saved) {
       try {

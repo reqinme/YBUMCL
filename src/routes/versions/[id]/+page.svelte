@@ -1,6 +1,7 @@
 <script lang="ts">
   import Dropdown from "$lib/components/Dropdown.svelte";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
+  import FileBrowser from "$lib/components/FileBrowser.svelte";
   import Modal from "$lib/components/Modal.svelte";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
@@ -31,6 +32,7 @@
     type JavaInstallation,
     type ModEntry,
     type ModProjectInfo,
+    type MrProject,
     type ModUpdate,
     type SaveEntry,
     type PackUpdateInfo,
@@ -78,8 +80,6 @@
   let entries = $state<Record<string, EntryInfo[]>>({});
   let entryBusy = $state("");
   let servers = $state<ServerEntry[]>([]);
-  /// 点开的文本文件内容（日志、崩溃报告）。
-  let textView = $state<{ title: string; body: string } | null>(null);
   /// 崩溃报告 tab 顶部那份诊断：看的是哪份文件、认出了什么。
   let crashDiag = $state<{ file: string; items: CrashDiagnosis[] } | null>(null);
   let diagBusy = $state(false);
@@ -248,6 +248,14 @@
   let packCanRestore = $state(false);
   let packError = $state("");
   let packCheckedOnce = false;
+  // 「绑定来源」：从 zip 装的实例包里没有项目 id，查不了更新；这里搜一次让用户点选。
+  let bindOpen = $state(false);
+  let bindQuery = $state("");
+  let bindBusy = $state(false);
+  let bindHits = $state<{ source: string; id: string; name: string; downloads: number; author: string }[]>(
+    []
+  );
+  let bindError = $state("");
   /** 下载整合包本体的字节进度；0 表示还没收到第一条事件。 */
   let packBytes = $state(0);
   let packTotalBytes = $state(0);
@@ -269,6 +277,82 @@
       if (force) showError("检查整合包更新失败", "没能取到最新版本信息。", String(e));
     } finally {
       packChecking = false;
+    }
+  }
+
+  function openBind() {
+    bindOpen = true;
+    bindHits = [];
+    bindError = "";
+    if (!bindQuery.trim()) bindQuery = version?.pack?.projectName ?? "";
+  }
+
+  /// 只做搜索、不自动选：同系列名字太像（ATM10 / ATM10SKY / Aeronautics），绑错就白更新。
+  async function searchBindCandidates() {
+    const term = bindQuery.trim();
+    if (!term || bindBusy) return;
+    bindBusy = true;
+    bindError = "";
+    bindHits = [];
+    try {
+      const [cf, mr] = (await Promise.all([
+        api.curseforgeSearch("modpack", term, null, null, "relevance", 8),
+        api.modrinthSearch("modpack", term, null, null, 8)
+      ]).catch(() => [[], []])) as [MrProject[], MrProject[]];
+      const seen = new Set<string>();
+      const hits: typeof bindHits = [];
+      for (const project of [...cf, ...mr]) {
+        const source = cf.includes(project) ? "curseforge" : "modrinth";
+        const key = `${source}:${project.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        hits.push({
+          source,
+          id: project.id,
+          name: project.chineseTitle ?? project.title,
+          downloads: project.downloads,
+          author: project.author
+        });
+      }
+      bindHits = hits;
+      if (hits.length === 0) bindError = "没搜到，换个关键词试试。";
+    } catch (e) {
+      bindError = `搜索失败：${String(e)}`;
+    } finally {
+      bindBusy = false;
+    }
+  }
+
+  async function bindPackTo(hit: { source: string; id: string }) {
+    if (!gameDirectory || bindBusy) return;
+    bindBusy = true;
+    bindError = "";
+    try {
+      const loaders =
+        (version?.loadersDetail ?? []).length > 0
+          ? (version?.loadersDetail ?? []).map((item) => item.loader)
+          : version?.loaders ?? [];
+      const wrote = await api.packUpdateBackfill(
+        gameDir,
+        gameDirectory,
+        hit.source,
+        hit.id,
+        version?.pack?.versionLabel ?? "",
+        version?.gameVersion ?? "",
+        loaders
+      );
+      if (!wrote) {
+        bindError = "这个实例已经有来源记录了，没有覆盖。";
+        return;
+      }
+      bindOpen = false;
+      await load();
+      await checkPackUpdate(true);
+      announce("已绑定来源，之后可以检查更新了");
+    } catch (e) {
+      bindError = `绑定失败：${String(e)}`;
+    } finally {
+      bindBusy = false;
     }
   }
 
@@ -661,62 +745,71 @@
       : new Set(shownMods.map((mod) => mod.fileName));
   }
 
+  /// 有并发上限的批量执行：串行会把「一张慢图」变成「后面全等」，
+  /// 全放出去又会挤爆连接；PCL 的图片加载也是固定线程数。
+  async function forEachWithLimit<T>(items: T[], limit: number, task: (item: T) => Promise<void>) {
+    let next = 0;
+    const worker = async () => {
+      while (next < items.length) {
+        await task(items[next++]);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  }
+
   /// 逐个补图标：只问一次，拿不到的记成 null，滚动时不重复请求。
-  /// 图标分两步：先读 jar 自带的（快，离线也有），再让后端按哈希去
-  /// Modrinth / CurseForge 反查项目图标，补上 jar 里没带图的那批。
+  /// 图标分两路，互不依赖、同时跑：
+  /// - jar 自带的（快，离线也有），固定并发；
+  /// - 后端按哈希去 Modrinth / CurseForge 反查项目图标（一次批量调用），
+  ///   结果只用来补 jar 里没带图的那批——以前要等 jar 全部读完才开始查，
+  ///   两段耗时白白相加。
   async function ensureModIcons() {
     const pending = mods.filter((mod) => !(mod.fileName in modIcons));
-    if (pending.length === 0) return;
-    for (let index = 0; index < pending.length; index += 8) {
-      const batch = pending.slice(index, index + 8);
-      await Promise.all(
-        batch.map(async (mod) => {
-          let icon: string | null = null;
-          try {
-            // 描述符里没写 icon 的模组也可能有 icon.png / logo.png，
-            // 交给后端按常见文件名再找一层，别在元数据这一层就放弃。
-            icon = await api.modIcon(gameDir, gameDirectory, mod.fileName);
-          } catch {
-            icon = null;
-          }
-          if (!(mod.fileName in modIcons)) {
-            modIcons = { ...modIcons, [mod.fileName]: icon };
-          }
-        }),
-      );
-    }
+    const jarIcons = forEachWithLimit(pending, 16, async (mod) => {
+      let icon: string | null = null;
+      try {
+        // 描述符里没写 icon 的模组也可能有 icon.png / logo.png，
+        // 交给后端按常见文件名再找一层，别在元数据这一层就放弃。
+        icon = await api.modIcon(gameDir, gameDirectory, mod.fileName);
+      } catch {
+        icon = null;
+      }
+      // 项目图标先到的话别用空值盖回去。
+      if (!(mod.fileName in modIcons)) {
+        modIcons = { ...modIcons, [mod.fileName]: icon };
+      }
+    });
 
     // 平台项目信息要覆盖全部模组：中文名和平台名都在这里，不只是缺图的那批。
     const unmet = mods
       .filter((mod) => !(mod.fileName in modProjects))
       .map((mod) => mod.fileName);
-    if (unmet.length === 0) return;
-    let infos: Record<string, ModProjectInfo> = {};
-    try {
-      infos = await api.modProjectIcons(gameDir, gameDirectory, unmet);
-    } catch {
-      return;
-    }
-    modProjects = { ...modProjects, ...infos };
-    modProjectsTick += 1;
-    // 项目图标只用来补 jar 里没有图的那批，jar 自带的优先。
-    const entries = Object.entries(infos).filter(
-      ([fileName, info]) => info.url && !modIcons[fileName],
-    );
-    for (let index = 0; index < entries.length; index += 4) {
-      const batch = entries.slice(index, index + 4);
-      await Promise.all(
-        batch.map(async ([fileName, info]) => {
-          if (!info.url) return;
-          try {
-            const icon = await api.fetchIcon(info.url);
-            if (icon) modIcons = { ...modIcons, [fileName]: icon };
-          } catch {
-            // 拉不到就保持 jar 里的结果（多半是空），下次进页面再试。
-          }
-        }),
+    const projectIcons = (async () => {
+      if (unmet.length === 0) return;
+      let infos: Record<string, ModProjectInfo> = {};
+      try {
+        infos = await api.modProjectIcons(gameDir, gameDirectory, unmet);
+      } catch {
+        return;
+      }
+      modProjects = { ...modProjects, ...infos };
+      modProjectsTick += 1;
+      // 项目图标只用来补 jar 里没有图的那批，jar 自带的优先。
+      const entries = Object.entries(infos).filter(
+        ([fileName, info]) => info.url && !modIcons[fileName],
       );
-    }
+      await forEachWithLimit(entries, 12, async ([fileName, info]) => {
+        if (!info.url) return;
+        try {
+          const icon = await api.fetchIcon(info.url);
+          if (icon) modIcons = { ...modIcons, [fileName]: icon };
+        } catch {
+          // 拉不到就保持 jar 里的结果（多半是空），下次进页面再试。
+        }
+      });
+    })();
+
+    await Promise.all([jarIcons, projectIcons]);
   }
 
   /// 查更新。打开模组页时自动跑一次（结果缓存 6 小时，命中缓存就不联网）；
@@ -1857,17 +1950,6 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     servers = await api.readServers(root + SEP + "servers.dat").catch(() => []);
   }
 
-  async function openText(name: string) {
-    const path = subPath(tab) + SEP + name;
-    try {
-      const body = await api.readTextFile(path);
-      textView = { title: name, body };
-      if (tab === "crashes") void diagnoseCrash(name);
-    } catch (error) {
-      showError("打开文件失败", path, String(error));
-    }
-  }
-
   /// 打开某个子目录（不存在的时候就先建出来）。
   async function openSub(kind: string) {
     const path = subPath(kind);
@@ -1882,9 +1964,10 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 
   async function switchTab(next: Tab) {
     tab = next;
-    textView = null;
     if (next === "servers") await loadServers();
-    if (next in SUB_DIRS && next !== "saves") await loadEntries(next);
+    if (next in SUB_DIRS && next !== "saves" && next !== "logs" && next !== "crashes") {
+      await loadEntries(next);
+    }
     if (next === "resourcepacks" || next === "shaders") {
       await loadLocalPackIcons(next as "resourcepacks" | "shaders");
       await loadPackInfo(next);
@@ -1899,7 +1982,9 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 
   /// 崩溃报告目录里最新的一份，装完崩溃后点进来就能看到结论。
   async function diagnoseNewest() {
-    const list = (entries.crashes ?? []).filter((item) => !item.dir);
+    const dir = subPath("crashes");
+    if (!dir) return;
+    const list = (await api.listEntries(dir).catch(() => [])).filter((item) => !item.dir);
     if (list.length === 0) {
       crashDiag = null;
       return;
@@ -2111,6 +2196,9 @@ function loaderKey(name: string): InstanceLoader["loader"] {
             <button class="btn tiny" disabled={packChecking} onclick={() => void checkPackUpdate(true)}>
               {packChecking ? "检查中…" : "检查更新"}
             </button>
+            {#if !version.pack.projectId}
+              <button class="btn tiny" onclick={openBind}>绑定来源</button>
+            {/if}
             {#if packCanRestore}
               <button class="btn tiny" disabled={packBusy} onclick={() => void restorePackUpdate()}>恢复上次更新</button>
             {/if}
@@ -2160,6 +2248,44 @@ function loaderKey(name: string): InstanceLoader["loader"] {
         {#if !packUpdate.allowIncremental && packUpdate.reason}
           <p class="dim">{packUpdate.reason}，只能重装更新。</p>
         {/if}
+      </Modal>
+    {/if}
+
+    {#if bindOpen}
+      <Modal open title="绑定整合包来源" onclose={() => (bindOpen = false)}>
+        {#snippet footer()}
+          <button class="btn ghost" disabled={bindBusy} onclick={() => (bindOpen = false)}>取消</button>
+        {/snippet}
+        <p class="dim">
+          这个实例是从 zip 装的，包里没有项目 id，所以查不了更新。搜一下它在 CurseForge / Modrinth
+          上的项目，点一个绑上。
+        </p>
+        <div class="bind-search">
+          <input
+            placeholder="整合包名字，比如 All the Mods 10"
+            bind:value={bindQuery}
+            onkeydown={(event) => {
+              if (event.key === "Enter") void searchBindCandidates();
+            }}
+          />
+          <button class="btn" disabled={bindBusy} onclick={() => void searchBindCandidates()}>
+            {bindBusy ? "搜索中…" : "搜索"}
+          </button>
+        </div>
+        {#if bindError}
+          <p class="dim">{bindError}</p>
+        {/if}
+        <div class="bind-hits">
+          {#each bindHits as hit (hit.source + hit.id)}
+            <button class="bind-hit" disabled={bindBusy} onclick={() => void bindPackTo(hit)}>
+              <strong>{hit.name}</strong>
+              <span class="dim">
+                {hit.source === "curseforge" ? "CurseForge" : "Modrinth"} · {hit.id} · {hit.downloads.toLocaleString()} 次下载{#if hit.author}
+                  · {hit.author}{/if}
+              </span>
+            </button>
+          {/each}
+        </div>
       </Modal>
     {/if}
 
@@ -3044,41 +3170,36 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     </section>
   {:else if tab === "logs" || tab === "crashes"}
     <section class="panel">
-      {#if (entries[tab] ?? []).length === 0}
-        <p class="dim">{tab === "logs" ? "还没有日志。" : "还没有崩溃报告。"}</p>
-      {:else}
-        {#if tab === "crashes" && crashDiag}
-          <div class="diag">
-            <p class="diag-file mono">{crashDiag.file}</p>
-            {#if diagBusy}
-              <p class="dim">正在看这份报告…</p>
-            {:else if crashDiag.items.length === 0}
-              <p class="dim">这份报告里没有认出常见原因，原文在下面。</p>
-            {:else}
-              {#each crashDiag.items as item (item.key)}
-                <div class="diag-item">
-                  <strong>{item.title}</strong>
-                  <p>{item.detail}</p>
-                  <ul>
-                    {#each item.advice as line}
-                      <li>{line}</li>
-                    {/each}
-                  </ul>
-                </div>
-              {/each}
-            {/if}
-          </div>
-        {/if}
-        <div class="files">
-          {#each entries[tab] ?? [] as file (file.name)}
-            <button class="file" onclick={() => void openText(file.name)}>
-              <span class="mono">{file.name}</span>
-              <span class="dim">{file.dir ? "文件夹" : sizeText(file.size)}</span>
-            </button>
-          {/each}
+      {#if tab === "crashes" && crashDiag}
+        <div class="diag">
+          <p class="diag-file mono">{crashDiag.file}</p>
+          {#if diagBusy}
+            <p class="dim">正在看这份报告…</p>
+          {:else if crashDiag.items.length === 0}
+            <p class="dim">这份报告里没有认出常见原因，原文在下面。</p>
+          {:else}
+            {#each crashDiag.items as item (item.key)}
+              <div class="diag-item">
+                <strong>{item.title}</strong>
+                <p>{item.detail}</p>
+                <ul>
+                  {#each item.advice as line}
+                    <li>{line}</li>
+                  {/each}
+                </ul>
+              </div>
+            {/each}
+          {/if}
         </div>
       {/if}
-      <div class="row"><button class="btn" onclick={() => void openSub(tab)}>打开目录</button></div>
+      {#key tab}
+        <FileBrowser
+          root={subPath(tab)}
+          rootName={SUB_DIRS[tab]}
+          emptyText={tab === "logs" ? "还没有日志。" : "还没有崩溃报告。"}
+          onDiagnose={tab === "crashes" ? diagnoseCrash : undefined}
+        />
+      {/key}
     </section>
   {:else}
     <section class="panel">
@@ -3118,16 +3239,6 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       {/if}
     </section>
   {/if}
-{/if}
-
-{#if textView}
-  <div class="textview">
-    <header>
-      <strong class="mono">{textView.title}</strong>
-      <button class="btn ghost" onclick={() => (textView = null)}>关闭</button>
-    </header>
-    <pre class="mono">{textView.body}</pre>
-  </div>
 {/if}
 
 {#if dragging}
@@ -3530,39 +3641,6 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     text-align: left;
     cursor: pointer;
   }
-  button.file:hover {
-    background: rgba(255, 255, 255, 0.06);
-  }
-  .textview {
-    position: fixed;
-    inset: 8% 12%;
-    z-index: 40;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 14px 16px;
-    border-radius: 14px;
-    border: 1px solid var(--border);
-    background: rgba(12, 15, 21, 0.96);
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
-  }
-  .textview header {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-  .textview pre {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
-    margin: 0;
-    font-size: 12px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: var(--text-dim);
-  }
-
   /* 整页是一条纵向流：头部与标签栏按内容占高，剩下的全给下面的内容区。 */
   .route {
     display: flex;
@@ -3732,6 +3810,49 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     gap: 14px;
     align-items: flex-start;
   }
+  /* 「绑定来源」弹窗里的一行结果：名字在上、来源与下载量在下。 */
+  .bind-search {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    margin: 12px 0;
+  }
+
+  .bind-search input {
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text);
+    font: inherit;
+  }
+
+  .bind-hits {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 320px;
+    overflow: auto;
+  }
+
+  .bind-hit {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .bind-hit:hover {
+    border-color: var(--accent);
+  }
+
   /* 整合包的身份区可以点进去看它在下载页的样子。 */
   .head.linked {
     width: 100%;

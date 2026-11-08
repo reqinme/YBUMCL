@@ -42,6 +42,8 @@ export type Task = {
   received: number;
   /** 已知总字节数；null 表示服务端没给 Content-Length。 */
   total: number | null;
+  /** 当前速度（字节/秒）；null 表示这一步没有速度可算（解压、搬文件）。 */
+  speed: number | null;
   /** 安装这种自己管进度的任务，把实时状态挂在这里给列表渲染。 */
   live: TaskLive | null;
   /** 这次任务的落盘位置；null 表示没有可打开/可删的东西。 */
@@ -142,6 +144,9 @@ function pump() {
         showNotice(task.note);
       })
       .catch((error) => {
+        // 暂停后后台还在收尾（旧任务被取消），错误回调可能比「已暂停」晚到：
+        // 这时保持 paused，别把卡片改成「失败」。
+        if (task.status === "paused") return;
         task.status = "failed";
         const text = String(error);
         // 取消/暂停不是「失败」：卡片和胶囊都说人话，别把后台的英文错误抛给用户。
@@ -199,6 +204,7 @@ export function submitTask(
     total: null,
     live: null,
     output: null,
+    speed: null,
     queued: true
   };
   tasks.unshift(task);
@@ -223,12 +229,35 @@ export function setTaskOutput(id: number, output: TaskOutput | null) {
 }
 
 /** 下载器推过来的字节进度（按任务 id 对上号）。 */
-export function setTaskProgress(id: number, received: number, total: number | null) {
+export function setTaskProgress(
+  id: number,
+  received: number,
+  total: number | null,
+  speed?: number,
+) {
   const task = find(id);
   if (!task) return;
   task.received = received;
   task.total = total;
   task.percent = total && total > 0 ? Math.min(99, (received / total) * 100) : 0;
+  if (speed !== undefined) task.speed = speed > 0 ? speed : null;
+}
+
+/**
+ * 后台已经算好整体百分比的任务（整合包安装按阶段加权）直接写这个数：
+ * 再按字节重算会把「解压覆盖」这种没有字节的阶段打回 0。
+ */
+export function setTaskPercent(id: number, percent: number) {
+  const task = find(id);
+  if (!task || !Number.isFinite(percent)) return;
+  task.percent = Math.max(0, Math.min(99.5, percent));
+}
+
+/** 只更新速度（安装阶段有速度但没有总量时需要它）。 */
+export function setTaskSpeed(id: number, speed: number) {
+  const task = find(id);
+  if (!task) return;
+  task.speed = speed > 0 ? speed : null;
 }
 
 /**
@@ -250,6 +279,7 @@ export function beginTask(title: string, detail = ""): number {
     total: null,
     live: null,
     output: null,
+    speed: null,
     queued: false
   };
   tasks.unshift(task);

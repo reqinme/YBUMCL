@@ -6,6 +6,9 @@
 //! 3. exe 同级唯一一个含 `config.json` 的文件夹（用户手动改名后自动接管）
 //! 4. 默认 `exe同级/YBUMCL`
 //!
+//! 数据目录就用默认的 `YBUMCL` 时**不生成** `ybumcl.cfg`——和 PCL 一样靠约定
+//! 认目录；只有目录被改名、或用 `--data-dir` 指到别处时才落这个指针。
+//!
 //! 目标位置不可写（只读介质、Program Files 等）时，回退到
 //! `%LOCALAPPDATA%\YBUMCL` 并把 `portable` 标为 false，由界面提示用户。
 
@@ -106,10 +109,17 @@ impl Paths {
                 .unwrap_or_else(|| self.data_dir.to_string_lossy().into_owned()),
             _ => self.data_dir.to_string_lossy().into_owned(),
         };
-        write_atomic(
-            &self.exe_dir.join(POINTER_FILE),
-            format!("{value}\n").as_bytes(),
-        )
+        // 默认位置就是 exe 同级的 `YBUMCL`，靠约定就能认出来，不落文件。
+        if value == APP_NAME {
+            return Ok(());
+        }
+        let path = self.exe_dir.join(POINTER_FILE);
+        if let Ok(existing) = fs::read_to_string(&path) {
+            if existing.trim() == value {
+                return Ok(());
+            }
+        }
+        write_atomic(&path, format!("{value}\n").as_bytes())
     }
 
     /// 写一行启动日志；调用方保证 logs 目录已建好。
