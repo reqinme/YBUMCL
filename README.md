@@ -1,94 +1,142 @@
-# YBUMCL · 延边大学我的世界启动器
+<div align="center">
 
-Windows 上的 Minecraft 启动器。只有一个 exe，双击就能用；游戏和数据都放在 exe 旁边，整个文件夹拷到别的电脑照样跑。
+<img src="static/logo.png" width="128" height="128" alt="YBUMCL logo">
 
-## 下载与使用
+# YBUMCL
 
-到 [Releases](https://github.com/reqinme/YBUMCL/releases) 下最新的 `YBUMCL-*.exe`，放进任意文件夹双击运行。首次启动会在它旁边建这些东西：
+**A portable Minecraft launcher for Windows — one exe, everything kept next to it.**
+
+[English](README.md) | [简体中文](README.zh_CN.md)
+
+</div>
+
+## Introduction
+
+**YBUMCL** (Yanbian University Minecraft Launcher) is a launcher for Windows written with Tauri 2, SvelteKit 5 and Rust. There is no installer: download one `YBUMCL.exe`, put it in any folder and run it. Settings, logs, caches and the game directory are created beside the exe, so moving the whole folder to another computer keeps everything working.
+
+It is built for the way launchers are actually used in mainland China: official Mojang endpoints, the BMCLAPI mirror and the usual maven mirrors are combined, every download is verified by SHA1, and everything works offline once the files exist.
+
+## Requirements & Installation
+
+**Windows 10 / 11 (x64).** WebView2 runtime is required; it is already present on most systems.
+
+1. Download the latest `YBUMCL-*.exe` from [Releases](https://github.com/reqinme/YBUMCL/releases).
+2. Put it in any folder and double-click it.
+3. On first start the launcher creates its data next to the exe:
 
 ```
 YBUMCL.exe
-ybumcl.cfg      # 记住数据文件夹叫什么
-YBUMCL\         # 设置、日志、界面运行时数据
-.minecraft\     # 装游戏之后才出现，和 PCL 一样可以直接搬走
+ybumcl.cfg       # remembers where the data folder lives
+YBUMCL/          # settings, logs, caches
+.minecraft/      # created after the first install; portable like PCL
 ```
 
-Windows 10 / 11。Java 会自动找（JAVA_HOME、PATH、各家厂商的安装目录、官方启动器的 `runtime\`），找不到也可以在设置里手动指一个。
+Java is detected automatically (`JAVA_HOME`, `PATH`, vendor install folders, the official launcher's `runtime/`). If nothing suitable is found, pick a `java.exe` manually in Settings.
 
-## 能做什么
+## Features
 
-### 装游戏
+### Installing game versions
 
-- 原版、Forge、NeoForge、Fabric、Quilt、Cleanroom、LiteLoader、OptiFine 都能装，加载器版本可以选稳定版、测试版、快照版。
-- 安装过程在「下载任务」里，可以暂停、继续、取消；取消会把半成品清干净。
-- 一个版本就是一个实例，设置跟着实例走。默认开启版本隔离：存档、模组、配置都在 `versions\<实例>\` 里，删实例就删这一包。
+- Vanilla plus **Forge, NeoForge, Fabric, Quilt, Cleanroom, LiteLoader and OptiFine**; stable, beta and snapshot loader builds are listed newest first.
+- Forge 1.13+, NeoForge, Fabric and Quilt are installed by the launcher itself: it reads `install_profile.json` / `version.json`, merges one library list and runs the processors — the official installer jar is not executed. Only OptiFine and Cleanroom still use their own installers.
+- Installs run as tasks in **Downloads → Tasks**: pause, resume, cancel; cancelling cleans up the partial files.
+- Several installs can run at the same time, including two copies of the same version. Files shared by one game version are locked and reused instead of being downloaded twice.
 
-### 下模组、整合包和材质
+### Downloads
 
-- Modrinth 与 CurseForge 两个源同时请求，谁快用谁，失效镜像自动跳过。
-- 进度、速度、剩余时间都是真实字节。
-- 整合包一键安装：装好自动建实例，概览页直接显示整合包名称、标签、简介、下载数和来源；点那块信息能跳回下载页看同一个项目。
-- 世界包下完自动解压到实例的 `saves`。
-- 模组、资源包、数据包、光影包会落到当前实例对应的目录。搜索框下方有「下载到」，可以在「默认」（游戏目录）和某个具体实例之间切，每类各记一份。
-- 下载完成的任务卡上能直接打开所在文件夹、移除记录，或者连文件一起删掉。
+- Modrinth and CurseForge are both queried; resources, shader packs, data packs, worlds and modpacks are downloaded with real byte-accurate progress, speed and ETA.
+- Source order is deterministic: Mojang's own static hosts always go official first, mirrors are used for the rest, BMCLAPI is rate-limited per host, long transfers have a read timeout and every failed file is retried once at the end.
+- Modpacks install in one click and create the instance automatically; world archives are extracted into the instance's `saves`.
+- Every task card can open its folder, be removed, or be deleted together with its files.
 
-### 管理实例
+### Instances
 
-实例详情页有 13 个标签：概览 / 设置 / 修改 / 导出 / 存档 / 截图 / 模组 / 资源包 / 光影包 / 投影 / 服务器 / 日志 / 崩溃报告。
+An instance is a single self-contained folder under `versions/` — the merged version JSON, its jar and its own `mods`, `saves`, `config`. The vanilla base used during installation is moved out to `cache/vanilla/<version>`, so the version list only shows what you actually installed.
 
-- **修改**：原地换游戏版本或加载器，`mods`、`saves`、`config` 都保留；换加载器之前会提醒旧的模组可能不适用。
-- **导出**：把实例打成 zip，里面有 `manifest.json`（名称、游戏版本、加载器、文件数、字节数），换机器也能照着重装。
-- **概览**：改图标（内置方块图或自己的图片）、实例名、描述、分类，把实例加进收藏夹——主页左栏只显示打星的实例；还能看到启动次数。
-- **高级管理**：导出启动脚本（`.bat`）、测试游戏、补全文件、重置（先备份核心再原地重装）、修补核心（拿一个 jar/zip 合并进客户端核心）、删除实例（进回收站，按住 Shift 才是永久删除）。
-- **模组**：扫描、启用/禁用、删除，也可以把 `.jar` 拖进窗口导入。
+The detail page has 13 tabs: Overview / Settings / Modify / Export / Saves / Screenshots / Mods / Resource packs / Shader packs / Projection / Servers / Logs / Crash reports.
 
-### 多个游戏目录
+- **Modify**: change the game version or loader in place, keeping `mods`, `saves` and `config`.
+- **Export**: pack the instance into a zip with a `manifest.json`.
+- **Overview**: icon, name, description, categories, pin to top, launch count.
+- **Advanced**: export a launch script, test the game, verify files, reset, patch the core, delete the instance (to the recycle bin unless Shift is held).
+- **Mods**: scan, enable/disable, delete, drop `.jar` files into the window, and check Modrinth/CurseForge for updates.
 
-左栏可以添加、移出、重命名、拖拽排序游戏目录，随时切换。每个目录有自己的版本列表、筛选和分类，互不干扰。
+The version list can be sorted by installation order, name, game version, loader or last launch; the choice is remembered per game folder. Pinned instances stay on top. The same sorting drives the sidebar on the home page.
 
-### 账户
+### Multiple game folders
 
-- 离线账户：玩家名保存下来，新建实例默认沿用。
-- 微软正版账户：设备码登录，令牌过期可以在账户卡片上「重新登录」。
-- 外置登录（authlib-injector）：填服务器地址后按服务器的账户体系登录。
-- 皮肤：微软账户可以选官方皮肤，也能用 LittleSkin；实例列表和账户页用 3D 预览显示。
+Add, remove, rename and drag-sort game folders in the sidebar. Each folder keeps its own version list, filters, categories and sort order. The active folder is shared by the version list, the home sidebar and the download destinations.
 
-## 目前不做
+### Accounts
 
-- 自动更新
-- macOS / Linux
+- **Offline**: a player name, reused by new instances.
+- **Microsoft**: device-code login; expired tokens can be refreshed from the account card.
+- **authlib-injector**: sign in through the account system of your own server.
+- **Skins**: official skins and LittleSkin, with pixel-accurate head avatars drawn from the skin's face and hat layer.
+- Drag the handle to reorder accounts, click the selected account again to deselect it, and each source keeps its own order.
 
-## 从源码构建
+### Logs, crashes and diagnostics
+
+- `logs/launcher.log` rotates, keeping five files.
+- Every launch writes its own log under `logs/runs/` with an `index.json`; running several instances at once keeps their output apart.
+- Crashes are analysed against 60 built-in rules, shown as a red bar in the log page and as a dialog, and can be exported as a zip containing the run log, launcher logs, game log, latest crash report, version JSON, system information and a reproducible `LatestLaunch.bat`.
+
+### Interface
+
+- Install animation: the install button turns into a ball of light that flies to the download icon in the top bar; the colour is configurable in Settings → Appearance.
+- Back navigation follows a layered model: category → overview → version list → home, with scroll positions restored, modals excluded from the history and keyboard Esc / Alt+← support.
+- Light and dark surfaces, no third-party UI library; every dropdown is the launcher's own component.
+
+## Files and data
+
+| Path | Contents |
+| --- | --- |
+| `YBUMCL/settings.json` | launcher settings |
+| `YBUMCL/accounts.json` | accounts and skins |
+| `YBUMCL/logs/` | `launcher.log` (5 files) and `runs/` with per-launch logs |
+| `.minecraft/versions/<id>/` | one self-contained instance |
+| `.minecraft/cache/vanilla/<version>/` | vanilla base shared by installs |
+| `.minecraft/libraries/`, `assets/` | shared libraries and assets, verified by SHA1 |
+
+## Building from source
+
+Requirements: Node.js 22+, pnpm, Rust stable with the MSVC toolchain, and the WebView2 runtime.
 
 ```bash
 pnpm install
-pnpm desktop          # 开发模式（前端热更新 + Tauri 窗口）
-pnpm build            # 只构建前端到 build/
-pnpm desktop:build    # 发布版 exe，产物在 target/release/YBUMCL.exe
+pnpm desktop          # dev mode: Vite HMR + Tauri window
+pnpm build            # frontend only, into build/
+pnpm desktop:build    # release exe at target/release/YBUMCL.exe
 pnpm check            # svelte-check
-pnpm verify           # 门禁：svelte-kit sync + svelte-check + 前端构建 + cargo check
-pnpm test:core        # Rust 核心测试
+pnpm verify           # gate: svelte-kit sync + svelte-check + frontend build + cargo check
+pnpm test:core        # Rust core tests
 ```
 
-只改了 `.svelte` 的话，打包前要先 `pnpm build`，再 `touch apps/desktop/src-tauri/src/lib.rs apps/desktop/src-tauri/build.rs`，否则 exe 里还是旧界面。
+If only `.svelte` files changed, run `pnpm build` before `pnpm desktop:build`; otherwise the packaged exe still contains the old interface.
 
-目录：
+Repository layout:
 
 ```
-apps/desktop/src-tauri/   # 壳：便携路径、单实例、Tauri 命令、设置与实例存储
-crates/launcher-core/     # 与界面无关的核心：扫版本、装游戏、装加载器、下载器、启动参数、模组
-src/                      # SvelteKit 前端（Svelte 5 runes，没有第三方 UI 库）
-tools/                    # 图标与壁纸源文件
+apps/desktop/src-tauri/   # shell: portable paths, single instance, Tauri commands, storage
+crates/launcher-core/     # UI-independent core: version scan, install, loaders, downloader, launch plan, mods
+src/                      # SvelteKit frontend (Svelte 5 runes, no UI framework)
+tools/                    # icon and wallpaper sources
 ```
 
-核心 crate 不依赖 Tauri，可以直接跑：`cargo run -p launcher-core --example install_vanilla`，`examples/` 里还有 `install_modloader`、`preview_launch`、`detect_java`。
+The core crate does not depend on Tauri and can be used directly:
 
-## 致谢
+```bash
+cargo run -p launcher-core --example install_vanilla
+```
 
-下载调度的设计参考了 [PCL-CE](https://github.com/PCL-Community/PCL-CE)：官方源和 BMCLAPI 镜像同时请求、先到先用，失败回落，半截文件留着续传。
+`examples/` also contains `install_modloader`, `preview_launch`, `detect_java`, `fetch_probe` and `labymod_prefetch`.
 
-界面与操作的取舍也大量对照 PCL 与 PCL-CE。
+## Acknowledgements
 
-## 法律
+The download scheduler follows the ideas of [PCL-CE](https://github.com/PCL-Community/PCL-CE): official hosts and the BMCLAPI mirror combined, deterministic source order, resumable partial files. Interface decisions were also compared against PCL and PCL-CE.
 
-本启动器不分发任何游戏本体文件：客户端、库、资源全部从 Mojang / Fabric 官方地址或其镜像下载，并按 SHA1 校验。
+Thanks to [BMCLAPI](https://bmclapi2.bangbang93.com/) and the mirror operators for keeping Minecraft downloads usable.
+
+## Legal
+
+This launcher does not distribute any game files. Clients, libraries and assets are downloaded from Mojang / Fabric official endpoints or their mirrors, and every file is verified by SHA1.
