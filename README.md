@@ -4,139 +4,70 @@
 
 # YBUMCL
 
-**A portable Minecraft launcher for Windows — one exe, everything kept next to it.**
+**A Minecraft launcher for Windows that is just one exe.**
 
 [English](README.md) | [简体中文](README.zh_CN.md)
 
 </div>
 
-## Introduction
+## About
 
-**YBUMCL** (Yanbian University Minecraft Launcher) is a launcher for Windows written with Tauri 2, SvelteKit 5 and Rust. There is no installer: download one `YBUMCL.exe`, put it in any folder and run it. Settings, logs, caches and the game directory are created beside the exe, so moving the whole folder to another computer keeps everything working.
+YBUMCL is a Minecraft launcher for Windows, written with Tauri, SvelteKit and Rust. You download one `YBUMCL.exe`, drop it in any folder and run it. Settings, logs and the game directory are created right next to the exe, so you can copy the whole folder to another PC and keep playing.
 
-It is built for the way launchers are actually used in mainland China: official Mojang endpoints, the BMCLAPI mirror and the usual maven mirrors are combined, every download is verified by SHA1, and everything works offline once the files exist.
+## Install
 
-## Requirements & Installation
+You need Windows 10 or 11 (64-bit). The WebView2 runtime is required, and most systems already have it.
 
-**Windows 10 / 11 (x64).** WebView2 runtime is required; it is already present on most systems.
-
-1. Download the latest `YBUMCL-*.exe` from [Releases](https://github.com/reqinme/YBUMCL/releases).
+1. Get the latest `YBUMCL-*.exe` from [Releases](https://github.com/reqinme/YBUMCL/releases).
 2. Put it in any folder and double-click it.
-3. On first start the launcher creates its data next to the exe:
+3. The launcher creates these files on first start:
 
 ```
 YBUMCL.exe
-ybumcl.cfg       # remembers where the data folder lives
+ybumcl.cfg       # remembers where the data folder is
 YBUMCL/          # settings, logs, caches
-.minecraft/      # created after the first install; portable like PCL
+.minecraft/      # appears after the first install, portable like PCL
 ```
 
-Java is detected automatically (`JAVA_HOME`, `PATH`, vendor install folders, the official launcher's `runtime/`). If nothing suitable is found, pick a `java.exe` manually in Settings.
+Java is found automatically through `JAVA_HOME`, `PATH`, vendor install folders and the official launcher's `runtime/`. If that fails, point the launcher at a `java.exe` in the settings.
 
-## Features
+## What it does
 
-### Installing game versions
+**Installing versions.** Vanilla plus Forge, NeoForge, Fabric, Quilt, Cleanroom, LiteLoader and OptiFine. Loader builds are listed newest first, with stable and beta builds marked. Forge 1.13+, NeoForge, Fabric and Quilt are installed by the launcher itself: it reads `install_profile.json` and `version.json`, merges them into one library list and runs the processors, without launching the official installer jar. Only OptiFine and Cleanroom still use their own installers. Installs show up as tasks that you can pause, resume or cancel, and several of them can run at once, even two copies of the same version.
 
-- Vanilla plus **Forge, NeoForge, Fabric, Quilt, Cleanroom, LiteLoader and OptiFine**; stable, beta and snapshot loader builds are listed newest first.
-- Forge 1.13+, NeoForge, Fabric and Quilt are installed by the launcher itself: it reads `install_profile.json` / `version.json`, merges one library list and runs the processors — the official installer jar is not executed. Only OptiFine and Cleanroom still use their own installers.
-- Installs run as tasks in **Downloads → Tasks**: pause, resume, cancel; cancelling cleans up the partial files.
-- Several installs can run at the same time, including two copies of the same version. Files shared by one game version are locked and reused instead of being downloaded twice.
+**Downloading.** Modrinth and CurseForge are both searched. Mods, resource packs, shader packs, data packs, worlds and modpacks all show real progress, speed and ETA. Mojang's own hosts are always tried first, mirrors handle the rest, BMCLAPI is rate-limited per host, and every failed file is retried once at the end. Modpacks install in one click and create their instance; world archives are extracted into `saves` for you.
 
-### Downloads
+**Instances.** An instance is a single folder under `versions/`: the merged version JSON, its jar, and its own `mods`, `saves` and `config`. The vanilla base used during installation is moved to `cache/vanilla/<version>`, so the version list only shows what you installed. The detail page has 13 tabs: Overview, Settings, Modify, Export, Saves, Screenshots, Mods, Resource packs, Shader packs, Projection, Servers, Logs and Crash reports.
 
-- Modrinth and CurseForge are both queried; resources, shader packs, data packs, worlds and modpacks are downloaded with real byte-accurate progress, speed and ETA.
-- Source order is deterministic: Mojang's own static hosts always go official first, mirrors are used for the rest, BMCLAPI is rate-limited per host, long transfers have a read timeout and every failed file is retried once at the end.
-- Modpacks install in one click and create the instance automatically; world archives are extracted into the instance's `saves`.
-- Every task card can open its folder, be removed, or be deleted together with its files.
+- **Modify** changes the game version or loader in place and keeps your mods, saves and config.
+- **Export** packs the instance into a zip with a `manifest.json`.
+- **Overview** holds the icon, name, description, categories, pin and launch count.
+- **Advanced** can export a launch script, test the game, verify files, reset, patch the core or delete the instance (to the recycle bin unless you hold Shift).
+- **Mods** scans, enables, disables and deletes mods, accepts dropped `.jar` files, and checks Modrinth and CurseForge for updates.
 
-### Instances
+The version list can be sorted by install order, name, game version, loader or last launch, and each game folder remembers its own choice. Pinned instances stay on top, and the sidebar on the home page uses the same order.
 
-An instance is a single self-contained folder under `versions/` — the merged version JSON, its jar and its own `mods`, `saves`, `config`. The vanilla base used during installation is moved out to `cache/vanilla/<version>`, so the version list only shows what you actually installed.
+**Game folders.** Add, remove, rename and drag-sort folders in the sidebar. Each one keeps its own versions, filters, categories and sort order. The folder you select is shared by the version page, the sidebar and the download destination.
 
-The detail page has 13 tabs: Overview / Settings / Modify / Export / Saves / Screenshots / Mods / Resource packs / Shader packs / Projection / Servers / Logs / Crash reports.
+**Accounts.** Offline accounts, Microsoft accounts with device-code login, and authlib-injector servers. Skins can come from Mojang or LittleSkin, and avatars are drawn from the skin's face and hat layer so the shape follows the skin. Drag the handle to reorder accounts, or click the selected one again to sign out; every source keeps its own order.
 
-- **Modify**: change the game version or loader in place, keeping `mods`, `saves` and `config`.
-- **Export**: pack the instance into a zip with a `manifest.json`.
-- **Overview**: icon, name, description, categories, pin to top, launch count.
-- **Advanced**: export a launch script, test the game, verify files, reset, patch the core, delete the instance (to the recycle bin unless Shift is held).
-- **Mods**: scan, enable/disable, delete, drop `.jar` files into the window, and check Modrinth/CurseForge for updates.
+**Logs and crashes.** `logs/launcher.log` keeps five rotated files. Every launch also writes its own log under `logs/runs/` with an `index.json`, so several running instances do not mix their output. A crash is matched against 60 built-in rules and shows up as a red bar and a dialog, with a one-click zip containing the run log, launcher logs, game log, latest crash report, version JSON, system information and a `LatestLaunch.bat`.
 
-The version list can be sorted by installation order, name, game version, loader or last launch; the choice is remembered per game folder. Pinned instances stay on top. The same sorting drives the sidebar on the home page.
+**Interface.** When you press Install, the button turns into a ball of light and flies to the download icon in the top bar; the colour is set in Settings → Appearance. Going back follows the page structure (category → overview → version list → home), restores the scroll position, leaves dialogs out of the history, and also works with Esc and Alt+←.
 
-### Multiple game folders
+## Files
 
-Add, remove, rename and drag-sort game folders in the sidebar. Each folder keeps its own version list, filters, categories and sort order. The active folder is shared by the version list, the home sidebar and the download destinations.
-
-### Accounts
-
-- **Offline**: a player name, reused by new instances.
-- **Microsoft**: device-code login; expired tokens can be refreshed from the account card.
-- **authlib-injector**: sign in through the account system of your own server.
-- **Skins**: official skins and LittleSkin, with pixel-accurate head avatars drawn from the skin's face and hat layer.
-- Drag the handle to reorder accounts, click the selected account again to deselect it, and each source keeps its own order.
-
-### Logs, crashes and diagnostics
-
-- `logs/launcher.log` rotates, keeping five files.
-- Every launch writes its own log under `logs/runs/` with an `index.json`; running several instances at once keeps their output apart.
-- Crashes are analysed against 60 built-in rules, shown as a red bar in the log page and as a dialog, and can be exported as a zip containing the run log, launcher logs, game log, latest crash report, version JSON, system information and a reproducible `LatestLaunch.bat`.
-
-### Interface
-
-- Install animation: the install button turns into a ball of light that flies to the download icon in the top bar; the colour is configurable in Settings → Appearance.
-- Back navigation follows a layered model: category → overview → version list → home, with scroll positions restored, modals excluded from the history and keyboard Esc / Alt+← support.
-- Light and dark surfaces, no third-party UI library; every dropdown is the launcher's own component.
-
-## Files and data
-
-| Path | Contents |
+| Path | What is there |
 | --- | --- |
 | `YBUMCL/settings.json` | launcher settings |
 | `YBUMCL/accounts.json` | accounts and skins |
-| `YBUMCL/logs/` | `launcher.log` (5 files) and `runs/` with per-launch logs |
-| `.minecraft/versions/<id>/` | one self-contained instance |
+| `YBUMCL/logs/` | `launcher.log` and `runs/` with one log per launch |
+| `.minecraft/versions/<id>/` | one instance |
 | `.minecraft/cache/vanilla/<version>/` | vanilla base shared by installs |
-| `.minecraft/libraries/`, `assets/` | shared libraries and assets, verified by SHA1 |
+| `.minecraft/libraries/`, `assets/` | shared libraries and assets |
 
-## Building from source
+## Thanks
 
-Requirements: Node.js 22+, pnpm, Rust stable with the MSVC toolchain, and the WebView2 runtime.
+A lot of the launcher was designed by looking at how other launchers solved the same problems. Ideas for the downloader, the version layout and the interface come from [PCL2](https://github.com/Meloong-Git/PCL), [PCL-CE](https://github.com/PCL-Community/PCL-CE), [HMCL](https://github.com/HMCL-dev/HMCL) and [SJMCL](https://github.com/UNIkeEN/SJMCL); thanks to their authors for keeping their work open.
 
-```bash
-pnpm install
-pnpm desktop          # dev mode: Vite HMR + Tauri window
-pnpm build            # frontend only, into build/
-pnpm desktop:build    # release exe at target/release/YBUMCL.exe
-pnpm check            # svelte-check
-pnpm verify           # gate: svelte-kit sync + svelte-check + frontend build + cargo check
-pnpm test:core        # Rust core tests
-```
-
-If only `.svelte` files changed, run `pnpm build` before `pnpm desktop:build`; otherwise the packaged exe still contains the old interface.
-
-Repository layout:
-
-```
-apps/desktop/src-tauri/   # shell: portable paths, single instance, Tauri commands, storage
-crates/launcher-core/     # UI-independent core: version scan, install, loaders, downloader, launch plan, mods
-src/                      # SvelteKit frontend (Svelte 5 runes, no UI framework)
-tools/                    # icon and wallpaper sources
-```
-
-The core crate does not depend on Tauri and can be used directly:
-
-```bash
-cargo run -p launcher-core --example install_vanilla
-```
-
-`examples/` also contains `install_modloader`, `preview_launch`, `detect_java`, `fetch_probe` and `labymod_prefetch`.
-
-## Acknowledgements
-
-The download scheduler follows the ideas of [PCL-CE](https://github.com/PCL-Community/PCL-CE): official hosts and the BMCLAPI mirror combined, deterministic source order, resumable partial files. Interface decisions were also compared against PCL and PCL-CE.
-
-Thanks to [BMCLAPI](https://bmclapi2.bangbang93.com/) and the mirror operators for keeping Minecraft downloads usable.
-
-## Legal
-
-This launcher does not distribute any game files. Clients, libraries and assets are downloaded from Mojang / Fabric official endpoints or their mirrors, and every file is verified by SHA1.
+Downloads would not be usable from here without [BMCLAPI](https://bmclapi2.bangbang93.com/). Thanks to it and to the mirror operators for keeping the files reachable.
