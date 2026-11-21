@@ -1,10 +1,19 @@
 <script lang="ts">
-  import { canGoBackPage, goBackPage } from "$lib/page-history.svelte";
+  import { backBlocked, canGoBackPage, goBackPage } from "$lib/page-history.svelte";
+  import { errorDialog, javaPrompt } from "$lib/dialogs.svelte";
+
+  let disabled = $derived(backBlocked() || errorDialog.value !== null || javaPrompt.value !== null);
 </script>
 
 <!-- 页面标题左侧的返回键：和 Esc / Alt+← 走同一个返回栈，没有上一页时整块不渲染。 -->
 {#if canGoBackPage()}
-  <button class="back" type="button" title="返回上一页（Esc 或 Alt+←）" onclick={() => void goBackPage()}>
+  <button
+    class="back"
+    type="button"
+    disabled={disabled}
+    title={disabled ? "先关掉弹窗再返回" : "返回上一页（Esc 或 Alt+←）"}
+    onclick={() => void goBackPage()}
+  >
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
       <path
         d="M10 3 5 8l5 5"
@@ -32,7 +41,10 @@
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
     transition: background 0.15s ease, border-color 0.15s ease;
   }
-  .back:hover {
+  .back:disabled {
+    opacity: 0.45;
+  }
+  .back:hover:not(:disabled) {
     background: rgba(255, 255, 255, 0.14);
     border-color: rgba(255, 255, 255, 0.24);
   }

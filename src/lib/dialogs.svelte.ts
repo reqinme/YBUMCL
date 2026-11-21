@@ -1,7 +1,7 @@
 // 全站只有一种「出错了」的展示：居中的错误弹窗。
 // 页面里的报错别再写行内小字，统一调 showError()。
 
-import type { JavaCheck } from "$lib/api";
+import type { CrashHit, JavaCheck } from "$lib/api";
 
 export type ErrorSource = "launcher" | "game";
 
@@ -26,6 +26,24 @@ export const errorDialog = $state<{ value: Shown | null }>({ value: null });
 export function showError(title: string, message?: string, detail?: string, source: ErrorSource = "launcher") {
   seq += 1;
   errorDialog.value = { id: seq, info: { title, message, detail, source } };
+}
+
+/** 游戏崩了：把规则引擎的结论组织成弹窗文案。 */
+export function showCrash(versionId: string, code: number | null, hits: CrashHit[]) {
+  const first = hits[0];
+  const title = first ? first.title : "游戏异常退出";
+  const message = first
+    ? ["实例", versionId, first.detail].filter(Boolean).join(" · ")
+    : `「${versionId}」退出码 ${code ?? "未知"}，没有认出已知原因。`;
+  const detail = hits
+    .flatMap((hit, index) => {
+      const head = `${index + 1}. ${hit.title}${hit.detail ? ` —— ${hit.detail}` : ""}`;
+      const fix = hit.fix ? `   建议：${hit.fix}` : "";
+      const evidence = hit.evidence.length ? [`   证据：${hit.evidence[0]}`] : [];
+      return [head, fix, ...evidence].filter(Boolean);
+    })
+    .join("\n");
+  showError(title, message, detail || undefined, "game");
 }
 
 /** 关掉错误弹窗。 */

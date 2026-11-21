@@ -28,6 +28,7 @@ fn main() {
         java_path: None,
         strategy: Default::default(),
         threads: Some(24),
+        cache_roots: Vec::new(),
         icon_url: None,
         source: None,
         project_id: None,

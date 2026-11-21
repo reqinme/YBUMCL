@@ -271,6 +271,23 @@ pub fn merged_version(base: &Value, parts: &[&Value], id: &str) -> Value {
     output
 }
 
+/// 原版「底稿」的缓存位置：`<root>/cache/vanilla/<id>/`。
+///
+/// 底稿只是合并实例时的输入（jar + json + 库清单），启动时不会读它，所以没必要
+/// 让它出现在 `versions/` 里占一张版本卡。放在这里还能跨实例复用同一份。
+pub fn scaffold_dir(root: &Path, id: &str) -> PathBuf {
+    root.join("cache").join("vanilla").join(id)
+}
+
+/// 底稿 json 的实际位置：优先缓存，其次兼容旧的 `versions/<id>` 落点。
+pub fn base_json_path(root: &Path, id: &str) -> PathBuf {
+    let cached = scaffold_dir(root, id).join(format!("{id}.json"));
+    if cached.is_file() {
+        return cached;
+    }
+    version_json(root, id)
+}
+
 /// 读取 `<root>/versions/<id>/<id>.json`。
 pub fn read_version(root: &Path, id: &str) -> Result<Value> {
     let path = version_json(root, id);
@@ -294,52 +311,135 @@ pub fn version_json_path(root: &Path, id: &str) -> PathBuf {
     version_json(root, id)
 }
 
-/// 写出合并后的实例：json + 从原版拷来的 client jar。
+/// 把旧版本落在 `versions/` 里的原版底稿搬进缓存。
 ///
-/// `base_id` 是原版版本 id，合并后的 `id` 是实例目录名；两者不同才拷 jar。
-pub fn write_instance(root: &Path, base_id: &str, parts: &[LoaderPart], id: &str) -> Result<Value> {
+/// 只搬「被别的实例当作 `clientVersion` 引用、自己又不是用户建的实例（无 `_ybmcl`）」
+/// 的那些目录，避免误搬用户真的想保留的纯原版。
+pub fn migrate_scaffolds(root: &Path) -> Result<Vec<String>> {
+    let versions = root.join("versions");
+    let Ok(entries) = fs::read_dir(&versions) else {
+        return Ok(Vec::new());
+    };
+    let mut instances: Vec<Value> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let json = version_json(root, &id);
+        if !json.is_file() {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&json) else { continue };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if value.get("_ybmcl").is_some() {
+            instances.push(value);
+        } else if value.get("downloads").and_then(|d| d.get("client")).is_some() {
+            candidates.push(id);
+        }
+    }
+    let mut moved = Vec::new();
+    for id in candidates {
+        let referenced = instances.iter().any(|json| {
+            json.get("clientVersion")
+                .and_then(|value| value.as_str())
+                .is_some_and(|game| game == id)
+        });
+        if !referenced {
+            continue;
+        }
+        let target = scaffold_dir(root, &id);
+        if target.join(format!("{id}.json")).is_file() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::remove_dir_all(&target);
+        if fs::rename(versions.join(&id), &target).is_ok() {
+            moved.push(id);
+        }
+    }
+    Ok(moved)
+}
+
+/// 写出实例。默认拍平成自包含实例（每个实例自带一份核心 jar，同 PCL）：
+/// 原版与加载器的 json 合并成一份、补 `clientVersion`、把原版 jar 复制成 `<实例>.jar`。
+///
+/// `flat = false` 只留给「自带完整 profile、没有 client jar」的加载器（LabyMod），
+/// 那种实例改用 `inheritsFrom` 指回那份 profile。
+pub fn write_instance(
+    root: &Path,
+    base_id: &str,
+    parts: &[LoaderPart],
+    id: &str,
+    flat: bool,
+    game: &str,
+) -> Result<Value> {
     if !safe_component(id) {
         return Err(CoreError::InvalidInput("Unsafe instance name".into()));
     }
-    let base = read_version(root, base_id)?;
+    // 实例名等于原版 id 时，`inheritsFrom` 会指向自己，并且落盘时覆盖 `versions/<id>/<id>.json`。
+    // （没有加载器又不同名的情况是合法的：LabyMod 这类加载器本身就给一份完整 profile，
+    //  实例只需要 `inheritsFrom` 过去，自己的库清单可以留空。）
+    if id == base_id {
+        return Err(CoreError::InvalidInput(format!(
+            "实例名不能和版本名相同（{id}），换一个名字再装"
+        )));
+    }
+    let base_path = base_json_path(root, base_id);
+    let base_bytes = fs::read(&base_path).map_err(|error| io(&base_path, error))?;
+    let base: Value = serde_json::from_slice(&base_bytes)
+        .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
     let ordered = merge_order(parts);
     let mut jsons = Vec::with_capacity(ordered.len());
     for part in &ordered {
         jsons.push(read_version(root, &part.version_id)?);
     }
-    let references: Vec<&Value> = jsons.iter().collect();
-    let mut merged = merged_version(&base, &references, id);
-    // 记下「原版版本 + 各加载器版本」，重装/重置时才能装回同一套东西。
-    let loaders: Vec<Value> = ordered
+    let legacy = jsons
         .iter()
-        .map(|part| {
-            serde_json::json!({
-                "loader": part.kind.key(),
-                "version": if part.version.is_empty() { None } else { Some(part.version.clone()) },
-            })
-        })
-        .collect();
+        .any(|json| json.get("minecraftArguments").is_some());
+    let merged = if legacy || flat {
+        write_flattened(root, base_id, &base, &jsons, &ordered, id, game)?
+    } else {
+        write_inheriting(root, base_id, &jsons, &ordered, id, game)?
+    };
+    let _ = &base;
+    Ok(merged)
+}
+
+/// 旧格式（launchwrapper）：把原版与加载器合并成一个自包含实例。
+fn write_flattened(
+    root: &Path,
+    base_id: &str,
+    base: &Value,
+    jsons: &[Value],
+    ordered: &[LoaderPart],
+    id: &str,
+    game: &str,
+) -> Result<Value> {
+    let references: Vec<&Value> = jsons.iter().collect();
+    let mut merged = merged_version(base, &references, id);
+    stamp_loaders(&mut merged, game, ordered);
+    // PCL 同款：记下真正对应的 Minecraft 版本（LabyMod 这类底稿不是原版，取 game）。
     if let Some(object) = merged.as_object_mut() {
-        object.insert(
-            "_ybmcl".to_string(),
-            serde_json::json!({ "gameVersion": base_id, "loaders": loaders }),
-        );
+        object.insert("clientVersion".into(), Value::String(game.to_owned()));
     }
-
-    let folder = root.join("versions").join(id);
-    fs::create_dir_all(&folder).map_err(|error| io(&folder, error))?;
-    let path = folder.join(format!("{id}.json"));
-    let text = serde_json::to_vec_pretty(&merged)
-        .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
-    fs::write(&path, text).map_err(|error| io(&path, error))?;
-
+    save_version(root, id, &merged)?;
     if id != base_id {
-        let source = root
-            .join("versions")
-            .join(base_id)
-            .join(format!("{base_id}.jar"));
+        let cached_jar = scaffold_dir(root, base_id).join(format!("{base_id}.jar"));
+        let source = if cached_jar.is_file() {
+            cached_jar
+        } else {
+            root.join("versions")
+                .join(base_id)
+                .join(format!("{base_id}.jar"))
+        };
         if source.is_file() {
-            let target = folder.join(format!("{id}.jar"));
+            let target = root.join("versions").join(id).join(format!("{id}.jar"));
             if target.exists() {
                 fs::remove_file(&target).map_err(|error| io(&target, error))?;
             }
@@ -349,9 +449,219 @@ pub fn write_instance(root: &Path, base_id: &str, parts: &[LoaderPart], id: &str
     Ok(merged)
 }
 
-/// 给不走合并流程的实例 json 补上 `_ybmcl`（原版实例、加载器外壳都是直接写 json 的）。
+/// 现代格式：实例只写加载器那一层，`inheritsFrom` 指回原版，不复制 jar、不复制原版库。
+fn write_inheriting(
+    root: &Path,
+    base_id: &str,
+    jsons: &[Value],
+    ordered: &[LoaderPart],
+    id: &str,
+    game: &str,
+) -> Result<Value> {
+    let mut child = Value::Object(Map::new());
+    for json in jsons {
+        let mut part = json.clone();
+        if let Some(object) = part.as_object_mut() {
+            // 这些字段属于原版层，混进来会覆盖继承来的值（尤其 downloads 会改变主 jar 的判定）。
+            for key in [
+                "id",
+                "inheritsFrom",
+                "jar",
+                "_comment_",
+                "_ybmcl",
+                "downloads",
+                "assetIndex",
+                "assets",
+                "asset",
+                "javaVersion",
+                "type",
+                "time",
+                "releaseTime",
+                "minimumLauncherVersion",
+                "complianceLevel",
+                "logging",
+            ] {
+                object.remove(key);
+            }
+        }
+        merge_into(&mut child, &part);
+    }
+    if let Some(object) = child.as_object_mut() {
+        object.insert("id".into(), Value::String(id.to_owned()));
+        object.insert("inheritsFrom".into(), Value::String(base_id.to_owned()));
+    } else {
+        return Err(CoreError::Metadata("版本 json 不是对象".into()));
+    }
+    stamp_loaders(&mut child, game, ordered);
+    save_version(root, id, &child)?;
+    Ok(child)
+}
+
+/// 记下「原版版本 + 各加载器版本」，重装/重置时才能装回同一套东西。
+fn stamp_loaders(value: &mut Value, base_id: &str, ordered: &[LoaderPart]) {
+    let loaders: Vec<Value> = ordered
+        .iter()
+        .map(|part| {
+            serde_json::json!({
+                "loader": part.kind.key(),
+                "version": if part.version.is_empty() { None } else { Some(part.version.clone()) },
+            })
+        })
+        .collect();
+    // 安装时间只记第一次：重装/迁移时保留原有的值，排序靠它还原「装的时候先后」。
+    let installed_at = value
+        .get("_ybmcl")
+        .and_then(|meta| meta.get("installedAt"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0)
+        });
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "_ybmcl".to_string(),
+            serde_json::json!({
+                "gameVersion": base_id,
+                "loaders": loaders,
+                "installedAt": installed_at,
+            }),
+        );
+    }
+}
+
+/// 把实例记下的加载器清单改成 `parts`（合并时 LabyMod 被当作底稿，会被排除在
+/// `merged_parts` 之外，但它在界面上仍应显示成实例的加载器）。
+pub fn stamp_loaders_for(root: &Path, id: &str, game: &str, parts: &[LoaderPart]) -> Result<()> {
+    let path = version_json(root, id);
+    let bytes = fs::read(&path).map_err(|error| io(&path, error))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| CoreError::InvalidInput(format!("{}: {error}", path.display())))?;
+    stamp_loaders(&mut value, game, parts);
+    let text = serde_json::to_vec_pretty(&value)
+        .map_err(|error| CoreError::InvalidInput(format!("{}: {error}", path.display())))?;
+    fs::write(&path, text).map_err(|error| io(&path, error))?;
+    Ok(())
+}
+
+fn save_version(root: &Path, id: &str, value: &Value) -> Result<()> {
+    let folder = root.join("versions").join(id);
+    fs::create_dir_all(&folder).map_err(|error| io(&folder, error))?;
+    let path = folder.join(format!("{id}.json"));
+    let text = serde_json::to_vec_pretty(value)
+        .map_err(|error| CoreError::InvalidInput(error.to_string()))?;
+    fs::write(&path, text).map_err(|error| io(&path, error))?;
+    Ok(())
+}
+
+/// 把现有的继承式实例拍平成自包含版本（PCL 的做法）：
+/// 合并整条 `inheritsFrom` 链、补 `clientVersion`、把链底的 client jar 复制成 `<实例>.jar`。
 ///
-/// `loaders` 是 `(loader key, 版本号)`，原版实例传空切片；版本号为空串写 `null`。
+/// 与 [`restore_inheritance`] 正好相反，两者都只改 json 与 jar，不动库和资源。
+pub fn flatten_inheriting_versions(root: &Path) -> Result<Vec<String>> {
+    let versions = root.join("versions");
+    let Ok(entries) = fs::read_dir(&versions) else {
+        return Ok(Vec::new());
+    };
+    let mut flattened = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !safe_component(&id) {
+            continue;
+        }
+        let Ok(child) = read_version(root, &id) else {
+            continue;
+        };
+        let Some(first) = child.get("inheritsFrom").and_then(Value::as_str) else {
+            continue;
+        };
+        // 顺着 inheritsFrom 往上找整条链，链底就是真正的游戏版本。
+        let mut chain: Vec<Value> = Vec::new();
+        let mut cursor = first.to_owned();
+        let mut guard = 0;
+        let mut game = None;
+        while guard < 8 {
+            let Ok(json) = read_version(root, &cursor) else {
+                break;
+            };
+            game = json
+                .get("clientVersion")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(game);
+            let next = json.get("inheritsFrom").and_then(Value::as_str).map(str::to_owned);
+            chain.push(json);
+            match next {
+                Some(next) if next != cursor => cursor = next,
+                _ => break,
+            }
+            guard += 1;
+        }
+        if chain.is_empty() {
+            continue;
+        }
+        let base = chain.pop().unwrap_or_else(|| child.clone());
+        chain.reverse();
+        let mut refs: Vec<&Value> = chain.iter().collect();
+        refs.push(&child);
+        let mut merged = merged_version(&base, &refs, &id);
+        if let Some(object) = merged.as_object_mut() {
+            // 继承链上的 `_ybmcl` 与 `clientVersion` 必须保留实例自己的那一份。
+            if let Some(stamp) = child.get("_ybmcl") {
+                object.insert("_ybmcl".into(), stamp.clone());
+            }
+            let game = child
+                .get("_ybmcl")
+                .and_then(|stamp| stamp.get("gameVersion"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| base.get("id").and_then(Value::as_str).map(str::to_owned))
+                .or(game)
+                .unwrap_or_else(|| first.to_owned());
+            object.insert("clientVersion".into(), Value::String(game.clone()));
+        }
+        save_version(root, &id, &merged)?;
+        // 复制链底目录里的 client jar（LabyMod 这类链底没有 jar 时退回游戏版本目录）。
+        let target = versions.join(&id).join(format!("{id}.jar"));
+        if !target.is_file() {
+            let base_id = base
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(&first)
+                .to_owned();
+            let source = versions.join(&base_id).join(format!("{base_id}.jar"));
+            if source.is_file() {
+                fs::copy(&source, &target).map_err(|error| io(&target, error))?;
+            }
+        }
+        flattened.push(id);
+    }
+    // 加载器 profile 拍平后留下的空壳目录（0 字节）顺手清掉；有内容的目录不碰。
+    if let Ok(entries) = fs::read_dir(&versions) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let empty = fs::read_dir(&path)
+                .map(|mut items| items.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                let _ = fs::remove_dir(&path);
+            }
+        }
+    }
+    Ok(flattened)
+}
+
+/// 内核模式切到「多核心式」时，把现有的继承式实例拍平成自包含版本：
+/// 合并整条 `inheritsFrom` 链、补 `clientVersion`、把链底的 client jar 复制成 `<实例>.jar`。
+///
 /// 已经有 `_ybmcl` 的文件原样不动，免得把合并时记下的那套加载器覆盖掉。
 pub fn stamp_meta(root: &Path, id: &str, game_version: &str, loaders: &[(&str, &str)]) -> Result<()> {
     if !safe_component(id) {
@@ -547,10 +857,16 @@ pub fn migrate_legacy_versions(root: &Path) -> Result<Vec<String>> {
 }
 
 /// 就地合并一个两层实例；本来就是自包含的返回 `Ok(false)`。
+///
+/// 带 `_ybmcl` 的是 YBUMCL 自己装的版本（现在有意保留 `inheritsFrom` 走继承链），
+/// 以及旧版拍平后又被 [`restore_inheritance`] 改回来的实例，都不在这里动。
 pub fn migrate_legacy_version(root: &Path, id: &str) -> Result<bool> {
     let Ok(raw) = read_version(root, id) else {
         return Ok(false);
     };
+    if raw.get("_ybmcl").is_some() {
+        return Ok(false);
+    }
     let Some(parent) = raw["inheritsFrom"].as_str().map(str::to_owned) else {
         return Ok(false);
     };

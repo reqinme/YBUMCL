@@ -89,6 +89,9 @@ pub struct ModpackRequest {
     /// 并发下载的线程数（1–256，留空用 64）。
     #[serde(default)]
     pub threads: Option<u32>,
+    /// 其它游戏目录：本目录缺的资源先从这些目录按 SHA1 复制，不发网络请求。
+    #[serde(default)]
+    pub cache_roots: Vec<String>,
     /// 资源站上这个整合包的图标地址；装完顺手存成实例图标。
     #[serde(default)]
     pub icon_url: Option<String>,
@@ -453,6 +456,7 @@ fn install_modpack_inner(
         java_path: request.java_path.clone(),
         strategy: request.strategy,
         threads: None,
+        cache_roots: request.cache_roots.clone(),
         overwrite: false,
     };
 

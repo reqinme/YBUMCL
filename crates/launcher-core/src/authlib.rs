@@ -40,6 +40,14 @@ pub struct Profile {
     pub uuid: String,
     pub token: String,
     pub avatar: Option<String>,
+    /// 整张皮肤（`data:image/png;base64,…`），账号页画全身预览用。
+    pub skin: Option<String>,
+    /// 披风，没有就是 None。
+    pub cape: Option<String>,
+    /// `slim` / `classic`。
+    pub skin_model: Option<String>,
+    /// 外链登录换来的 OIDC 刷新令牌；密码登录为空。
+    pub refresh_token: Option<String>,
 }
 
 fn now() -> u64 {
@@ -180,23 +188,25 @@ pub fn jar_version(path: &Path) -> Option<String> {
         .map(|value| value.trim().to_owned())
 }
 
-/// 保证数据目录里有一份能用的 authlib-injector.jar：有就复用，没有就下最新的。
+/// 保证数据目录里有一份能用的 authlib-injector.jar：版本对就复用，旧了才重下。
 pub fn ensure_jar(dir: &Path) -> Result<PathBuf, String> {
     let path = jar_path(dir);
-    if jar_version(&path).is_some() {
+    let local = jar_version(&path);
+    let (version, url) = match latest_release() {
+        Ok(release) => release,
+        // 拿不到版本清单时，本地有 jar 就先用着（离线也能启动）。
+        Err(error) => {
+            return match local {
+                Some(_) => Ok(path),
+                None => Err(error),
+            }
+        }
+    };
+    if local.as_deref() == Some(version.as_str()) {
         return Ok(path);
     }
-    let meta: serde_json::Value = http()
-        .get(LATEST)
-        .send()
-        .and_then(|response| response.json())
-        .map_err(|error| format!("拿不到 authlib-injector 的版本信息：{error}"))?;
-    let url = meta
-        .get("download_url")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "authlib-injector 的版本信息里没有下载地址。".to_string())?;
     let bytes = http()
-        .get(url)
+        .get(&url)
         .send()
         .and_then(|response| response.bytes())
         .map_err(|error| format!("下载 authlib-injector 失败：{error}"))?;
@@ -204,12 +214,384 @@ pub fn ensure_jar(dir: &Path) -> Result<PathBuf, String> {
     let temp = path.with_extension("jar.tmp");
     fs::write(&temp, &bytes).map_err(|error| format!("写不进 authlib-injector.jar：{error}"))?;
     fs::rename(&temp, &path).map_err(|error| format!("authlib-injector.jar 换名失败：{error}"))?;
-    if jar_version(&path).is_none() {
-        return Err("下载回来的 authlib-injector.jar 打不开，可能下坏了。".into());
+    if jar_version(&path).as_deref() != Some(version.as_str()) {
+        return Err("下载回来的 authlib-injector.jar 版本不对，可能下坏了。".into());
     }
     Ok(path)
 }
 
+/// 官方清单拿不到时退回 GitHub 的 release（国内访问 GitHub API 常常比 yushi.moe 稳）。
+fn latest_release() -> Result<(String, String), String> {
+    let direct = http()
+        .get(LATEST)
+        .send()
+        .and_then(|response| response.json::<serde_json::Value>());
+    if let Ok(value) = direct {
+        let version = value
+            .get("version")
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if let Some(url) = value.get("download_url").and_then(|item| item.as_str()) {
+            if !version.is_empty() {
+                return Ok((version, url.to_owned()));
+            }
+        }
+    }
+    let value: serde_json::Value = http()
+        .get("https://api.github.com/repos/yushijinhun/authlib-injector/releases/latest")
+        .send()
+        .and_then(|response| response.json())
+        .map_err(|error| format!("拿不到 authlib-injector 的版本信息：{error}"))?;
+    let version = value
+        .get("tag_name")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default()
+        .trim_start_matches('v')
+        .to_owned();
+    let url = value
+        .get("assets")
+        .and_then(|item| item.as_array())
+        .and_then(|assets| {
+            assets.iter().find(|asset| {
+                asset
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .is_some_and(|name| name.ends_with(".jar"))
+            })
+        })
+        .and_then(|asset| asset.get("browser_download_url"))
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "authlib-injector 的版本信息里没有下载地址。".to_string())?;
+    Ok((version, url.to_owned()))
+}
+
+/// yggdrasil 的 `validate`：令牌还有效就返回 true，避免每次启动都 refresh。
+pub fn validate(server: &Server, token: &str) -> bool {
+    let body = serde_json::json!({ "accessToken": token });
+    matches!(
+        post(&format!("{}/authserver/validate", server.url), &body),
+        Ok((200, _))
+    )
+}
+
+/// 第三方服务器的外链登录（OIDC 设备码）。只有开了 `feature.openid_configuration_url`
+/// 的服务器支持；拿不到就直接报错，让用户回去用密码登录。
+#[derive(Debug, Clone)]
+pub struct DeviceLogin {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub interval: u64,
+    pub expires_in: u64,
+    pub client_id: String,
+    token_endpoint: String,
+    jwks_uri: Option<String>,
+}
+
+/// 一次设备码轮询的结果。
+#[derive(Debug)]
+pub enum DevicePoll {
+    /// 用户还没在浏览器里确认。
+    Pending,
+    /// 服务器要求放慢轮询。
+    SlowDown,
+    /// 用户点了拒绝。
+    Denied,
+    /// 设备码过期。
+    Expired,
+    Ready(Box<Profile>),
+}
+
+fn openid_config(server: &Server) -> Result<serde_json::Value, String> {
+    let metadata = server
+        .metadata
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .ok_or_else(|| "这个服务器没有给出元数据，用不了外链登录。".to_string())?;
+    let endpoint = metadata
+        .pointer("/meta/feature.openid_configuration_url")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "这个服务器不支持外链登录，用密码登录吧。".to_string())?;
+    http()
+        .get(endpoint)
+        .send()
+        .and_then(|response| response.json())
+        .map_err(|error| format!("读不到这个服务器的登录配置：{error}"))
+}
+
+/// 内置的 client id 表：公益服的 OAuth 应用都是各服自己报备的，按域名对。
+fn builtin_client_id(server: &Server) -> Option<String> {
+    let host = server
+        .url
+        .split("//")
+        .nth(1)?
+        .split('/')
+        .next()?
+        .to_ascii_lowercase();
+    let table = [
+        ("skin.mc.sjtu.cn", "6"),
+        ("skin.mualliance.ltd", "27"),
+        ("littleskin.cn", "1014"),
+        ("oauth.ustb.world", "6"),
+        ("skin.jsumc.fun", "2"),
+        ("user.suesmc.ltd", "4"),
+    ];
+    table
+        .iter()
+        .find(|(domain, _)| host == *domain || host.ends_with(&format!(".{domain}")))
+        .map(|(_, id)| (*id).to_owned())
+}
+
+/// 发起设备码登录：返回用户要打开/输入的东西。
+pub fn start_device_login(server: &Server) -> Result<DeviceLogin, String> {
+    let config = openid_config(server)?;
+    let device_endpoint = config
+        .get("device_authorization_endpoint")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "这个服务器的登录配置里没有设备码接口。".to_string())?;
+    let token_endpoint = config
+        .get("token_endpoint")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "这个服务器的登录配置里没有换票接口。".to_string())?
+        .to_owned();
+    let client_id = server
+        .client_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| {
+            config
+                .get("shared_client_id")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+        })
+        .or_else(|| builtin_client_id(server))
+        .ok_or_else(|| "不知道该用哪个 client id，这个服务器没法外链登录。".to_string())?;
+    let response = http()
+        .post(device_endpoint)
+        .form(&[
+            ("client_id", client_id.as_str()),
+            (
+                "scope",
+                "openid offline_access Yggdrasil.PlayerProfiles.Select Yggdrasil.Server.Join",
+            ),
+        ])
+        .send()
+        .map_err(|error| format!("发不起设备码请求：{error}"))?;
+    let status = response.status().as_u16();
+    let text = response.text().unwrap_or_default();
+    if status != 200 {
+        return Err(format!("服务器拒绝了外链登录（HTTP {status}）。"));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("设备码返回看不懂：{error}"))?;
+    let verification = value
+        .get("verification_uri_complete")
+        .and_then(|item| item.as_str())
+        .or_else(|| value.get("verification_uri").and_then(|item| item.as_str()))
+        .unwrap_or_default()
+        .to_owned();
+    Ok(DeviceLogin {
+        device_code: value
+            .get("device_code")
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        user_code: value
+            .get("user_code")
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        verification_uri: verification,
+        interval: value.get("interval").and_then(|item| item.as_u64()).unwrap_or(5),
+        expires_in: value
+            .get("expires_in")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(600),
+        client_id,
+        token_endpoint,
+        jwks_uri: config
+            .get("jwks_uri")
+            .and_then(|item| item.as_str())
+            .map(str::to_owned),
+    })
+}
+
+/// 轮询设备码；用户确认后返回角色（含皮肤）。
+pub fn poll_device_login(server: &Server, login: &DeviceLogin) -> Result<DevicePoll, String> {
+    let response = http()
+        .post(&login.token_endpoint)
+        .form(&[
+            ("client_id", login.client_id.as_str()),
+            ("device_code", login.device_code.as_str()),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+        ])
+        .send()
+        .map_err(|error| format!("轮询登录状态失败：{error}"))?;
+    let status = response.status().as_u16();
+    let text = response.text().unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    if status != 200 {
+        return Ok(match value.get("error").and_then(|item| item.as_str()) {
+            Some("authorization_pending") => DevicePoll::Pending,
+            Some("slow_down") => DevicePoll::SlowDown,
+            Some("access_denied") => DevicePoll::Denied,
+            Some("expired_token") => DevicePoll::Expired,
+            Some(other) => return Err(format!("登录失败：{other}")),
+            None => return Err(format!("登录失败（HTTP {status}）。")),
+        });
+    }
+    let access = value
+        .get("access_token")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "登录返回里没有 access_token。".to_string())?
+        .to_owned();
+    let refresh_token = value
+        .get("refresh_token")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned);
+    let id = value
+        .get("id_token")
+        .and_then(|item| item.as_str())
+        .map(|token| verify_id_token(token, login))
+        .transpose()?
+        .and_then(|claims| {
+            claims
+                .pointer("/selectedProfile/id")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "登录成功但没有返回角色 id。".to_string())?;
+    let look = profile(server, &id).unwrap_or_else(|| Look {
+        uuid: id.clone(),
+        name: id.clone(),
+        ..Look::default()
+    });
+    Ok(DevicePoll::Ready(Box::new(Profile {
+        name: look.name,
+        uuid: look.uuid,
+        token: access,
+        avatar: look.avatar,
+        skin: look.skin,
+        cape: look.cape,
+        skin_model: look.skin_model,
+        refresh_token,
+    })))
+}
+
+/// 外链登录的账户过期后用 OIDC 的 refresh_token 换票；有的服务器会顺带换一个新的
+/// refresh_token，那就一起返回，由调用方写回账号。
+pub fn refresh_oauth(server: &Server, refresh_token: &str) -> Result<(String, Option<String>), String> {
+    let config = openid_config(server)?;
+    let endpoint = config
+        .get("token_endpoint")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "这个服务器的登录配置里没有换票接口。".to_string())?;
+    let client_id = server
+        .client_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| {
+            config
+                .get("shared_client_id")
+                .and_then(|item| item.as_str())
+                .map(str::to_owned)
+        })
+        .or_else(|| builtin_client_id(server))
+        .ok_or_else(|| "不知道该用哪个 client id，重新登录一次吧。".to_string())?;
+    let response = http()
+        .post(endpoint)
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .map_err(|error| format!("刷新登录状态失败：{error}"))?;
+    let status = response.status().as_u16();
+    let value: serde_json::Value = response
+        .json()
+        .map_err(|error| format!("刷新登录状态失败：{error}"))?;
+    if status != 200 {
+        let reason = value
+            .get("error")
+            .and_then(|item| item.as_str())
+            .unwrap_or("unknown");
+        return Err(format!("登录已过期（{reason}），重新登录一次。"));
+    }
+    let access = value
+        .get("access_token")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "刷新返回里没有 access_token。".to_string())?
+        .to_owned();
+    let next = value
+        .get("refresh_token")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned);
+    Ok((access, next))
+}
+
+/// 用服务器的 JWKS 验 id_token 的 RS256 签名，顺便核对 aud。
+fn verify_id_token(token: &str, login: &DeviceLogin) -> Result<serde_json::Value, String> {
+    use rsa::signature::Verifier;
+    let mut parts = token.split('.');
+    let (Some(head), Some(payload), Some(signature)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err("id_token 格式不对。".into());
+    };
+    let header: serde_json::Value = serde_json::from_slice(&b64url(head)?)
+        .map_err(|error| format!("id_token 头看不懂：{error}"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&b64url(payload)?)
+        .map_err(|error| format!("id_token 内容看不懂：{error}"))?;
+    if claims.get("aud").and_then(|item| item.as_str()) != Some(login.client_id.as_str()) {
+        return Err("id_token 不是发给这个启动器的。".into());
+    }
+    let Some(jwks_uri) = login.jwks_uri.as_deref() else {
+        return Ok(claims);
+    };
+    let jwks: serde_json::Value = http()
+        .get(jwks_uri)
+        .send()
+        .and_then(|response| response.json())
+        .map_err(|error| format!("读不到服务器的公钥：{error}"))?;
+    let kid = header.get("kid").and_then(|item| item.as_str());
+    let key = jwks
+        .get("keys")
+        .and_then(|item| item.as_array())
+        .and_then(|keys| {
+            keys.iter().find(|key| {
+                kid.is_none_or(|kid| key.get("kid").and_then(|k| k.as_str()) == Some(kid))
+            })
+        })
+        .ok_or_else(|| "服务器的公钥里没有对应的那把。".to_string())?;
+    let modulus = key
+        .get("n")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "公钥缺少 n。".to_string())?;
+    let exponent = key
+        .get("e")
+        .and_then(|item| item.as_str())
+        .ok_or_else(|| "公钥缺少 e。".to_string())?;
+    let public = rsa::RsaPublicKey::new(
+        rsa::BigUint::from_bytes_be(&b64url(modulus)?),
+        rsa::BigUint::from_bytes_be(&b64url(exponent)?),
+    )
+    .map_err(|error| format!("公钥读不出来：{error}"))?;
+    let verifying = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(public);
+    let signature = rsa::pkcs1v15::Signature::try_from(b64url(signature)?.as_slice())
+        .map_err(|_| "id_token 签名格式不对。".to_string())?;
+    verifying
+        .verify(format!("{head}.{payload}").as_bytes(), &signature)
+        .map_err(|_| "id_token 签名不对，可能被改过。".to_string())?;
+    Ok(claims)
+}
+
+fn b64url(input: &str) -> Result<Vec<u8>, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    URL_SAFE_NO_PAD
+        .decode(input)
+        .map_err(|error| format!("base64 解码失败：{error}"))
+}
 /// yggdrasil 密码登录；返回这个账号下的所有角色（有些服务器是「账号 → 多个角色」）。
 pub fn login(server: &Server, username: &str, password: &str) -> Result<Vec<Profile>, String> {
     let body = serde_json::json!({
@@ -255,19 +637,38 @@ pub fn login(server: &Server, username: &str, password: &str) -> Result<Vec<Prof
     }
     let mut out = Vec::new();
     for (id, name) in ids {
-        let (uuid, display, avatar) = profile(server, &id).unwrap_or((id.clone(), name.clone(), None));
+        let look = profile(server, &id).unwrap_or_else(|| Look {
+            uuid: id.clone(),
+            name: name.clone(),
+            ..Look::default()
+        });
         out.push(Profile {
-            name: display,
-            uuid,
+            name: look.name,
+            uuid: look.uuid,
             token: token.clone(),
-            avatar,
+            avatar: look.avatar,
+            skin: look.skin,
+            cape: look.cape,
+            skin_model: look.skin_model,
+            refresh_token: None,
         });
     }
     Ok(out)
 }
 
 /// `{server}/sessionserver/session/minecraft/profile/<uuid>`：名字和皮肤。
-fn profile(server: &Server, id: &str) -> Option<(String, String, Option<String>)> {
+/// 档案 + 皮肤纹理，`profile()` 一次拿全，省得再请求一遍。
+#[derive(Default)]
+struct Look {
+    uuid: String,
+    name: String,
+    avatar: Option<String>,
+    skin: Option<String>,
+    cape: Option<String>,
+    skin_model: Option<String>,
+}
+
+fn profile(server: &Server, id: &str) -> Option<Look> {
     let url = format!("{}/sessionserver/session/minecraft/profile/{}", server.url, id);
     let value: serde_json::Value = http().get(url).send().ok()?.json().ok()?;
     let uuid = value
@@ -280,7 +681,7 @@ fn profile(server: &Server, id: &str) -> Option<(String, String, Option<String>)
         .and_then(|item| item.as_str())
         .unwrap_or_default()
         .to_owned();
-    let avatar = value
+    let textures = value
         .get("properties")
         .and_then(|item| item.as_array())
         .and_then(|properties| {
@@ -289,19 +690,46 @@ fn profile(server: &Server, id: &str) -> Option<(String, String, Option<String>)
                 .find(|property| property.get("name").and_then(|n| n.as_str()) == Some("textures"))
         })
         .and_then(|property| property.get("value").and_then(|item| item.as_str()))
-        .and_then(texture_url)
-        .and_then(|url| auth::head_avatar(&url).ok().flatten());
-    Some((uuid, name, avatar))
+        .and_then(decoded_textures);
+    let skin_url = textures
+        .as_ref()
+        .and_then(|value| value.pointer("/textures/SKIN/url"))
+        .and_then(|item| item.as_str());
+    let skin_model = textures
+        .as_ref()
+        .and_then(|value| value.pointer("/textures/SKIN/metadata/model"))
+        .and_then(|item| item.as_str())
+        .map(str::to_owned);
+    let cape_url = textures
+        .as_ref()
+        .and_then(|value| value.pointer("/textures/CAPE/url"))
+        .and_then(|item| item.as_str());
+    let skin_png = skin_url.and_then(|url| auth::fetch_image(url).ok());
+    let avatar = skin_png.as_deref().and_then(auth::head_avatar_png);
+    let skin = skin_png.as_deref().map(auth::data_url);
+    let cape = cape_url
+        .and_then(|url| auth::fetch_image(url).ok())
+        .map(|png| auth::data_url(&png));
+    Some(Look {
+        uuid,
+        name,
+        avatar,
+        skin,
+        cape,
+        skin_model,
+    })
 }
 
 /// textures 属性：base64 的 `{ "textures": { "SKIN": { "url": … } } }`。
-fn texture_url(encoded: &str) -> Option<String> {
+fn decoded_textures(encoded: &str) -> Option<serde_json::Value> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value
-        .get("textures")?
-        .get("SKIN")?
-        .get("url")?
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// textures 属性里的 SKIN 地址（测试与旧调用点用，正式解析走 `decoded_textures`）。
+fn texture_url(encoded: &str) -> Option<String> {
+    decoded_textures(encoded)?
+        .pointer("/textures/SKIN/url")?
         .as_str()
         .map(str::to_owned)
 }

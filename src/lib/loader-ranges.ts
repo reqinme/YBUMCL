@@ -139,14 +139,14 @@ export function supportsLoader(kind: LoaderKind, game: string): boolean {
   }
 }
 
-/** 加载器标签：只认实例 json 解析出来的记录；没有版本号的项不显示，全空就是原版。 */
+/** 加载器标签：只认实例 json 解析出来的记录；认得出加载器但拿不到版本号时只写名字，全空就是原版。 */
 export function loaderLabels(
   detail: { loader: string; version?: string }[] | null | undefined,
 ): string[] {
-  const items = (detail ?? []).filter((item) => item && item.loader && item.version);
+  const items = (detail ?? []).filter((item) => item && item.loader);
   if (items.length === 0) return ["原版"];
   return items.map((item) => {
     const label = LOADER_NAME[item.loader as LoaderKind] ?? item.loader;
-    return `${label} ${item.version}`;
+    return item.version ? `${label} ${item.version}` : label;
   });
 }

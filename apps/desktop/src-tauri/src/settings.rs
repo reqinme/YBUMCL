@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::portable::Paths;
 
 const SETTINGS_FILE: &str = "settings.json";
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 9;
 /// 默认堆内存：现代版本 2 GB 起，低于 1 GB 很多模组包会直接 OOM。
 pub const DEFAULT_MEMORY_MB: u32 = 4096;
 pub const MAX_MEMORY_MB: u32 = 32768;
@@ -28,12 +28,26 @@ pub struct Settings {
     pub java_path: String,
     /// 是否播放启动动画。
     pub show_splash: bool,
-    /// 下载源策略：`race`（两者竞速，默认）、`official-first`、`mirror-first`、
+    /// 下载源策略：`sequential`（顺序换源，默认）、`race`（两者竞速）、`official-first`、`mirror-first`、
     /// `mirror-only`、`official-only`。没有镜像路由的文件永远只走官方。
     #[serde(default)]
     pub download_strategy: Option<String>,
+    /// 版本隔离：`all`（默认，每个版本自己的 mods/存档）、`off`（全部共用 .minecraft）。
+    #[serde(default = "default_isolation_mode")]
+    pub isolation_mode: String,
+    /// 「安装光球」的颜色（`#rrggbb`），点安装后飞向下载圆环的那颗球。
+    /// 「安装光球」的颜色（`#rrggbb`），点安装后飞向下载圆环的那颗球。
+    #[serde(default = "default_install_ball_color")]
+    pub install_ball_color: String,
+    /// 下载时把其它已登记游戏目录里的资源（按 SHA1 命中）直接复制过来，不再重复下载。
+    #[serde(default = "default_true")]
+    pub reuse_game_folders: bool,
     /// 最大线程数：同时下载的线程上限，1..=256（PCL 同款，默认 64）。
     pub concurrent_downloads: u32,
+    /// 下载协议：false = HTTP/1.1（默认，每文件一条连接），true = HTTP/2（多路复用）。
+    /// 实测 h2 会把多线程下载合回一条 TCP，通常更慢，只有个别源反过来。
+    #[serde(default)]
+    pub use_http2: bool,
     /// 全局限速档位（0..=42，PCL 的 `ToolDownloadSpeed`）：42 表示不限速，
     /// 0..=14 每档 0.1 MB/s，15..=31 每档 0.5 MB/s，32..=41 每档 1 MB/s。
     #[serde(default = "default_speed_tier")]
@@ -113,9 +127,13 @@ impl Default for Settings {
             memory_mb: DEFAULT_MEMORY_MB,
             java_path: String::new(),
             show_splash: true,
-            download_strategy: Some("race".into()),
+            download_strategy: Some("sequential".into()),
+            isolation_mode: "all".into(),
+            install_ball_color: default_install_ball_color(),
+            reuse_game_folders: true,
             download_source: String::new(),
             concurrent_downloads: 64,
+            use_http2: false,
             download_speed: launcher_core::download::SPEED_TIER_UNLIMITED,
             speed_limit: 0,
             mirror_race: true,
@@ -137,6 +155,14 @@ impl Default for Settings {
             active_game_folder: String::new(),
         }
     }
+}
+
+fn default_install_ball_color() -> String {
+    "#a8cc84".into()
+}
+
+fn default_isolation_mode() -> String {
+    "all".into()
 }
 
 fn default_true() -> bool {
@@ -174,6 +200,12 @@ impl Settings {
         self.split_ratio = self.split_ratio.clamp(25, 65);
         self.versions_split_ratio = self.versions_split_ratio.clamp(12, 30);
         self.nav_slide_ms = self.nav_slide_ms.min(600);
+        // 隔离只有两种现象：隔离版本 / 不隔离版本。
+        self.isolation_mode = if self.isolation_mode == "off" {
+            "off".into()
+        } else {
+            "all".into()
+        };
         if self.missing_deps_mode > 2 {
             self.missing_deps_mode = 0;
         }
@@ -182,6 +214,10 @@ impl Settings {
         }
         if self.file_name_format > 4 {
             self.file_name_format = 4;
+        }
+        // v4：默认策略从「竞速」改为「顺序换源」；v3 及更早存下的 race 是旧默认值，跟着迁移。
+        if self.schema_version < 4 && self.download_strategy.as_deref() == Some("race") {
+            self.download_strategy = Some("sequential".into());
         }
         // 新配置优先；老配置（download_source + mirror_race）映射过来。
         let parsed = self
@@ -226,6 +262,16 @@ impl Settings {
             .trim()
             .trim_end_matches(['\\', '/'])
             .to_owned();
+        self.install_ball_color = match self.install_ball_color.as_str() {
+            value
+                if value.len() == 7
+                    && value.starts_with('#')
+                    && value[1..].chars().all(|ch| ch.is_ascii_hexdigit()) =>
+            {
+                value.to_ascii_lowercase()
+            }
+            _ => default_install_ball_color(),
+        };
         self.schema_version = SCHEMA_VERSION;
         self
     }
@@ -237,9 +283,16 @@ pub fn settings_path(paths: &Paths) -> PathBuf {
 
 /// 读取设置；文件不存在、损坏或不是合法 JSON 时都返回默认值而不是报错。
 pub fn load(paths: &Paths) -> Settings {
-    read_file(&settings_path(paths))
-        .unwrap_or_default()
-        .sanitized()
+    let Some(raw) = read_file(&settings_path(paths)) else {
+        return Settings::default();
+    };
+    let stale = raw.schema_version < SCHEMA_VERSION;
+    let settings = raw.sanitized();
+    // 迁移只在内存里做的话，文件里会一直留着旧值（例如 v3 的 race），下次启动还要重迁一遍。
+    if stale {
+        let _ = save(paths, settings.clone());
+    }
+    settings
 }
 
 pub fn save(paths: &Paths, settings: Settings) -> Result<Settings, String> {

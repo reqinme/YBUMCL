@@ -4,6 +4,7 @@
 //! Minecraft 访问令牌 → profile。刷新令牌用 DPAPI 加密后再写盘（只有当前
 //! Windows 用户解得开），访问令牌只放在内存里，进程退出即失效。
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -12,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub const ACCOUNTS_FILE: &str = "accounts.json";
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// 启动器自己注册的 Azure 应用（仅限个人 Microsoft 账户，允许公共客户端流）。
 pub const CLIENT_ID: &str = "0190d27f-2112-45ba-8ae1-4ebba66ca60c";
@@ -56,6 +57,24 @@ pub struct Account {
     /// 第三方账户所属的认证服务器地址（离线 / 微软账户为 None）。
     #[serde(default)]
     pub server: Option<String>,
+    /// 第三方外链登录换来的 OIDC 刷新令牌（DPAPI 保护）。密码登录的账户没有。
+    #[serde(default)]
+    pub oauth: Option<String>,
+    /// 整张皮肤（`data:image/png;base64,…`），账号页拿来画全身预览。
+    #[serde(default)]
+    pub skin: Option<String>,
+    /// 披风（同格式），没有就是 None。
+    #[serde(default)]
+    pub cape: Option<String>,
+    /// 皮肤模型：`slim`（细手臂）或 `classic`。
+    #[serde(default)]
+    pub skin_model: Option<String>,
+    /// 选的是哪一款官方默认皮肤（`steve`/`alex`/…）；自定义皮肤为 None。
+    #[serde(default)]
+    pub skin_official: Option<String>,
+    /// 选的是哪一张内置披风（`minecon2011`/`migrator`/…）；自选文件为 None。
+    #[serde(default)]
+    pub cape_official: Option<String>,
 }
 
 impl Account {
@@ -78,6 +97,15 @@ pub struct Store {
     /// 添加过的第三方认证服务器（用不到的不会有，删掉账户也不会自动删服务器）。
     #[serde(default)]
     pub auth_servers: Vec<crate::authlib::Server>,
+    /// 用户主动删掉的默认服务器：记下来，下次启动别再自动塞回去。
+    #[serde(default)]
+    pub dismissed_servers: Vec<String>,
+    /// 每个「来源」档自己的顺序：`all` / `offline` / `microsoft` / 第三方服务器 URL。
+    ///
+    /// 各档互不影响：在某一档里拖动只改这一档，切回「全部来源」看到的还是
+    /// `players` 本来的顺序。没出现在列表里的账户排在末尾。
+    #[serde(default)]
+    pub orders: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Store {
@@ -87,6 +115,8 @@ impl Default for Store {
             current: None,
             players: Vec::new(),
             auth_servers: Vec::new(),
+            dismissed_servers: Vec::new(),
+            orders: BTreeMap::new(),
         }
     }
 }
@@ -95,17 +125,55 @@ fn accounts_path(dir: &Path) -> PathBuf {
     dir.join(ACCOUNTS_FILE)
 }
 
+/// 内置的第三方认证服务器：装上就有，不用用户自己填地址。
+const DEFAULT_SERVERS: &[(&str, &str)] = &[(
+    "https://skin.ybumua.homes/api/yggdrasil",
+    "YBUMC用户中心",
+)];
+
+/// 早先写进账户表里的旧名字，读到时顺手改掉。
+const RENAMED_SERVERS: &[(&str, &str)] = &[("YBU用户中心", "YBUMC用户中心")];
+
 impl Store {
+    /// 把内置服务器补进列表（用户删过的跳过）。
+    fn seed_default_servers(&mut self) {
+        for (url, name) in DEFAULT_SERVERS {
+            if self.dismissed_servers.iter().any(|gone| gone == url) {
+                continue;
+            }
+            if let Some(existing) = self.auth_servers.iter_mut().find(|server| server.url == *url) {
+                if let Some((_, new_name)) = RENAMED_SERVERS.iter().find(|(old, _)| old == &existing.name) {
+                    existing.name = (*new_name).to_owned();
+                }
+                continue;
+            }
+            self.auth_servers.push(crate::authlib::Server {
+                url: (*url).to_owned(),
+                name: (*name).to_owned(),
+                client_id: None,
+                metadata: None,
+                timestamp: 0,
+            });
+        }
+    }
+
     pub fn load(dir: &Path) -> Self {
         let path = accounts_path(dir);
         let Ok(text) = fs::read_to_string(&path) else {
-            return Self::default();
+            let mut store = Self::default();
+            store.seed_default_servers();
+            return store;
         };
         let mut store: Store = serde_json::from_str(&text).unwrap_or_default();
+        // 旧版本没有 current 字段：只在迁移时补选第一个，补完写回一次。
+        // 迁移之后再出现 `current: None` 就是用户主动取消选择（未登录），必须原样保留。
+        let legacy = store.schema_version < SCHEMA_VERSION;
         store.schema_version = SCHEMA_VERSION;
-        if store.current.is_none() {
+        if legacy && store.current.is_none() {
             store.current = store.players.first().map(|player| player.id.clone());
+            let _ = store.save(dir);
         }
+        store.seed_default_servers();
         store
     }
 
@@ -135,6 +203,11 @@ impl Store {
         }
         self.current = Some(id.to_owned());
         Ok(())
+    }
+
+    /// 取消选中：账户都还在，只是没有「当前账户」，启动器回到未登录状态。
+    pub fn deselect(&mut self) {
+        self.current = None;
     }
 
     /// 第三方账户：同一个服务器下按 UUID 合并（换过一次皮肤也只是同一个人）。
@@ -175,6 +248,9 @@ impl Store {
 
     /// 删服务器时把它名下的账户一起删掉（留着也登不进去）。
     pub fn remove_server(&mut self, url: &str) {
+        if DEFAULT_SERVERS.iter().any(|(builtin, _)| builtin == &url) {
+            self.dismissed_servers.push(url.to_owned());
+        }
         self.auth_servers.retain(|server| server.url != url);
         let removed: Vec<String> = self
             .players
@@ -189,8 +265,9 @@ impl Store {
         }
     }
 
-    /// 离线账户用「玩家名」当身份：UUID 由名字按 Minecraft 的老规矩算出来。
-    pub fn add_offline(&mut self, name: &str) -> Result<String, String> {
+    /// 离线账户用「玩家名」当身份：UUID 默认由名字按 Minecraft 的老规矩算出来，
+    /// 也可以在「高级」里手填一个（服务器要求固定 UUID 时用）。
+    pub fn add_offline(&mut self, name: &str, uuid: Option<&str>) -> Result<String, String> {
         let name = normalize_name(name)?;
         if self
             .players
@@ -199,8 +276,16 @@ impl Store {
         {
             return Err(format!("已经有一个叫 {name} 的离线账户了。"));
         }
-        let uuid = offline_uuid(&name);
-        let id = format!("offline-{uuid}");
+        let uuid = match uuid.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => parse_uuid(text)?,
+            None => offline_uuid(&name),
+        };
+        let mut id = format!("offline-{uuid}");
+        let mut index = 2;
+        while self.players.iter().any(|player| player.id == id) {
+            id = format!("offline-{uuid}-{index}");
+            index += 1;
+        }
         self.players.push(Account {
             id: id.clone(),
             name,
@@ -210,6 +295,38 @@ impl Store {
         });
         self.current = Some(id.clone());
         Ok(id)
+    }
+
+    /// 换掉离线账户的皮肤（`None` 表示去掉，回到首字母方块）。
+    pub fn set_offline_look(
+        &mut self,
+        id: &str,
+        skin: Option<String>,
+        skin_model: Option<String>,
+        skin_official: Option<String>,
+        cape: Option<String>,
+        cape_official: Option<String>,
+    ) -> Result<(), String> {
+        let player = self
+            .players
+            .iter_mut()
+            .find(|player| player.id == id)
+            .ok_or_else(|| "找不到这个账户。".to_string())?;
+        if player.kind != AccountKind::Offline {
+            return Err("只有离线账户可以在这里换皮肤。".into());
+        }
+        player.skin = skin;
+        player.cape = cape;
+        player.skin_official = skin_official;
+        player.cape_official = cape_official;
+        player.skin_model = skin_model.map(|model| {
+            if model.eq_ignore_ascii_case("slim") {
+                "slim".to_string()
+            } else {
+                "classic".to_string()
+            }
+        });
+        Ok(())
     }
 
     pub fn rename(&mut self, id: &str, name: &str) -> Result<(), String> {
@@ -231,8 +348,7 @@ impl Store {
             return Err(format!("已经有一个叫 {name} 的账户了。"));
         }
         if let Some(player) = self.players.iter_mut().find(|player| player.id == id) {
-            // id 是界面和启动请求拿来认人的，改名只换 UUID 和显示名，id 不动。
-            player.uuid = offline_uuid(&name);
+            // 只换显示名：UUID 建号时就定了，改名后存档与服务器白名单仍认得是同一人。
             player.name = name;
         }
         Ok(())
@@ -240,9 +356,72 @@ impl Store {
 
     pub fn remove(&mut self, id: &str) {
         self.players.retain(|player| player.id != id);
+        // 删的是当前账户就回到未登录，不自动选下一个。
         if self.current.as_deref() == Some(id) {
-            self.current = self.players.first().map(|player| player.id.clone());
+            self.current = None;
         }
+        // 每个来源档的顺序里也要抹掉这个 id：离线账户 id 是按名字算的，
+        // 同名账户重新加回来时 id 相同，残留会把它「复活」到老位置或画出两张卡。
+        for ids in self.orders.values_mut() {
+            ids.retain(|kept| kept != id);
+        }
+    }
+
+    /// 按档保存顺序。`all` 直接改 `players` 的数组顺序，其它档只存自己的列表。
+    pub fn reorder(&mut self, filter: &str, ids: &[String]) -> Result<(), String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                return Err("顺序里有重复的账户，刷新后再试。".into());
+            }
+            if !self.players.iter().any(|player| &player.id == id) {
+                return Err(format!("找不到账户 {id}，刷新后再试。"));
+            }
+        }
+        if filter == "all" {
+            if ids.len() != self.players.len() {
+                return Err("账户顺序和账户数量对不上，刷新后再试。".into());
+            }
+            let mut ordered = Vec::with_capacity(ids.len());
+            for id in ids {
+                ordered.push(self.players.iter().find(|player| &player.id == id).cloned().unwrap());
+            }
+            self.players = ordered;
+            return Ok(());
+        }
+        self.orders.insert(filter.to_owned(), ids.to_vec());
+        Ok(())
+    }
+
+    /// 某个来源档的顺序：先按存过的顺序，没出现过的账户按账户表顺序接在后面。
+    pub fn order_for(&self, filter: &str) -> Vec<String> {
+        if filter == "all" {
+            return self.players.iter().map(|player| player.id.clone()).collect();
+        }
+        let saved = self.orders.get(filter);
+        let mut out: Vec<String> = Vec::new();
+        if let Some(ids) = saved {
+            for id in ids {
+                if self.players.iter().any(|player| &player.id == id) && !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+        }
+        for player in &self.players {
+            let visible = match filter {
+                "offline" | "microsoft" => {
+                    matches!(
+                        (filter, player.kind),
+                        ("offline", AccountKind::Offline) | ("microsoft", AccountKind::Microsoft)
+                    )
+                }
+                other => player.server.as_deref() == Some(other),
+            };
+            if visible && !out.contains(&player.id) {
+                out.push(player.id.clone());
+            }
+        }
+        out
     }
 
     /// 把微软登录拿到的档案并进来：同一 UUID 视为同一个人，覆盖令牌与头像。
@@ -268,19 +447,33 @@ impl Store {
     }
 }
 
-/// 离线名字：3–16 个字符，只允许英文、数字和下划线（中文名进不了大多数服务器）。
+/// 离线名字：1–16 个字符，不能带空格或控制字符；中文和符号可以用，但多数服务器不认。
 pub fn normalize_name(name: &str) -> Result<String, String> {
     let name = name.trim();
-    if name.chars().count() < 3 || name.chars().count() > 16 {
-        return Err("玩家名要 3–16 个字符。".into());
+    if name.is_empty() || name.chars().count() > 16 {
+        return Err("玩家名要 1–16 个字符。".into());
     }
-    if !name
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return Err("玩家名只能用英文、数字和下划线。".into());
+    if name.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err("玩家名里不能有空格或控制字符。".into());
     }
     Ok(name.to_owned())
+}
+
+/// 手填的 UUID：接受 32 位裸十六进制或 36 位带横线的写法，统一成小写带横线。
+fn parse_uuid(text: &str) -> Result<String, String> {
+    let clean: String = text.chars().filter(|ch| *ch != '-').collect();
+    if clean.len() != 32 || !clean.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("UUID 要是 32 位十六进制（可带横线）。".into());
+    }
+    let lower = clean.to_ascii_lowercase();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &lower[0..8],
+        &lower[8..12],
+        &lower[12..16],
+        &lower[16..20],
+        &lower[20..32]
+    ))
 }
 
 /// 离线 UUID：`md5("OfflinePlayer:<name>")` 再按 Java 的规矩打上版本位。
@@ -361,10 +554,19 @@ pub fn start_device_code() -> Result<DeviceCode, String> {
     }
     let body: serde_json::Value = serde_json::from_str(&text)
         .map_err(|error| format!("设备码返回看不懂：{error}"))?;
+    // `verification_uri_complete` 里已经带了 user_code，用户点开就能直接确认。
+    let verification = {
+        let complete = string_field(&body, "verification_uri_complete");
+        if complete.is_empty() {
+            string_field(&body, "verification_uri")
+        } else {
+            complete
+        }
+    };
     Ok(DeviceCode {
         device_code: string_field(&body, "device_code"),
         user_code: string_field(&body, "user_code"),
-        verification_uri: string_field(&body, "verification_uri"),
+        verification_uri: verification,
         interval: body.get("interval").and_then(|value| value.as_u64()).unwrap_or(5),
         expires_in: body.get("expires_in").and_then(|value| value.as_u64()).unwrap_or(900),
         message: string_field(&body, "message"),
@@ -478,10 +680,21 @@ fn finish_microsoft(ms_access: &str, refresh_token: Option<String>) -> Result<Po
         Ok(value) => value,
         Err(error) => return Ok(Poll::Failed(error)),
     };
-    let avatar = profile
-        .skin
-        .as_deref()
-        .and_then(|url| head_avatar(url).ok().flatten());
+    // 皮肤整张存下来（账号页画全身预览），头像顺带从同一份字节里裁。
+    let (avatar, skin, cape) = match profile.skin.as_deref() {
+        Some(url) => match fetch_image(url) {
+            Ok(png) => {
+                let cape = profile
+                    .cape
+                    .as_deref()
+                    .and_then(|url| fetch_image(url).ok())
+                    .map(|png| data_url(&png));
+                (head_avatar_png(&png), Some(data_url(&png)), cape)
+            }
+            Err(_) => (None, None, None),
+        },
+        None => (None, None, None),
+    };
     Ok(Poll::Done(Box::new(Account {
         id: String::new(),
         name: profile.name,
@@ -492,6 +705,12 @@ fn finish_microsoft(ms_access: &str, refresh_token: Option<String>) -> Result<Po
         access: Some(mc_access),
         access_expires: now_secs() + expires_in.max(60),
         server: None,
+        oauth: None,
+        skin,
+        cape,
+        skin_model: profile.skin_model,
+        skin_official: None,
+        cape_official: None,
     })))
 }
 
@@ -511,11 +730,26 @@ pub fn session(account: &mut Account, server: &crate::authlib::Server) -> Result
             return Ok(token);
         }
     }
+    // 外链登录的账户用 OIDC 的 refresh_token 换票，密码登录的走 yggdrasil 的 refresh。
+    if let Some(refresh_token) = account.oauth.as_deref().and_then(unprotect) {
+        let (token, next) = crate::authlib::refresh_oauth(server, &refresh_token)?;
+        if let Some(next) = next {
+            account.oauth = protect(&next);
+        }
+        set_session(account, &token);
+        return Ok(token);
+    }
     let saved = account
         .refresh
         .as_deref()
         .and_then(unprotect)
         .ok_or_else(|| "这个账户的登录状态没了，重新输入一次密码。".to_string())?;
+    // 存下来的令牌很多本来就是长期有效的：先问一次 validate，过了就不用换，
+    // 省掉一次 refresh（有些服务器的 refresh 会顺手作废旧令牌）。
+    if crate::authlib::validate(server, &saved) {
+        set_session(account, &saved);
+        return Ok(saved);
+    }
     let token = crate::authlib::refresh(server, &saved)?;
     set_session(account, &token);
     Ok(token)
@@ -583,11 +817,15 @@ fn xsts_error(text: &str) -> String {
     let value: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
     let code = value.get("XErr").and_then(|item| item.as_u64()).unwrap_or(0);
     let hint = match code {
-        2148916233 => "这个微软账号还没有 Xbox 档案，先去 xbox.com 建一个（免费的）。",
-        2148916235 => "这个微软账号所在的国家/地区不提供 Xbox Live。",
-        2148916236 | 2148916237 => "这个微软账号需要在 xbox.com 完成成人验证。",
-        2148916238 => "这是未成年账号，需要一个成人账号把它加进 Microsoft 家庭组。",
         2148916227 => "这个微软账号被 Xbox Live 封禁了。",
+        2148916229 => "这个微软账号受家长控制限制，去 account.microsoft.com/family 改一下权限。",
+        2148916233 => "这个微软账号还没有 Xbox 档案，先去 xbox.com 建一个（免费的）。",
+        2148916234 => "这个微软账号还没同意 Xbox 的服务条款，去 xbox.com 同意一次。",
+        2148916235 => "这个微软账号所在的国家/地区不提供 Xbox Live。",
+        2148916236 | 2148916238 | 2148916239 => {
+            "这是未成年账号，需要一个成人账号把它加进 Microsoft 家庭组并授权。"
+        }
+        2148916237 => "这个微软账号受家长控制限制，需要家长在 family.microsoft.com 授权。",
         _ => "微软账号过不了 Xbox 安全令牌校验。",
     };
     if code == 0 {
@@ -652,6 +890,10 @@ struct Profile {
     id: String,
     name: String,
     skin: Option<String>,
+    #[allow(dead_code)]
+    skin_model: Option<String>,
+    #[allow(dead_code)]
+    cape: Option<String>,
 }
 
 fn minecraft_profile(mc_access: &str) -> Result<Profile, String> {
@@ -672,31 +914,161 @@ fn minecraft_profile(mc_access: &str) -> Result<Profile, String> {
     if id.is_empty() || name.is_empty() {
         return Err("Minecraft 档案缺少 id 或名字。".into());
     }
-    let skin = value
-        .pointer("/skins/0/url")
-        .and_then(|item| item.as_str())
-        .map(str::to_owned);
-    Ok(Profile { id, name, skin })
+    // 只用 state=ACTIVE 的那套；没激活的皮肤是「买了但没穿」。
+    let active = |key: &str| -> Option<(String, Option<String>)> {
+        value
+            .get(key)
+            .and_then(|items| items.as_array())
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("state").and_then(|state| state.as_str()) == Some("ACTIVE")
+                })
+            })
+            .and_then(|item| item.get("url").and_then(|url| url.as_str()))
+            .map(|url| {
+                (
+                    url.to_owned(),
+                    value
+                        .get(key)
+                        .and_then(|items| items.as_array())
+                        .and_then(|items| {
+                            items.iter().find(|item| {
+                                item.get("state").and_then(|state| state.as_str())
+                                    == Some("ACTIVE")
+                            })
+                        })
+                        .and_then(|item| item.pointer("/metadata/model"))
+                        .and_then(|model| model.as_str())
+                        .map(str::to_owned),
+                )
+            })
+    };
+    let skin = active("skins");
+    let cape = active("capes").map(|(url, _)| url);
+    Ok(Profile {
+        id,
+        name,
+        skin: skin.as_ref().map(|(url, _)| url.clone()),
+        skin_model: skin.and_then(|(_, model)| model),
+        cape,
+    })
 }
 
-/// 把皮肤裁成头像：取头部正面 8×8，再叠上帽子层，放大成 64×64。
-pub(crate) fn head_avatar(url: &str) -> Result<Option<String>, String> {
+/// 下载一张皮肤/披风图，返回 PNG 字节（统一重编码，省得前端分辨 gif/webp）。
+pub(crate) fn fetch_image(url: &str) -> Result<Vec<u8>, String> {
     let bytes = client()
         .get(url)
         .send()
         .and_then(|response| response.bytes())
         .map_err(|error| format!("下载皮肤失败：{error}"))?;
     let image = image::load_from_memory(&bytes).map_err(|error| format!("皮肤文件看不懂：{error}"))?;
-    let head = match head_image(&image.to_rgba8()) {
-        Some(head) => head,
-        None => return Ok(None),
-    };
     let mut png = std::io::Cursor::new(Vec::new());
-    head.write_to(&mut png, image::ImageFormat::Png)
-        .map_err(|error| format!("头像编码失败：{error}"))?;
+    image
+        .to_rgba8()
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| format!("皮肤编码失败：{error}"))?;
+    Ok(png.into_inner())
+}
+
+/// 本地皮肤文件 → data URL。只收 Minecraft 皮肤表的那三种尺寸。
+pub fn local_skin(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("读不到这个文件：{error}"))?;
+    let image = image::load_from_memory(&bytes).map_err(|error| format!("这看起来不是图片：{error}"))?;
+    let (width, height) = (image.width(), image.height());
+    if !((width == 64 && (height == 32 || height == 64)) || (width == 128 && height == 128)) {
+        return Err("皮肤图要 64×32、64×64 或 128×128。".into());
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image
+        .to_rgba8()
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| format!("皮肤编码失败：{error}"))?;
+    Ok(data_url(&png.into_inner()))
+}
+
+/// 读一张披风贴图：原版披风是 64×32，个别老资源是 22×17，两种都收。
+pub fn local_cape(path: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("读不到这个文件：{error}"))?;
+    let image = image::load_from_memory(&bytes).map_err(|error| format!("这看起来不是图片：{error}"))?;
+    let (width, height) = (image.width(), image.height());
+    if !((width == 64 && height == 32) || (width == 22 && height == 17) || (width == 64 && height == 64)) {
+        return Err("披风图要是 64×32（老资源 22×17 也行）。".into());
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image
+        .to_rgba8()
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| format!("披风编码失败：{error}"))?;
+    Ok(data_url(&png.into_inner()))
+}
+
+/// 把名字塞进 URL 路径：中文得转成 UTF-8 百分号编码。
+fn escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// LittleSkin 按用户名取皮肤：返回 (dataUrl, `slim` 或 `classic`)。
+pub fn littleskin_skin(name: &str) -> Result<(String, String), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("先填 LittleSkin 的用户名。".into());
+    }
+    let url = format!("https://littleskin.cn/csl/{}.json", escape(name));
+    let text = client()
+        .get(&url)
+        .send()
+        .and_then(|response| response.text())
+        .map_err(|error| format!("查不到这个皮肤：{error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "LittleSkin 返回的东西看不懂。".to_string())?;
+    let skins = value["skins"].as_object();
+    let (hash, model) = match skins {
+        Some(skins) => {
+            if let Some(slim) = skins.get("slim").and_then(|item| item.as_str()) {
+                (slim.to_owned(), "slim")
+            } else if let Some(fallback) = skins.get("default").and_then(|item| item.as_str()) {
+                (fallback.to_owned(), "classic")
+            } else if let Some(any) = skins.values().find_map(|item| item.as_str()) {
+                (any.to_owned(), "classic")
+            } else {
+                return Err("这个玩家在 LittleSkin 上没有皮肤。".into());
+            }
+        }
+        None => return Err("这个玩家在 LittleSkin 上没有皮肤。".into()),
+    };
+    let png = fetch_image(&format!("https://littleskin.cn/csl/textures/{hash}"))?;
+    Ok((data_url(&png), model.to_string()))
+}
+
+/// PNG 字节 → `data:image/png;base64,…`，账号页和启动参数都直接吃这个字符串。
+pub(crate) fn data_url(png: &[u8]) -> String {
     use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-    Ok(Some(format!("data:image/png;base64,{encoded}")))
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png)
+    )
+}
+
+/// 把皮肤裁成头像：取头部正面 8×8，再叠上帽子层，放大成 64×64。
+pub(crate) fn head_avatar(url: &str) -> Result<Option<String>, String> {
+    Ok(head_avatar_png(&fetch_image(url)?))
+}
+
+pub(crate) fn head_avatar_png(png: &[u8]) -> Option<String> {
+    let image = image::load_from_memory(png).ok()?;
+    let head = head_image(&image.to_rgba8())?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    head.write_to(&mut encoded, image::ImageFormat::Png).ok()?;
+    Some(data_url(encoded.get_ref()))
 }
 
 /// 从皮肤里裁出 64×64 的头像：头部正面 8×8 叠上帽子层，再按最近邻放大。
@@ -840,7 +1212,7 @@ mod dpapi {
 }
 
 /// 刷新令牌写盘前用 DPAPI 包一层；解不开就当没有（让用户重新登录）。
-fn protect(plain: &str) -> Option<String> {
+pub fn protect(plain: &str) -> Option<String> {
     use base64::Engine;
     #[cfg(windows)]
     {
@@ -857,7 +1229,7 @@ fn protect(plain: &str) -> Option<String> {
     }
 }
 
-fn unprotect(stored: &str) -> Option<String> {
+pub fn unprotect(stored: &str) -> Option<String> {
     use base64::Engine;
     let encoded = stored.strip_prefix("dpapi:").unwrap_or(stored);
     let bytes = base64::engine::general_purpose::STANDARD
@@ -904,19 +1276,62 @@ mod tests {
 
     #[test]
     fn names_follow_minecraft_rules() {
+        // 短名、中文、符号都放行；空格、控制字符和超长才拒绝。
         assert!(normalize_name("Steve_1").is_ok());
-        assert!(normalize_name("ab").is_err());
+        assert!(normalize_name("ab").is_ok());
+        assert!(normalize_name("中文名").is_ok());
         assert!(normalize_name("bad name").is_err());
-        assert!(normalize_name("中文名").is_err());
+        assert!(normalize_name("bad	name").is_err());
         assert!(normalize_name("abcdefghijklmnopq").is_err());
+    }
+
+    #[test]
+    fn custom_uuid_is_normalized_and_kept_on_rename() {
+        assert_eq!(
+            parse_uuid("0123456789ABCDEF0123456789ABCDEF").unwrap(),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert!(parse_uuid("hello").is_err());
+        let mut store = Store::default();
+        let id = store
+            .add_offline("Steve", Some("01234567-89ab-cdef-0123-456789abcdef"))
+            .unwrap();
+        store.rename(&id, "Alex").unwrap();
+        let player = store.players.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(player.name, "Alex");
+        assert_eq!(player.uuid, "01234567-89ab-cdef-0123-456789abcdef");
+    }
+
+    #[test]
+    fn offline_skin_can_be_set_and_cleared() {
+        let mut store = Store::default();
+        let id = store.add_offline("Steve", None).unwrap();
+        store
+            .set_offline_look(
+                &id,
+                Some("data:image/png;base64,AA==".into()),
+                Some("slim".into()),
+                Some("alex".into()),
+                Some("data:image/png;base64,BB==".into()),
+                Some("migrator".into()),
+            )
+            .unwrap();
+        let player = store.players.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(player.skin_model.as_deref(), Some("slim"));
+        assert_eq!(player.skin_official.as_deref(), Some("alex"));
+        assert_eq!(player.cape_official.as_deref(), Some("migrator"));
+        store.set_offline_look(&id, None, None, None, None, None).unwrap();
+        let player = store.players.iter().find(|item| item.id == id).unwrap();
+        assert!(player.skin.is_none());
+        assert!(player.cape.is_none());
     }
 
     #[test]
     fn store_round_trips_and_keeps_current() {
         let dir = temp_dir("store");
         let mut store = Store::default();
-        let steve = store.add_offline("Steve").unwrap();
-        let alex = store.add_offline("Alex").unwrap();
+        let steve = store.add_offline("Steve", None).unwrap();
+        let alex = store.add_offline("Alex", None).unwrap();
         assert_eq!(store.current.as_deref(), Some(alex.as_str()));
         store.select(&steve).unwrap();
         store.save(&dir).unwrap();
@@ -930,15 +1345,16 @@ mod tests {
         loaded.rename(&steve, "Steve_2").unwrap();
         assert_eq!(loaded.current().unwrap().name, "Steve_2");
         loaded.remove(&steve);
-        assert_eq!(loaded.current.as_deref(), Some(alex.as_str()));
+        // 删掉当前账户 = 回到未登录，不自动选下一个。
+        assert_eq!(loaded.current.as_deref(), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn duplicate_offline_names_are_rejected() {
         let mut store = Store::default();
-        store.add_offline("Steve").unwrap();
-        assert!(store.add_offline("steve").is_err());
+        store.add_offline("Steve", None).unwrap();
+        assert!(store.add_offline("steve", None).is_err());
     }
 
     #[test]

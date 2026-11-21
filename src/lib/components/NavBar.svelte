@@ -1,15 +1,19 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { page } from "$app/state";
-  import { api } from "$lib/api";
+  import { OFFICIAL_SKINS } from "$lib/official-skins";
+  import { api, onGameCrash } from "$lib/api";
+  import { showCrash } from "$lib/dialogs.svelte";
   import Logo from "./Logo.svelte";
+  import HeadAvatar from "./HeadAvatar.svelte";
   import Island from "./Island.svelte";
   import TaskRing from "./TaskRing.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
   import JavaChoiceDialog from "./JavaChoiceDialog.svelte";
-  import avatarOffline from "$lib/assets/avatar-offline.png";
+  import type { Account } from "$lib/api";
   import { settingsLive } from "$lib/settings-live.svelte";
-  import { canGoBackPage, goBackPage, rememberPage } from "$lib/page-history.svelte";
+  import { backBlocked, canGoBackPage, goBackPage, rememberPage } from "$lib/page-history.svelte";
+  import { errorDialog, javaPrompt } from "$lib/dialogs.svelte";
 
   const items = [
     { href: "/", label: "主页" },
@@ -23,6 +27,9 @@
   ];
 
   let username = $state("Steve");
+  /// 当前选中的账户：头像、名字、登录方式都跟着它走。
+  let me = $state<Account | null>(null);
+  let servers = $state<{ url: string; name: string }[]>([]);
   /// 药丸滑动的时长（毫秒）；0 表示直接跳位，不做动画。
   let slideMs = $state(220);
   let linksEl = $state<HTMLDivElement | null>(null);
@@ -56,6 +63,48 @@
     return href === "/" ? path === "/" : path.startsWith(href);
   }
 
+  /// 顶栏那个头像框：读账户表，账户页改了会广播一次。
+  async function loadMe() {
+    const view = await api.listAccounts().catch(() => null);
+    if (!view) return;
+    servers = view.servers.map((server) => ({ url: server.url, name: server.name }));
+    // 只有「选中了某个账户」才显示它的头像；取消选择后要回到未登录，
+    // 不能退到 players[0]（那会让顶栏一直挂着第一个账户）。
+    me = view.current
+      ? (view.players.find((player) => player.id === view.current) ?? null)
+      : null;
+  }
+
+  $effect(() => {
+    const handler = () => void loadMe();
+    void loadMe();
+    window.addEventListener("ybmcl:accounts", handler);
+    return () => window.removeEventListener("ybmcl:accounts", handler);
+  });
+
+  /// 顶栏头像用哪张皮肤：账户自己的皮肤，没有就退回原版 Steve（粗臂）。
+  ///
+  /// 离线账户通常没有独立皮肤，直接按 `avatar`/`skin` 取会掉到字母占位，
+  /// 和下面账户卡片里那张立体皮肤对不上，所以这里统一给一张底图。
+  const headSkin = $derived.by(() => {
+    const account = me;
+    if (!account) return null;
+    if (account.skin) return account.skin;
+    return account.skinModel === "slim" ? OFFICIAL_SKINS[0].slim : OFFICIAL_SKINS[0].wide;
+  });
+
+  /// 当前账户的登录方式：第三方服务器显示服务器名。
+  const meKind = $derived.by(() => {
+    const account = me;
+    if (!account) return "离线账户";
+    if (account.kind === "microsoft") return "微软账户";
+    if (account.kind === "thirdparty") {
+      const server = servers.find((item) => item.url === account.server);
+      return server?.name ?? "第三方账户";
+    }
+    return "离线账户";
+  });
+
   // 账户页改完名字回到主页要立刻反映；设置页保存后也要立刻生效，所以跟着这两件事重读设置。
   $effect(() => {
     settingsLive.version;
@@ -77,7 +126,7 @@
 
   /// 路由一变就把当前页记进返回栈，供「跨页面返回」用。
   $effect(() => {
-    rememberPage(page.url.pathname);
+    rememberPage(`${page.url.pathname}${page.url.search}`);
   });
 
   /// Esc / Alt+← 跨页面返回。
@@ -85,8 +134,10 @@
   /// 页面自己那几层（下载任务面板、右侧详情）在捕获阶段就 `preventDefault` 了，
   /// 这里放在冒泡阶段读 `defaultPrevented`，被页面处理过就不插手。
   function onGlobalKey(event: KeyboardEvent) {
+    // 有弹窗时 Esc 归弹窗，不在这里翻页。
+    const modal = errorDialog.value !== null || javaPrompt.value !== null;
     if (event.key === "Escape" && !event.defaultPrevented) {
-      if (!canGoBackPage()) return;
+      if (modal || backBlocked() || !canGoBackPage()) return;
       event.preventDefault();
       void goBackPage();
       return;
@@ -104,9 +155,15 @@
     if (linksEl) observer.observe(linksEl);
     void document.fonts?.ready.then(() => measurePill());
     window.addEventListener("keydown", onGlobalKey);
+    // 游戏非正常退出时弹诊断窗，不管用户当前在哪个页面。
+    let stopCrash: (() => void) | null = null;
+    void onGameCrash((event) => showCrash(event.versionId, event.code, event.hits)).then((off) => {
+      stopCrash = off;
+    });
     return () => {
       observer.disconnect();
       window.removeEventListener("keydown", onGlobalKey);
+      stopCrash?.();
     };
   });
 </script>
@@ -142,12 +199,24 @@
     <Island />
   </div>
 
-  <a class="account" href="/accounts" title="账户设置">
-    <img class="head" src={avatarOffline} alt="" />
-    <span class="who">
-      <strong>{username}</strong>
-      <small>离线账户</small>
-    </span>
+  <a
+    class="account"
+    class:signed-out={!me}
+    href="/accounts"
+    title={me ? "账户设置" : "未登录，点这里添加账户"}
+  >
+    {#if me}
+      <HeadAvatar skin={headSkin} size={30} fallback={me.name} />
+      <span class="who">
+        <strong>{me.name}</strong>
+        <small>{meKind}</small>
+      </span>
+    {:else}
+      <span class="head letter guest" aria-hidden="true">?</span>
+      <span class="who">
+        <strong>未登录</strong>
+      </span>
+    {/if}
   </a>
 </nav>
 
@@ -272,11 +341,29 @@
     border-color: var(--border);
   }
   .head {
+    display: block;
     width: 30px;
     height: 30px;
-    border-radius: 8px;
+    /* 整张皮肤放大后只露出脸，多出来的部分裁掉。 */
+    overflow: hidden;
     image-rendering: pixelated;
     flex: none;
+  }
+  .head.letter.guest {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-dim);
+  }
+  .account.signed-out .who strong {
+    color: var(--text-dim);
+    font-weight: 520;
+  }
+  .head.letter {
+    display: grid;
+    place-items: center;
+    background: rgba(120, 220, 160, 0.18);
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 600;
   }
   .who {
     display: flex;

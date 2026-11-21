@@ -1,7 +1,7 @@
 {
   "name": "ybumcl",
   "private": true,
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "延边大学我的世界启动器 / Yanbian University Minecraft Launcher",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "prepare": "svelte-kit sync || echo ''",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "verify": "node scripts/verify.mjs",
     "tauri": "tauri",
     "desktop": "tauri dev --config apps/desktop/src-tauri/tauri.conf.json",
     "desktop:build": "tauri build --config apps/desktop/src-tauri/tauri.conf.json --no-bundle",
@@ -20,13 +21,16 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.8.4",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-opener": "^2",
+    "skinview3d": "^3.4.2",
+    "three": "^0.187.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",
     "@sveltejs/kit": "^2.65.1",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tauri-apps/cli": "^2",
+    "@types/three": "^0.187.0",
     "svelte": "^5.56.3",
     "svelte-check": "^4.6.0",
     "typescript": "~6.0.3",

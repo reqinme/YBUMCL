@@ -141,6 +141,8 @@ struct Probe {
     libraries: Vec<String>,
     client_sha1: String,
     recorded_version: Option<String>,
+    /// 我们自己在 `_ybmcl.loaders` 里记下的加载器：比从库名里猜可靠。
+    recorded_loaders: Vec<String>,
 }
 
 fn probe(instance_dir: &Path, id: &str) -> Option<Probe> {
@@ -178,11 +180,24 @@ fn probe(instance_dir: &Path, id: &str) -> Option<Probe> {
                 .and_then(|value| value.as_str())
         })
         .map(str::to_owned);
+    let recorded_loaders = json
+        .get("_ybmcl")
+        .and_then(|value| value.get("loaders"))
+        .and_then(|value| value.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| item.as_str())
+                .map(str::to_owned)
+                .filter(|name| name != "原版")
+                .collect()
+        })
+        .unwrap_or_default();
     Some(Probe {
         main_class,
         libraries,
         client_sha1,
         recorded_version,
+        recorded_loaders,
     })
 }
 
@@ -234,7 +249,11 @@ pub fn describe_all(game_dir: &Path, ids: &[String]) -> BTreeMap<String, Version
             .map(channel_of)
             .unwrap_or("unknown")
             .to_owned();
-        let mut loaders = loaders_of(&found.main_class, &found.libraries);
+        let mut loaders = if found.recorded_loaders.is_empty() {
+            loaders_of(&found.main_class, &found.libraries)
+        } else {
+            found.recorded_loaders.clone()
+        };
         for extra in name_loaders(id) {
             if !loaders.iter().any(|name| name == extra) {
                 if loaders.len() == 1 && loaders[0] == "原版" {

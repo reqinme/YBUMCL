@@ -973,18 +973,25 @@ fn vanilla_java_baseline_follows_the_game_version() {
     assert_eq!(requirement("1.18.2", &plain).range.min, 17);
     assert_eq!(requirement("1.21.1", &plain).range.min, 21);
     assert_eq!(requirement("1.20.4", &plain).range.min, 17);
-    assert_eq!(requirement("26.3", &plain).range.min, 21);
+    // 26.1 起换年份版本号，最低 Java 25（PCL 的分段表同此）。
+    assert_eq!(requirement("26.3", &plain).range.min, 25);
     assert!(requirement("1.21.1", &plain).accepts(25));
     assert!(!requirement("1.21.1", &plain).accepts(17));
 
     let declared = json!({"id":"x","mainClass":"net.minecraft.client.main.Main","libraries":[],"javaVersion":{"majorVersion":25}});
     let JavaRequirement { range, .. } = requirement("26.3", &declared);
     assert_eq!(range.min, 25);
-    assert!(!JavaRequirement {
-        range,
-        majors: None
-    }
-    .accepts(21));
+    assert!(!requirement("26.3", &declared).accepts(21));
+    // json 声明的运行时组件要能带出来：自动下载 Java 时靠它挑对版本。
+    assert_eq!(
+        requirement("26.3", &declared).component.as_deref(),
+        None
+    );
+    let with_component = json!({"id":"x","libraries":[],"javaVersion":{"majorVersion":25,"component":"java-runtime-epsilon"}});
+    assert_eq!(
+        requirement("26.3", &with_component).component.as_deref(),
+        Some("java-runtime-epsilon")
+    );
 }
 
 #[test]
@@ -1183,6 +1190,155 @@ fn merged_version_drops_inheritance_and_renames_the_instance() {
         merged["mainClass"],
         "cpw.mods.bootstraplauncher.BootstrapLauncher"
     );
+}
+
+#[test]
+fn instances_need_a_loader_and_a_distinct_name() {
+    let f = Fixture::new();
+    f.version(
+        "1.21.1",
+        json!({
+            "id": "1.21.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "libraries": [{"name": "net.minecraft:client:1.21.1"}],
+            "arguments": {"jvm": [], "game": []}
+        }),
+    );
+    // 实例名和原版同名：inheritsFrom 会指向自己。
+    let parts = vec![crate::merge::LoaderPart {
+        kind: crate::merge::LoaderKind::Fabric,
+        version: "0.20.1".into(),
+        version_id: "1.21.1-fabric-loader-0.20.1".into(),
+    }];
+    let same = crate::merge::write_instance(&f.root, "1.21.1", &parts, "1.21.1", false, "1.21.1").unwrap_err();
+    assert!(same.to_string().contains("不能和版本名相同"), "{same}");
+    // 没有自己的库、只继承一份完整 profile（LabyMod）是合法的。
+    let inherited = crate::merge::write_instance(&f.root, "1.21.1", &[], "1.21.1-plain", false, "1.21.1").unwrap();
+    assert_eq!(inherited["inheritsFrom"], "1.21.1");
+    assert!(inherited.get("libraries").is_none());
+    // 原版 json 没被这两次失败的调用动过。
+    let raw = fs::read_to_string(f.root.join("versions/1.21.1/1.21.1.json")).unwrap();
+    assert!(raw.contains("net.minecraft.client.main.Main"), "{raw}");
+}
+
+#[test]
+fn multi_core_instances_are_self_contained() {
+    let f = Fixture::new();
+    f.version(
+        "1.21.1",
+        json!({
+            "id": "1.21.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "libraries": [{"name": "net.minecraft:client:1.21.1"}],
+            "downloads": {"client": {"url": "https://piston-data.mojang.com/v1/objects/x/client.jar"}},
+            "assetIndex": {"id": "17"},
+            "assets": "17",
+            "arguments": {"jvm": ["-cp", "${classpath}"], "game": ["--username", "${auth_player_name}"]}
+        }),
+    );
+    f.file("versions/1.21.1/1.21.1.jar", b"client-jar");
+    f.version(
+        "1.21.1-neoforge-21.1.267",
+        json!({
+            "id": "1.21.1-neoforge-21.1.267",
+            "inheritsFrom": "1.21.1",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "libraries": [{"name": "net.neoforged:neoforge:21.1.267"}],
+            "arguments": {"jvm": ["-p", "boot.jar"], "game": ["--launchTarget", "forge_client"]}
+        }),
+    );
+    let parts = vec![crate::merge::LoaderPart {
+        kind: crate::merge::LoaderKind::NeoForge,
+        version: "21.1.267".into(),
+        version_id: "1.21.1-neoforge-21.1.267".into(),
+    }];
+    let merged =
+        crate::merge::write_instance(&f.root, "1.21.1", &parts, "1.21.1-NeoForge_21.1.267", true, "1.21.1")
+            .unwrap();
+    // 合并式：自包含，不靠 inheritsFrom；游戏版本记在 clientVersion 里（同 PCL）。
+    assert_eq!(merged["id"], "1.21.1-NeoForge_21.1.267");
+    assert!(merged.get("inheritsFrom").is_none());
+    assert!(merged.get("jar").is_none());
+    assert_eq!(merged["clientVersion"], "1.21.1");
+    assert_eq!(merged["mainClass"], "cpw.mods.bootstraplauncher.BootstrapLauncher");
+    // 原版字段（库、下载信息、资源索引）必须留下来，否则启动会缺类或缺资源。
+    let libs = merged["libraries"].as_array().unwrap();
+    assert_eq!(libs.len(), 2);
+    assert!(merged.get("downloads").is_some());
+    assert_eq!(merged["assetIndex"]["id"], "17");
+    // 原版 client jar 复制成实例自己的核心。
+    let jar = f.root.join("versions/1.21.1-NeoForge_21.1.267/1.21.1-NeoForge_21.1.267.jar");
+    assert_eq!(fs::read(&jar).unwrap(), b"client-jar");
+}
+
+#[test]
+fn modern_loader_instances_keep_inheritance() {
+    let f = Fixture::new();
+    f.version(
+        "1.21.1",
+        json!({
+            "id": "1.21.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "libraries": [{"name": "net.minecraft:client:1.21.1"}],
+            "arguments": {
+                "jvm": ["-Djava.library.path=${natives_directory}", "-cp", "${classpath}"],
+                "game": ["--username", "${auth_player_name}"]
+            }
+        }),
+    );
+    f.version(
+        "1.21.1-neoforge-21.1.267",
+        json!({
+            "id": "1.21.1-neoforge-21.1.267",
+            "inheritsFrom": "1.21.1",
+            "jar": "1.21.1",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "libraries": [
+                {"name": "net.minecraft:client:1.21.1"},
+                {"name": "net.neoforged:neoforge:21.1.267"}
+            ],
+            "arguments": {
+                "jvm": ["-Djava.library.path=${natives_directory}", "-cp", "${classpath}", "-p", "boot.jar"],
+                "game": ["--launchTarget", "forge_client"]
+            }
+        }),
+    );
+    let parts = vec![crate::merge::LoaderPart {
+        kind: crate::merge::LoaderKind::NeoForge,
+        version: "21.1.267".into(),
+        version_id: "1.21.1-neoforge-21.1.267".into(),
+    }];
+    let merged =
+        crate::merge::write_instance(&f.root, "1.21.1", &parts, "1.21.1-NeoForge_21.1.267", false, "1.21.1").unwrap();
+    assert_eq!(merged["id"], "1.21.1-NeoForge_21.1.267");
+    assert_eq!(merged["inheritsFrom"], "1.21.1");
+    assert!(merged.get("jar").is_none());
+    assert!(merged.get("downloads").is_none());
+    assert_eq!(merged["_ybmcl"]["gameVersion"], "1.21.1");
+    // 实例这一层只写加载器的参数，原版的参数留给继承解析去拼（避免重复）。
+    let game: Vec<&str> = merged["arguments"]["game"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.as_str())
+        .collect();
+    assert_eq!(game, vec!["--launchTarget", "forge_client"]);
+    let jvm: Vec<&str> = merged["arguments"]["jvm"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item.as_str())
+        .collect();
+    assert!(jvm.contains(&"-p"));
+    // 不起第二份 jar，原版目录也不动。
+    assert!(!f
+        .root
+        .join("versions/1.21.1-NeoForge_21.1.267/1.21.1-NeoForge_21.1.267.jar")
+        .exists());
+    assert!(f.root.join("versions/1.21.1/1.21.1.json").is_file());
 }
 
 #[test]
@@ -1565,12 +1721,45 @@ fn relative_library_files_reads_local_libraries() {
 }
 
 #[test]
-fn plan_chunks_covers_the_file_without_gaps() {
-    // 小于阈值不分块（阈值 2 MiB，1–2 MiB 的小文件单流反而更快）
-    assert!(download::plan_chunks(2 * 1024 * 1024 - 1).is_empty());
+fn scaffolds_move_into_the_cache_and_disappear_from_versions() {
+    let f = Fixture::new();
+    let vanilla = json!({
+        "id": "1.21.1",
+        "type": "release",
+        "mainClass": "net.minecraft.client.main.Main",
+        "libraries": [{"name": "com.example:one:1.0"}],
+        "downloads": {"client": {"url": "https://piston-data.mojang.com/v1/objects/x/client.jar"}},
+        "assetIndex": {"id": "17"}
+    });
+    f.version("1.21.1", vanilla);
+    f.file("versions/1.21.1/1.21.1.jar", b"client-jar");
+    f.version(
+        "1.21.1-NeoForge_21.1.267",
+        json!({
+            "id": "1.21.1-NeoForge_21.1.267",
+            "clientVersion": "1.21.1",
+            "_ybmcl": {"gameVersion": "1.21.1", "loaders": [{"loader": "neoforge", "version": "21.1.267"}]},
+            "libraries": [],
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher"
+        }),
+    );
+    let moved = crate::merge::migrate_scaffolds(&f.root).unwrap();
+    assert_eq!(moved, vec!["1.21.1".to_string()]);
+    assert!(!f.root.join("versions/1.21.1").exists());
+    let cached = crate::merge::scaffold_dir(&f.root, "1.21.1");
+    assert!(cached.join("1.21.1.json").is_file());
+    assert!(cached.join("1.21.1.jar").is_file());
+    // 已经搬过一次就不再搬。
+    assert!(crate::merge::migrate_scaffolds(&f.root).unwrap().is_empty());
+}
 
-    // 3 MiB 切成两块
-    let small = 3 * 1024 * 1024;
+#[test]
+fn plan_chunks_covers_the_file_without_gaps() {
+    // 小于阈值不分块（阈值 4 MiB，小文件单流反而更快）
+    assert!(download::plan_chunks(4 * 1024 * 1024 - 1).is_empty());
+
+    // 5 MiB 切成两块
+    let small = 5 * 1024 * 1024;
     let small_chunks = download::plan_chunks(small);
     assert!(small_chunks.len() >= 2);
     assert_eq!(small_chunks[0].0, 0);
@@ -1661,6 +1850,7 @@ fn unchanged_instance_reinstall_is_a_no_op() {
         java_path: None,
         strategy: Default::default(),
         threads: None,
+        cache_roots: Vec::new(),
         overwrite: true,
     };
     let summary = crate::instance::install_instance(
@@ -1684,6 +1874,8 @@ fn modlauncher_entry_points_are_allowed() {
     assert!(supported_main("cpw.mods.modlauncher.Launcher"));
     assert!(supported_main("net.neoforged.modlauncher.Launcher"));
     assert!(supported_main("cpw.mods.bootstraplauncher.BootstrapLauncher"));
+    // NeoForge 26.x 把入口挪到了 fml 的启动类。
+    assert!(supported_main("net.neoforged.fml.startup.Client"));
     assert!(supported_main("net.minecraft.launchwrapper.Launch"));
     assert!(!supported_main("com.example.Evil"));
 }

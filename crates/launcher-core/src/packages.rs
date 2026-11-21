@@ -159,6 +159,7 @@ fn loader_installer(
         java_path: String::new(),
         strategy: download::DownloadStrategy::default(),
         threads: None,
+        cache_roots: Vec::new(),
     };
     let url = modloader::installer_download(&request).map_err(dl)?;
     Ok(file_from_url(&url, "installer.jar"))

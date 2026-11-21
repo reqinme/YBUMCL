@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     quilt_loader: None,
                     strategy: launcher_core::download::DownloadStrategy::default(),
                     threads: None,
+                    cache_roots: Vec::new(),
                 },
                 CancellationToken::default(),
                 |progress| {

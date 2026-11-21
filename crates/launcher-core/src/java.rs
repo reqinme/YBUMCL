@@ -51,9 +51,35 @@ impl JavaRange {
 pub struct JavaRequirement {
     pub range: JavaRange,
     pub majors: Option<Vec<u32>>,
+    /// 版本 json 声明的运行时组件（`java-runtime-epsilon` 这类）。挑本机 Java
+    /// 用不上它，但「自动」要下载 Java 时它就是唯一正确的目标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    /// 软上限：高于它的 Java 仍能选，但排序时排在满足的后面。
+    ///
+    /// 这些是「推荐上限」而不是硬规则（现代 Forge 遇到太新的 JDK 常报
+    /// `Unsupported JVM module path`），硬写成排除会把唯一能用的 Java 判死。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_max: Option<u32>,
 }
 
 impl JavaRequirement {
+    /// 高出软上限就记一次违规（不排除，只降权）。
+    pub fn soft_penalty(&self, major: u32) -> u32 {
+        match self.soft_max {
+            Some(cap) if major > cap => 1,
+            _ => 0,
+        }
+    }
+
+    /// 满足区间时返回「比下限高出几档主版本」，越小越贴近版本真正需要的那一档。
+    pub fn slack(&self, major: u32) -> Option<u32> {
+        if !self.accepts(major) {
+            return None;
+        }
+        Some(major.saturating_sub(self.range.min))
+    }
+
     pub fn accepts(&self, major: u32) -> bool {
         match &self.majors {
             Some(majors) => majors.contains(&major),
@@ -110,7 +136,8 @@ fn base_range(game: &str) -> JavaRange {
         return range;
     };
     if first >= 2 {
-        range.at_least(21);
+        // 26.1 起换成年份版本号，最低 Java 25（PCL 的分段表同此）。
+        range.at_least(25);
         return range;
     }
     let minor = parts.get(1).copied().unwrap_or(0);
@@ -134,7 +161,7 @@ fn base_range(game: &str) -> JavaRange {
 /// 只有 `majorVersion >= 22` 才当硬下限——PCL 同样只在这个区间信任 json
 /// （见 `pcl_ModLaunch.vb`：`JavaVersion.Major >= 22` 时才 `MinVersion` 跟随）。
 /// 1.13–1.21 的 json 常写着 8，照着抬会把「1.7.10/1.12.2 用 Java 7 也行」判死。
-fn declared_json(value: &Value, range: &mut JavaRange) {
+fn declared_json(value: &Value, range: &mut JavaRange) -> Option<String> {
     if let Some(major) = value
         .get("javaVersion")
         .and_then(|java| java.get("majorVersion"))
@@ -143,11 +170,17 @@ fn declared_json(value: &Value, range: &mut JavaRange) {
     {
         if major >= 22 {
             range.at_least(major);
+            return value
+                .get("javaVersion")
+                .and_then(|java| java.get("component"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
         }
     }
+    None
 }
 
-fn forge_range(game: &str, forge: &str, range: &mut JavaRange) {
+fn forge_range(game: &str, forge: &str, range: &mut JavaRange, soft_max: &mut Option<u32>) {
     let parts = numeric(game);
     let minor = parts.get(1).copied().unwrap_or(0);
     // 1.7.10 的 Forge 既能跑 Java 7 也能跑 Java 8（安装器自己写的
@@ -174,14 +207,33 @@ fn forge_range(game: &str, forge: &str, range: &mut JavaRange) {
         16 => {
             let build = numeric(forge).get(1).copied().unwrap_or(0);
             if (34..=36).contains(&build) {
-                range.at_most(8);
+                if build <= 36 {
+                    // 34.0.0–36.2.25 里有一批在 Java 9+ 上直接崩，这条保留硬上限。
+                    range.at_most(8);
+                }
             }
         }
         _ => {}
     }
+    // 现代 Forge 带 OptiFine 或 45.0.66–47.4.8：官方文档建议不超过 21，但 22–25
+    // 通常也能起，只降权不排除。
+    if minor >= 18 && forge.starts_with("4") {
+        let build = numeric(forge).first().copied().unwrap_or(0);
+        if (45..=47).contains(&build) {
+            soften(soft_max, 21);
+        }
+    }
+    if minor >= 18 {
+        soften(soft_max, 23);
+    }
 }
 
-fn optifine_range(game: &str, range: &mut JavaRange) {
+/// 记录一个软上限，多条规则取最严格的那条。
+fn soften(soft_max: &mut Option<u32>, cap: u32) {
+    *soft_max = Some(soft_max.map_or(cap, |value| value.min(cap)));
+}
+
+fn optifine_range(game: &str, range: &mut JavaRange, soft_max: &mut Option<u32>) {
     let minor = numeric(game).get(1).copied().unwrap_or(0);
     if minor < 7 {
         range.at_most(8);
@@ -190,7 +242,7 @@ fn optifine_range(game: &str, range: &mut JavaRange) {
     } else if minor == 12 {
         range.at_most(8);
     } else if minor == 18 {
-        range.at_most(18);
+        soften(soft_max, 18);
     }
 }
 
@@ -215,6 +267,7 @@ fn cleanroom_range(version: &str, range: &mut JavaRange) {
 #[derive(Debug, Default)]
 pub struct LoaderPresence<'a> {
     pub forge: Option<&'a str>,
+    pub neoforge: Option<&'a str>,
     pub cleanroom: Option<&'a str>,
     pub fabric: bool,
     pub liteloader: bool,
@@ -254,11 +307,10 @@ impl<'a> LoaderPresence<'a> {
             if lower.contains("net.minecraftforge:forge:") {
                 presence.forge.get_or_insert_with(|| maven_version(name));
             }
-            if let Some(version) = name.strip_prefix("net.neoforged:neoforge:") {
-                presence.forge.get_or_insert(version);
-            }
-            if let Some(version) = name.strip_prefix("net.neoforged:forge:") {
-                presence.forge.get_or_insert(version);
+            if lower.starts_with("net.neoforged:") {
+                presence
+                    .neoforge
+                    .get_or_insert_with(|| maven_version(name));
             }
         }
         presence
@@ -281,14 +333,22 @@ pub fn requirement_with(
     loaders: &LoaderPresence<'_>,
 ) -> JavaRequirement {
     let mut range = base_range(game);
+    let mut component = None;
+    let mut soft_max = None;
     if let Some(value) = value {
-        declared_json(value, &mut range);
+        component = declared_json(value, &mut range);
     }
     if let Some(forge) = loaders.forge {
-        forge_range(game, forge, &mut range);
+        forge_range(game, forge, &mut range, &mut soft_max);
+    }
+    if let Some(neoforge) = loaders.neoforge {
+        // 1.20.1 的 NeoForge 官方建议 ≤21（22+ 的模块检查改动会炸），但 22 也能起。
+        if game.starts_with("1.20.1") || numeric(neoforge).get(1).copied().unwrap_or(0) <= 20 {
+            soften(&mut soft_max, 21);
+        }
     }
     if loaders.optifine {
-        optifine_range(game, &mut range);
+        optifine_range(game, &mut range, &mut soft_max);
     }
     if loaders.fabric {
         fabric_range(game, &mut range);
@@ -300,6 +360,7 @@ pub fn requirement_with(
         cleanroom_range(cleanroom, &mut range);
     }
 
+    // 硬区间被软规则挤空时（例如老版本 json 写着 8、加载器建议 ≤7），以硬区间为准。
     let majors = value
         .and_then(|value| value.get("compatibleJavaMajors"))
         .and_then(Value::as_array)
@@ -323,7 +384,13 @@ pub fn requirement_with(
     if range.max < range.min {
         range.max = OPEN_MAX;
     }
-    JavaRequirement { range, majors }
+    let soft_max = soft_max.filter(|cap| *cap >= range.min);
+    JavaRequirement {
+        range,
+        majors,
+        component,
+        soft_max,
+    }
 }
 
 /// 读游戏目录里某个版本的 json（含继承合并）判断它要什么 Java。

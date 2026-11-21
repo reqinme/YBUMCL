@@ -45,24 +45,121 @@ pub struct GameSnapshot {
     pub logs: Vec<LogLine>,
 }
 
-#[derive(Default)]
-pub struct Session {
+/// 一次启动。同一实例可以同时开多份（PCL 也不拦），所以按「启动」而不是按实例名存。
+pub struct Run {
+    pub id: u64,
+    pub version_id: String,
     child: Option<Child>,
+    pid: Option<u32>,
     logs: VecDeque<LogLine>,
     last_exit: Option<i32>,
+    /// 这次启动的落盘日志；进程一起就只能追加，别的地方不动它。
+    log: Option<crate::runlog::RunLog>,
+    /// 用户点了「结束实例」：之后的非零退出码不算崩溃。
+    stopped: bool,
+}
+
+impl Run {
+    fn new(id: u64, version_id: String) -> Self {
+        Self {
+            id,
+            version_id,
+            child: None,
+            pid: None,
+            logs: VecDeque::new(),
+            last_exit: None,
+            log: None,
+            stopped: false,
+        }
+    }
+}
+
+/// 所有启动 + 最近一次启动的编号（`game_snapshot` 不带参数时用它）。
+#[derive(Default)]
+pub struct Sessions {
+    runs: std::collections::HashMap<u64, Run>,
+    next_id: u64,
+    last: Option<u64>,
+}
+
+impl Sessions {
+    /// 开一次新启动，先登记版本名，进程起来之后再挂上 child。
+    fn begin(&mut self, version_id: &str) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.runs.insert(id, Run::new(id, version_id.to_owned()));
+        self.last = Some(id);
+        self.prune();
+        id
+    }
+
+    fn running(&self) -> usize {
+        self.runs.values().filter(|run| run.child.is_some()).count()
+    }
+
+    /// 已结束的启动只留最近 20 条，避免长时间挂机越攒越多。
+    fn prune(&mut self) {
+        let mut finished: Vec<u64> = self
+            .runs
+            .values()
+            .filter(|run| run.child.is_none())
+            .map(|run| run.id)
+            .collect();
+        if finished.len() <= 20 {
+            return;
+        }
+        finished.sort_unstable();
+        let drop_count = finished.len() - 20;
+        for id in finished.into_iter().take(drop_count) {
+            self.runs.remove(&id);
+            if self.last == Some(id) {
+                self.last = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default)]
-pub struct GameRuntime(pub Arc<Mutex<Session>>);
+pub struct GameRuntime(pub Arc<Mutex<Sessions>>);
 
-fn publish(app: &AppHandle, runtime: &GameRuntime, line: LogLine) {
-    if let Ok(mut session) = runtime.0.lock() {
-        session.logs.push_back(line.clone());
-        while session.logs.len() > MAX_LOG_LINES {
-            session.logs.pop_front();
+/// 崩溃分析用的上下文：读游戏自己的 latest.log 尾部（有就带上）。
+fn crash_tail(game_dir: &str, version_id: &str) -> Vec<String> {
+    let path = std::path::Path::new(game_dir)
+        .join("versions")
+        .join(version_id)
+        .join("logs")
+        .join("latest.log");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(300);
+    lines[start..]
+        .iter()
+        .map(|line| format!("[latest.log] {line}"))
+        .collect()
+}
+
+fn publish(app: &AppHandle, runtime: &GameRuntime, run_id: u64, line: LogLine) {
+    let mut version_id = String::new();
+    if let Ok(mut sessions) = runtime.0.lock() {
+        if let Some(run) = sessions.runs.get_mut(&run_id) {
+            version_id = run.version_id.clone();
+            if let Some(log) = run.log.as_mut() {
+                log.push(&line.stream, &line.text);
+            }
+            run.logs.push_back(line.clone());
+            while run.logs.len() > MAX_LOG_LINES {
+                run.logs.pop_front();
+            }
         }
     }
-    let _ = app.emit("game-log", &line);
+    let mut payload = serde_json::to_value(&line).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("runId".into(), serde_json::json!(run_id));
+        object.insert("versionId".into(), serde_json::Value::String(version_id));
+    }
+    let _ = app.emit("game-log", &payload);
 }
 
 // ------------------------------------------------------------ 版本（即实例）
@@ -97,6 +194,12 @@ pub struct VersionView {
     pub icon: String,
     /// 启动次数。
     pub launches: u64,
+    /// 安装时间（unix 秒），排序「默认顺序」用；老实例回落到目录创建时间。
+    #[serde(default)]
+    pub installed_at: Option<u64>,
+    /// 最近一次启动时间（`logs/runs/index.json` 里的 `started`），没启动过是 None。
+    #[serde(default)]
+    pub last_started: Option<String>,
     /// 整合包信息；手动装的实例是 None。
     pub pack: Option<crate::versions::PackInfo>,
     /// 内存分配方式：0 自动、1 自定义、2 跟随全局。
@@ -176,6 +279,9 @@ fn loaders_from_libraries(json: &serde_json::Value) -> Vec<launcher_core::instan
             ("org.quiltmc", "quilt-loader") => "quilt",
             ("com.mumfrey", "liteloader") => "liteloader",
             ("com.cleanroommc", "cleanroom") => "cleanroom",
+            // LabyMod 的库全在 `net.labymod` 下面，没有单独的「加载器」坐标，
+            // 版本号只能从安装时记下的 `_ybmcl.loaders` 里取。
+            ("net.labymod", _) => "labymod",
             (_, "optifine") | (_, "OptiFine") => "optifine",
             // NeoForge 20.2+ 把 FML 拆到了 net.neoforged.fancymodloader，
             // 主组 net.neoforged 下还挂着 bus/coremods/accesstransformers 这些，靠它认。
@@ -214,12 +320,28 @@ fn loaders_from_libraries(json: &serde_json::Value) -> Vec<launcher_core::instan
                 version = found;
             }
         }
+        // LabyMod 的库版本号是各个子库自己的（dnsjava 4.0.0 之类），不是加载器版本。
+        if loader == "labymod" {
+            version = recorded_loader_version(json, "labymod").unwrap_or_default();
+        }
         out.push(launcher_core::instance::LoaderChoice {
             loader: loader.to_owned(),
             version,
         });
     }
     out
+}
+
+/// 安装时记在实例 json 里的加载器版本（`_ybmcl.loaders[].version`）。
+fn recorded_loader_version(json: &serde_json::Value, loader: &str) -> Option<String> {
+    json.get("_ybmcl")?
+        .get("loaders")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("loader").and_then(|value| value.as_str()) == Some(loader))?
+        .get("version")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// 从 `arguments.game` 里取 `--flag value` 形式的参数值。
@@ -254,6 +376,16 @@ fn version_dir(game_dir: &Path, id: &str) -> Result<PathBuf, String> {
     Ok(versions_root(game_dir).join(id))
 }
 
+/// 记下当前目录的版本排序方式（每个文件夹各存一份）。
+#[tauri::command]
+pub fn set_version_order(
+    paths: State<'_, Paths>,
+    order: String,
+) -> Result<crate::categories::CategorySnapshot, String> {
+    let game_dir = crate::game_folders::current(&paths);
+    crate::categories::set_order(&paths.data_dir(), &game_dir.to_string_lossy(), &order)
+}
+
 #[tauri::command]
 pub async fn list_versions(
     paths: State<'_, Paths>,
@@ -261,14 +393,24 @@ pub async fn list_versions(
 ) -> Result<Vec<VersionView>, String> {
     let game_dir = crate::game_folders::current(&paths);
     let data_dir = paths.data_dir().to_owned();
+    let log_dir = paths.log_dir();
     let running = runtime
         .0
         .lock()
-        .map(|session| session.child.is_some())
+        .map(|sessions| sessions.running() > 0)
         .unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let _ = running;
-        versions_cached(&game_dir, &data_dir)
+        let mut views = versions_cached(&game_dir, &data_dir)?;
+        // 「最近启动」排序要的时间不在版本缓存里（它来自启动记录），每次列表都现填。
+        let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for run in crate::runlog::history(&log_dir, 500) {
+            latest.entry(run.version_id).or_insert(run.started);
+        }
+        for view in &mut views {
+            view.last_started = latest.get(&view.id).cloned();
+        }
+        Ok(views)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -297,6 +439,28 @@ pub fn warm_instance_cache(game_dir: &Path, data_dir: &Path) {
 }
 
 /// 真正扫一遍所有实例，拼出列表页 / 实例页概述要的那份数据。
+/// 实例的安装时间：优先读 json 里 `_ybmcl.installedAt`，老实例用目录创建时间兜底。
+fn installed_at_of(game_dir: &Path, id: &str) -> Option<u64> {
+    let folder = game_dir.join("versions").join(id);
+    let json = folder.join(format!("{id}.json"));
+    if let Ok(bytes) = std::fs::read(&json) {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(stamp) = value
+                .get("_ybmcl")
+                .and_then(|meta| meta.get("installedAt"))
+                .and_then(serde_json::Value::as_u64)
+            {
+                return Some(stamp);
+            }
+        }
+    }
+    std::fs::metadata(&folder)
+        .and_then(|meta| meta.created())
+        .ok()
+        .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs())
+}
+
 fn collect_views(game_dir: &Path, data_dir: &Path) -> Result<Vec<VersionView>, String> {
     {
         let game_dir = game_dir.to_path_buf();
@@ -332,6 +496,7 @@ fn collect_views(game_dir: &Path, data_dir: &Path) -> Result<Vec<VersionView>, S
                 };
             let category_key = version.id.clone();
             let loaders_detail = instance_loader_choices(&game_dir.to_string_lossy(), &version.id);
+            let installed_at = installed_at_of(&game_dir, &version.id);
             out.push(VersionView {
                 id: version.id,
                 kind: version.kind,
@@ -353,6 +518,8 @@ fn collect_views(game_dir: &Path, data_dir: &Path) -> Result<Vec<VersionView>, S
                 description: settings.description.clone(),
                 icon: settings.icon.clone(),
                 launches: settings.launches,
+                installed_at,
+                last_started: None,
                 pack: settings.pack.clone(),
                 memory_type: settings.memory_type,
                 memory_custom_mb: settings.memory_custom_mb,
@@ -906,6 +1073,33 @@ fn launch_request(
     } else {
         None
     };
+    // 离线账户带皮肤时，启动时要起本地 Yggdrasil 并注入 authlib-injector。
+    let offline = account
+        .as_ref()
+        .is_some_and(|player| player.kind == launcher_core::auth::AccountKind::Offline);
+    let offline_skin = account
+        .as_ref()
+        .filter(|player| player.kind == launcher_core::auth::AccountKind::Offline)
+        .and_then(|player| player.skin.clone());
+    let offline_skin_model = account
+        .as_ref()
+        .filter(|player| player.kind == launcher_core::auth::AccountKind::Offline)
+        .and_then(|player| player.skin_model.clone());
+    let offline_cape = account
+        .as_ref()
+        .filter(|player| player.kind == launcher_core::auth::AccountKind::Offline)
+        .and_then(|player| player.cape.clone());
+    let authlib_jar = if offline && offline_skin.is_some() {
+        launcher_core::authlib::ensure_jar(paths.data_dir())
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    // 没有选中账户就不启动：登录态（username/uuid/token）全靠当前账户。
+    if with_account && account.is_none() {
+        return Err("还没有选中账户：先去「账户」页选一个再启动。".into());
+    }
     let username = account
         .as_ref()
         .map(|player| player.name.clone())
@@ -976,6 +1170,15 @@ fn launch_request(
             }
         }
     }
+    // 自动档每次都重算，选完把「要什么 / 选了谁」写进启动器日志，出问题能直接看出来。
+    let requirement = java_requirement(game_dir, id);
+    crate::versions::append_log(
+        paths.data_dir(),
+        &format!(
+            "[java] 实例 {id} 需要 {}，使用 {java_path}",
+            requirement.describe()
+        ),
+    );
     let mut game_args = split_args(&version.game_args);
     // 「自动进入服务器」：1.20 起原版把 --server/--port 换成了 --quickPlayMultiplayer，
     // 旧参数会被直接忽略，所以要按基础版本挑一种写法。
@@ -1035,6 +1238,10 @@ fn launch_request(
         allow_java_upgrade: true,
         log4j_debug: version.debug_log4j,
         authlib,
+        skin: offline_skin,
+        skin_model: offline_skin_model,
+        cape: offline_cape,
+        authlib_jar,
         quick_play,
     })
 }
@@ -1833,9 +2040,20 @@ fn pick_java_for(requirement: launcher_core::java::JavaRequirement) -> Result<St
         .iter()
         .filter(|java| requirement.accepts(java.major))
         .collect();
-    // PCL 的 JavaSorter：8/17/21 权重更高，同权重再挑大版本。
-    matching.sort_by_key(|java| (launcher_core::java_weight(java.major), java.major));
-    match matching.last() {
+    // 先按「离下限最近」挑（1.20.1 的 17 优于 21，26.3 只认 25），
+    // 同档优先 64 位、再取大版本。PCL 的权重表（8/17/21 偏好）只作最后的
+    // 兜底：把它挪到排序末尾会让「1.20.1 挑到 21」这种能用但易崩的组合复现。
+    matching.sort_by_key(|java| {
+        (
+            // 先满足软上限（建议区间），再贴近下限，最后才轮到 64 位与权重。
+            requirement.soft_penalty(java.major),
+            requirement.slack(java.major).unwrap_or(u32::MAX),
+            !java.is_64,
+            std::cmp::Reverse(launcher_core::java_weight(java.major)),
+            std::cmp::Reverse(java.major),
+        )
+    });
+    match matching.first() {
         Some(java) => Ok(java.path.clone()),
         None => {
             let majors: Vec<u32> = found.iter().map(|java| java.major).collect();
@@ -1857,9 +2075,11 @@ pub fn sync_global_strategy(paths: &crate::portable::Paths) -> launcher_core::do
     let global = crate::settings::load(paths);
     let strategy = strategy_of(global.download_strategy.as_deref());
     launcher_core::download::set_strategy(strategy);
+    launcher_core::download::set_http2(global.use_http2);
     launcher_core::download::set_speed_limit(launcher_core::download::tier_limit(
         global.download_speed,
     ));
+    crate::versions::set_isolation_mode(&global.isolation_mode);
     strategy
 }
 
@@ -1922,6 +2142,98 @@ fn repair_before_launch(
     .map_err(|error| format!("补齐缺失文件失败：{error}"))
 }
 
+
+/// 从游戏输出里认出「这次是 Java 选错了」，并给出该往哪个方向挪。
+enum JavaFix {
+    /// 需要更高主版本；`UnsupportedClassVersionError` 会带出 class file 版本。
+    Up(Option<u32>),
+    /// 需要更低主版本：模块/访问检查失败，常见于旧模组 + 新 JDK。
+    Down,
+    /// 同主版本换 build（JVM 原生崩溃）。
+    SameBuild,
+}
+
+impl JavaFix {
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::Up(_) => "Java 版本过低",
+            Self::Down => "Java 版本过高",
+            Self::SameBuild => "JVM 自身崩溃",
+        }
+    }
+}
+
+/// 只认三类特征；其余失败（缺库、主类找不到、超时）不是换 Java 能解决的。
+fn java_fix(logs: &[LogLine]) -> Option<JavaFix> {
+    for line in logs.iter().rev().take(600) {
+        let text = line.text.as_str();
+        if text.contains("UnsupportedClassVersionError")
+            || text.contains("compiled by a more recent version of the Java Runtime")
+        {
+            // `class file version 69.0` 对应 Java 25（class file 版本 = 主版本 + 44）。
+            let needed = text
+                .split("class file version ")
+                .nth(1)
+                .and_then(|rest| {
+                    rest.split(|c: char| !c.is_ascii_digit())
+                        .find(|part| !part.is_empty())
+                })
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .and_then(|file| file.checked_sub(44));
+            return Some(JavaFix::Up(needed));
+        }
+        if text.contains("Unsupported JVM module path")
+            || text.contains("module java.base does not")
+            || text.contains("IllegalAccessError")
+        {
+            return Some(JavaFix::Down);
+        }
+        if text.contains("EXCEPTION_ACCESS_VIOLATION") || text.contains("hs_err_pid") {
+            return Some(JavaFix::SameBuild);
+        }
+    }
+    None
+}
+
+/// 换 Java 需要的上下文：只在「自动档 + 没有手动指定」时才自动重试。
+struct RetryContext {
+    paths: crate::portable::Paths,
+    game_dir: std::path::PathBuf,
+    version_id: String,
+    java_path: String,
+    auto_mode: bool,
+    started: std::time::Instant,
+}
+
+fn java_retry_candidate(
+    requirement: &launcher_core::java::JavaRequirement,
+    used_major: u32,
+    fix: &JavaFix,
+) -> Option<launcher_core::JavaInstallation> {
+    let mut candidates: Vec<launcher_core::JavaInstallation> = launcher_core::detect_java()
+        .into_iter()
+        .filter(|java| requirement.accepts(java.major) && java.major != used_major)
+        .collect();
+    candidates.sort_by_key(|java| {
+        (
+            requirement.soft_penalty(java.major),
+            requirement.slack(java.major).unwrap_or(u32::MAX),
+            !java.is_64,
+            std::cmp::Reverse(java.major),
+        )
+    });
+    match fix {
+        JavaFix::Up(needed) => {
+            let floor = needed.unwrap_or(used_major + 1);
+            candidates.into_iter().find(|java| java.major >= floor)
+        }
+        JavaFix::Down => candidates.into_iter().find(|java| java.major < used_major),
+        JavaFix::SameBuild => candidates
+            .into_iter()
+            .find(|java| java.major == used_major),
+    }
+}
+
 /// 启动一个版本。配置来自 `version-settings.json`，缺省字段用全局设置补。
 #[tauri::command]
 pub async fn launch_version(
@@ -1938,6 +2250,9 @@ pub async fn launch_version(
     let game_dir = crate::game_folders::current(&paths);
     // 拼启动请求要读账户、必要时联网续期令牌，放进阻塞线程里做，别卡界面。
     let paths_for_request = (*paths).clone();
+    let retry_paths = (*paths).clone();
+    let retry_id = id.clone();
+    let retry_dir = game_dir.clone();
     let request_id = id.clone();
     let launch_dir = game_dir.clone();
     let pre_dir = launch_dir.clone();
@@ -2003,13 +2318,17 @@ pub async fn launch_version(
             append_error(&log_dir, &message);
             return Err(message);
         }
-        let mut session = runtime.0.lock().map_err(|e| e.to_string())?;
-        if session.child.is_some() {
-            return Err("已有游戏进程正在运行".into());
-        }
+        // 同一实例可以同时开多份（PCL 也不拦），这里只开一次新的启动编号。
+        let run_id = {
+            let mut sessions = runtime.0.lock().map_err(|e| e.to_string())?;
+            sessions.begin(&version_id)
+        };
 
         // 实例的「启动前执行命令」：在游戏目录里跑；失败就不启动。
         let settings = crate::versions::load_instance(&pre_dir, &version_id);
+        // 自动档（没手动指定 Java）才允许失败后自动换一个重试。
+        let auto_mode =
+            java.is_none() && (settings.java_auto || settings.java_path.trim().is_empty());
         if !settings.pre_launch.trim().is_empty() {
             match run_pre_launch(
                 &settings.pre_launch,
@@ -2047,6 +2366,41 @@ pub async fn launch_version(
                 version_id, plan.java_path, plan.working_directory
             ),
         );
+        // 落盘：这次的运行日志 + 可双击复现的启动脚本。
+        let command_line = std::iter::once(plan.java_path.clone())
+            .chain(plan.args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Err(error) = crate::runlog::write_latest_batch(
+            &log_dir,
+            &plan.working_directory,
+            &plan.java_path,
+            &plan.args,
+        ) {
+            append_error(&log_dir, &format!("写 LatestLaunch.bat 失败：{error}"));
+        }
+        let started_at = crate::runlog::now_readable();
+        match crate::runlog::RunLog::open(
+            &log_dir,
+            run_id,
+            &version_id,
+            [
+                format!("启动：{started_at}"),
+                format!("Java：{}", plan.java_path),
+                format!("目录：{}", plan.working_directory),
+                format!("命令行：{command_line}"),
+            ],
+        ) {
+            Ok(mut log) => {
+                log.push("system", &format!("启动 {version_id}"));
+                if let Ok(mut sessions) = runtime.0.lock() {
+                    if let Some(run) = sessions.runs.get_mut(&run_id) {
+                        run.log = Some(log);
+                    }
+                }
+            }
+            Err(error) => append_error(&log_dir, &format!("开运行日志失败：{error}")),
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -2063,11 +2417,15 @@ pub async fn launch_version(
         }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        session.logs.clear();
-        session.last_exit = None;
-        session.child = Some(child);
-        drop(session);
+        {
+            let mut sessions = runtime.0.lock().map_err(|e| e.to_string())?;
+            if let Some(run) = sessions.runs.get_mut(&run_id) {
+                run.pid = Some(pid);
+                run.child = Some(child);
+            }
+        }
 
+        let reader_run = run_id;
         for (stream, pipe) in [
             (
                 "stdout",
@@ -2081,6 +2439,7 @@ pub async fn launch_version(
             let Some(pipe) = pipe else { continue };
             let app = app.clone();
             let runtime = runtime.clone();
+            let reader_run = reader_run;
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(pipe);
                 loop {
@@ -2090,6 +2449,7 @@ pub async fn launch_version(
                         Ok(_) => publish(
                             &app,
                             &runtime,
+                            reader_run,
                             LogLine {
                                 stream: stream.into(),
                                 text: decode_text(&bytes).trim_end().to_string(),
@@ -2100,25 +2460,65 @@ pub async fn launch_version(
             });
         }
 
+        let retry_ctx = RetryContext {
+            paths: retry_paths,
+            game_dir: retry_dir,
+            version_id: retry_id,
+            java_path: plan.java_path.clone(),
+            auto_mode,
+            started: std::time::Instant::now(),
+        };
         let app_exit = app.clone();
         let runtime_exit = runtime.clone();
+        let exit_run = run_id;
+        let exit_version = version_id.clone();
+        let log_dir_exit = log_dir.clone();
+        let started_at_exit = started_at.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(300));
-                let Ok(mut session) = runtime_exit.0.lock() else {
+                let Ok(mut sessions) = runtime_exit.0.lock() else {
                     break;
                 };
-                let Some(child) = session.child.as_mut() else {
+                let Some(run) = sessions.runs.get_mut(&exit_run) else {
+                    break;
+                };
+                let Some(child) = run.child.as_mut() else {
                     break;
                 };
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        session.last_exit = status.code();
-                        session.child = None;
-                        drop(session);
+                        run.last_exit = status.code();
+                        run.child = None;
+                        // 收尾：把退出码写进运行日志，并登记到 index.json。
+                        let pid = run.pid;
+                        let stopped_by_user = run.stopped;
+                        let log_file = run.log.as_mut().map(|log| log.finish(status.code()));
+                        run.log = None;
+                        if let Some(path) = log_file {
+                            let entry = crate::runlog::RunEntry {
+                                run_id: exit_run,
+                                version_id: exit_version.clone(),
+                                pid,
+                                started: started_at_exit.clone(),
+                                ended: Some(crate::runlog::now_readable()),
+                                exit_code: status.code(),
+                                file: path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                crashed: status.code().unwrap_or(0) != 0 && !stopped_by_user,
+                            };
+                            if let Err(error) = crate::runlog::record(&log_dir_exit, entry) {
+                                append_error(&log_dir_exit, &format!("写运行日志索引失败：{error}"));
+                            }
+                        }
+                        let logs_snapshot: Vec<LogLine> = run.logs.iter().cloned().collect();
+                        drop(sessions);
                         publish(
                             &app_exit,
                             &runtime_exit,
+                            exit_run,
                             LogLine {
                                 stream: "system".into(),
                                 text: format!(
@@ -2130,15 +2530,108 @@ pub async fn launch_version(
                                 ),
                             },
                         );
-                        let _ = app_exit.emit("game-exit", status.code());
+                        // 非正常退出：用规则表认一下原因，推给界面做红条提示。
+                        // 用户自己点「结束实例」的不算崩溃。
+                        if status.code().unwrap_or(0) != 0 && !stopped_by_user {
+                            let mut context: Vec<String> = logs_snapshot
+                                .iter()
+                                .map(|line| format!("[{}] {}", line.stream, line.text))
+                                .collect();
+                            context.extend(crash_tail(&retry_ctx.game_dir.to_string_lossy(), &retry_ctx.version_id));
+                            let hits = launcher_core::crashlog::analyze(&context);
+                            if hits.is_empty() {
+                                append_error(
+                                    &retry_ctx.paths.log_dir(),
+                                    &format!(
+                                        "[crash] {} 退出码 {}，未识别出已知原因（内置 {} 条规则）",
+                                        retry_ctx.version_id,
+                                        status.code().unwrap_or(-1),
+                                        launcher_core::crashlog::rule_count()
+                                    ),
+                                );
+                            } else {
+                                append_error(
+                                    &retry_ctx.paths.log_dir(),
+                                    &format!(
+                                        "[crash] {} 退出码 {}：{}",
+                                        retry_ctx.version_id,
+                                        status.code().unwrap_or(-1),
+                                        hits[0].summary()
+                                    ),
+                                );
+                            }
+                            let _ = app_exit.emit(
+                                "game-crash",
+                                serde_json::json!({
+                                    "runId": exit_run,
+                                    "versionId": retry_ctx.version_id,
+                                    "code": status.code(),
+                                    "hits": hits,
+                                }),
+                            );
+                        }
+                        // Java 选错的典型失败：退出码非 0、启动后 3 分钟内退出。
+                        // 只做「建议 + 前端重试一次」，不改这里的启动状态。
+                        if status.code().unwrap_or(0) != 0
+                            && retry_ctx.auto_mode
+                            && retry_ctx.started.elapsed() < Duration::from_secs(180)
+                        {
+                            if let Some(fix) = java_fix(&logs_snapshot) {
+                                let requirement = java_requirement(&retry_ctx.game_dir, &retry_ctx.version_id);
+                                let used = launcher_core::detect_java()
+                                    .into_iter()
+                                    .find(|java| java.path.replace('/', "\\").eq_ignore_ascii_case(&retry_ctx.java_path.replace('/', "\\")))
+                                    .map(|java| java.major)
+                                    .unwrap_or(0);
+                                match java_retry_candidate(&requirement, used, &fix) {
+                                    Some(next) => {
+                                        append_error(
+                                            &retry_ctx.paths.log_dir(),
+                                            &format!(
+                                                "[java] {} 用 Java {used} 启动失败（{}），改用 {} 重试",
+                                                retry_ctx.version_id,
+                                                fix.describe(),
+                                                next.path
+                                            ),
+                                        );
+                                        let _ = app_exit.emit(
+                                            "java-retry",
+                                            serde_json::json!({
+                                                "versionId": retry_ctx.version_id,
+                                                "javaPath": next.path,
+                                                "reason": fix.describe(),
+                                            }),
+                                        );
+                                    }
+                                    None => append_error(
+                                        &retry_ctx.paths.log_dir(),
+                                        &format!(
+                                            "[java] {} 启动失败（{}），没有更合适的 Java 可换：{}",
+                                            retry_ctx.version_id,
+                                            fix.describe(),
+                                            requirement.describe()
+                                        ),
+                                    ),
+                                }
+                            }
+                        }
+                        let _ = app_exit.emit(
+                            "game-exit",
+                            serde_json::json!({
+                                "runId": exit_run,
+                                "versionId": exit_version,
+                                "code": status.code(),
+                            }),
+                        );
                         break;
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        drop(session);
+                        drop(sessions);
                         publish(
                             &app_exit,
                             &runtime_exit,
+                            exit_run,
                             LogLine {
                                 stream: "system".into(),
                                 text: format!("读取进程状态失败：{error}"),
@@ -2165,14 +2658,119 @@ pub async fn launch_version(
 }
 
 #[tauri::command]
-pub fn game_snapshot(runtime: State<'_, GameRuntime>) -> Result<GameSnapshot, String> {
-    let session = runtime.0.lock().map_err(|e| e.to_string())?;
+pub fn game_snapshot(
+    runtime: State<'_, GameRuntime>,
+    version_id: Option<String>,
+    run_id: Option<u64>,
+) -> Result<GameSnapshot, String> {
+    let sessions = runtime.0.lock().map_err(|e| e.to_string())?;
+    let run = match run_id {
+        Some(id) => sessions.runs.get(&id),
+        None => {
+            let id = sessions
+                .last
+                .filter(|id| sessions.runs.contains_key(id))
+                .or_else(|| {
+                    version_id
+                        .as_ref()
+                        .and_then(|version| {
+                            sessions
+                                .runs
+                                .values()
+                                .filter(|run| &run.version_id == version)
+                                .max_by_key(|run| run.id)
+                        })
+                        .map(|run| run.id)
+                });
+            id.and_then(|id| sessions.runs.get(&id))
+        }
+    };
     Ok(GameSnapshot {
-        running: session.child.is_some(),
-        pid: session.child.as_ref().map(Child::id),
-        last_exit: session.last_exit,
-        logs: session.logs.iter().cloned().collect(),
+        running: run.map(|run| run.child.is_some()).unwrap_or(false),
+        pid: run.and_then(|run| run.pid),
+        last_exit: run.and_then(|run| run.last_exit),
+        logs: run
+            .map(|run| run.logs.iter().cloned().collect())
+            .unwrap_or_default(),
     })
+}
+
+/// 「运行中实例」浮层里的一行。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunView {
+    pub run_id: u64,
+    pub version_id: String,
+    pub pid: u32,
+    /// 同名实例里的第几份，从 1 开始。
+    pub index: u32,
+}
+
+#[tauri::command]
+pub fn list_runs(runtime: State<'_, GameRuntime>) -> Result<Vec<RunView>, String> {
+    let sessions = runtime.0.lock().map_err(|e| e.to_string())?;
+    let mut live: Vec<&Run> = sessions
+        .runs
+        .values()
+        .filter(|run| run.child.is_some() && run.pid.is_some())
+        .collect();
+    live.sort_by_key(|run| run.id);
+    let mut seen: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    Ok(live
+        .into_iter()
+        .map(|run| {
+            let index = seen.entry(run.version_id.as_str()).or_insert(0);
+            *index += 1;
+            RunView {
+                run_id: run.id,
+                version_id: run.version_id.clone(),
+                pid: run.pid.unwrap_or(0),
+                index: *index,
+            }
+        })
+        .collect())
+}
+
+/// 结束某一次启动。只杀这一个进程，别的启动不受影响。
+/// 导出错误报告 zip。`target` 由前端另存为对话框给出。
+#[tauri::command]
+pub fn export_crash_report(
+    paths: State<'_, crate::portable::Paths>,
+    target: String,
+    version_id: String,
+    run_file: Option<String>,
+) -> Result<String, String> {
+    let game_dir = crate::game_folders::current_string(&paths);
+    let path = crate::crashreport::write(
+        std::path::Path::new(&target),
+        &paths,
+        &game_dir,
+        &version_id,
+        run_file.as_deref(),
+    )?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// 最近几次启动记录（含已结束的），新的在前。
+#[tauri::command]
+pub fn run_history(
+    paths: State<'_, crate::portable::Paths>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::runlog::RunEntry>, String> {
+    Ok(crate::runlog::history(&paths.log_dir(), limit.unwrap_or(20)))
+}
+
+#[tauri::command]
+pub fn stop_run(runtime: State<'_, GameRuntime>, run_id: u64) -> Result<(), String> {
+    let mut sessions = runtime.0.lock().map_err(|e| e.to_string())?;
+    let Some(run) = sessions.runs.get_mut(&run_id) else {
+        return Err("这次启动已经结束了".into());
+    };
+    run.stopped = true;
+    if let Some(child) = run.child.as_mut() {
+        child.kill().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 下载安装
@@ -2505,6 +3103,7 @@ pub async fn install_ftb_modpack(
     let runtime_inner = runtime.inner().clone();
     let staging = PathBuf::from(&game_dir).join(".ybmcl").join("modpack");
     let pack_dir = game_dir.clone();
+    let app_announce = app.clone();
     crate::sweep::clear_paused(&staging);
     let probe = token.clone();
 
@@ -2531,6 +3130,7 @@ pub async fn install_ftb_modpack(
                 java_path,
                 strategy,
                 threads: None,
+                cache_roots: Vec::new(),
                 icon_url,
                 // FTB 的整合包由我们自己写 .mrpack，来源是确定的，直接带进实例记录。
                 source: Some("ftb".into()),
@@ -2570,6 +3170,7 @@ pub async fn install_ftb_modpack(
     if let Ok(summary) = &result {
         remember_output(summary.path.clone());
         write_pack(&pack_dir, summary);
+        announce_versions(&app_announce, &pack_dir);
     }
     result
 }
@@ -3099,13 +3700,61 @@ pub async fn download_package(
     Ok(written.into_iter().map(remember_output).collect())
 }
 
+/// 其它游戏目录：这些目录里已有同 SHA1 的文件时直接复制，免得再下一遍。
+///
+/// 只把「用户登记过的目录」当来源（当前目录 + 已添加的文件夹），并且可以在设置里关掉。
+fn reuse_cache_roots(paths: &Paths, game_dir: &str) -> Vec<String> {
+    let settings = crate::settings::load(paths);
+    if !settings.reuse_game_folders {
+        return Vec::new();
+    }
+    let resolve = |path: &str| -> Option<String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let candidate = std::path::Path::new(path);
+        let resolved = candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf());
+        Some(resolved.to_string_lossy().to_string())
+    };
+    let target = resolve(game_dir);
+    let mut roots: Vec<String> = Vec::new();
+    let mut push = |path: &str| {
+        if let Some(resolved) = resolve(path) {
+            if Some(&resolved) != target.as_ref() && !roots.contains(&resolved) {
+                roots.push(resolved);
+            }
+        }
+    };
+    push(&settings.active_game_folder);
+    for entry in &settings.game_folders {
+        push(&entry.path);
+    }
+    for path in &settings.folder_order {
+        push(path);
+    }
+    roots
+}
+
+
+/// 装完之后通知各页面重新读盘：版本页靠这个自动刷新列表，
+/// 否则它会一直显示安装前的快照（用户删掉目录、装完新版本都看不到变化）。
+fn announce_versions(app: &tauri::AppHandle, game_dir: &str) {
+    use tauri::Emitter;
+    let _ = app.emit("versions-changed", serde_json::json!({ "gameDir": game_dir }));
+}
+
 #[tauri::command]
 pub async fn install_game_version(
     app: AppHandle,
     runtime: State<'_, InstallRuntime>,
+    paths: State<'_, Paths>,
     install_id: Option<u64>,
-    request: InstallRequest,
+    mut request: InstallRequest,
 ) -> Result<InstallSummary, String> {
+    request.cache_roots = reuse_cache_roots(&paths, &request.game_dir);
     // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
     let install_id = install_id.unwrap_or_else(next_anonymous_install);
     let token = runtime.begin(install_id)?;
@@ -3113,12 +3762,10 @@ pub async fn install_game_version(
     // 装完要登记产出（任务卡的「打开文件夹 / 移除并删除文件」），得先留一份游戏目录。
     let version_dir = request.game_dir.clone();
 
+    let (_watch, emit) =
+        crate::install_watch::watch(app.clone(), paths.log_dir(), token.clone(), false, install_id);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let emitter = app.clone();
-        install_version(request, token, move |progress: InstallProgress| {
-            let _ = emitter.emit("install-progress", &progress);
-        })
-        .map_err(|e| e.to_string())
+        install_version(request, token, emit).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -3143,6 +3790,9 @@ pub async fn install_game_version(
         );
         remember_output(summary.path.clone());
     }
+    if result.is_ok() {
+        announce_versions(&app, &version_dir);
+    }
     result
 }
 
@@ -3150,35 +3800,51 @@ pub async fn install_game_version(
 pub async fn install_game_modloader(
     app: AppHandle,
     runtime: State<'_, InstallRuntime>,
+    paths: State<'_, Paths>,
     install_id: Option<u64>,
     mut request: ModLoaderInstallRequest,
 ) -> Result<InstallSummary, String> {
+    request.cache_roots = reuse_cache_roots(&paths, &request.game_dir);
     // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
     let install_id = install_id.unwrap_or_else(next_anonymous_install);
     let token = runtime.begin(install_id)?;
     let runtime_inner = runtime.inner().clone();
     // request 要搬进后台线程，装完登记产出还得知道游戏目录在哪。
     let loader_dir = request.game_dir.clone();
+    let launch_dir_probe = std::path::PathBuf::from(&request.game_dir);
 
     {
         let loaders = request_loaders(&request);
+        // 先读原版 json（它带着 `javaVersion` 与 `component`）：安装加载器时要跑
+        // 处理器，选错 Java 会一路报「class file version 69.0」这类错。
         let requirement =
-            launcher_core::java::requirement_with(&request.game_version, None, &loaders);
+            launcher_core::java::requirement_for_dir(&launch_dir_probe, &request.game_version)
+                .unwrap_or_else(|| {
+                    launcher_core::java::requirement_with(&request.game_version, None, &loaders)
+                });
         let current = launcher_core::detect_java()
             .into_iter()
             .find(|java| java.path.eq_ignore_ascii_case(&request.java_path))
             .map(|java| java.major);
         if current.is_none_or(|major| !requirement.accepts(major)) {
-            request.java_path = pick_java_for(requirement)?;
+            let picked = pick_java_for(requirement.clone())?;
+            crate::versions::append_log(
+                paths.data_dir(),
+                &format!(
+                    "[java] 安装 {} 需要 {}，选用 {}",
+                    request.game_version,
+                    requirement.describe(),
+                    picked
+                ),
+            );
+            request.java_path = picked;
         }
     }
 
+    let (_watch, emit) =
+        crate::install_watch::watch(app.clone(), paths.log_dir(), token.clone(), true, install_id);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let emitter = app.clone();
-        install_modloader(request, token, move |progress: InstallProgress| {
-            let _ = emitter.emit("install-progress", &progress);
-        })
-        .map_err(|e| e.to_string())
+        install_modloader(request, token, emit).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -3196,30 +3862,41 @@ pub async fn install_game_modloader(
         }
         remember_output(summary.path.clone());
     }
+    if result.is_ok() {
+        announce_versions(&app, &loader_dir);
+    }
     result
 }
 
 #[tauri::command]
 pub async fn install_game_instance(
     app: AppHandle,
+    paths: State<'_, Paths>,
     runtime: State<'_, InstallRuntime>,
     install_id: Option<u64>,
-    request: InstanceRequest,
+    mut request: InstanceRequest,
 ) -> Result<InstallSummary, String> {
+    request.cache_roots = reuse_cache_roots(&paths, &request.game_dir);
     // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
     let install_id = install_id.unwrap_or_else(next_anonymous_install);
     let token = runtime.begin(install_id)?;
     let runtime_inner = runtime.inner().clone();
     // 暂停时半成品就是这个目录；装成功或用户取消都要把登记撤掉。
     let instance_path = launcher_core::instance::instance_target(&request);
+    let game_dir_announce = request.game_dir.clone();
     let probe = token.clone();
 
+    let has_loaders = !request.loaders.is_empty();
+    let (_watch, emit) =
+        crate::install_watch::watch(
+        app.clone(),
+        paths.log_dir(),
+        token.clone(),
+        has_loaders,
+        install_id,
+    );
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let emitter = app.clone();
-        install_instance(request, token, move |progress: InstallProgress| {
-            let _ = emitter.emit("install-progress", &progress);
-        })
-        .map_err(|e| e.to_string())
+        install_instance(request, token, emit).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -3235,6 +3912,9 @@ pub async fn install_game_instance(
     }
     if let Ok(summary) = &result {
         remember_output(summary.path.clone());
+    }
+    if result.is_ok() {
+        announce_versions(&app, &game_dir_announce);
     }
     result
 }
@@ -3260,10 +3940,15 @@ fn write_pack(game_dir: &str, summary: &launcher_core::modpack::ModpackSummary) 
 #[tauri::command]
 pub async fn install_modpack(
     app: AppHandle,
+    paths: State<'_, Paths>,
     runtime: State<'_, InstallRuntime>,
     install_id: Option<u64>,
-    request: launcher_core::modpack::ModpackRequest,
+    mut request: launcher_core::modpack::ModpackRequest,
 ) -> Result<launcher_core::modpack::ModpackSummary, String> {
+    request.cache_roots = reuse_cache_roots(&paths, &request.game_dir);
+    if request.threads.is_none() {
+        request.threads = Some(crate::settings::load(&paths).concurrent_downloads);
+    }
     // 前端任务卡的 id 用不上时（版本页那种一次性安装）发一个匿名号，照样互不干扰。
     let install_id = install_id.unwrap_or_else(next_anonymous_install);
     let token = runtime.begin(install_id)?;
@@ -3275,6 +3960,7 @@ pub async fn install_modpack(
     crate::sweep::clear_paused(&staging);
     let probe = token.clone();
 
+    let app_announce = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let emitter = app.clone();
         launcher_core::modpack::install_modpack(
@@ -3308,6 +3994,7 @@ pub async fn install_modpack(
             remember_output(summary.path.clone());
             write_pack(&pack_dir, summary);
             crate::sweep::clear_paused(&staging);
+            announce_versions(&app_announce, &pack_dir);
         }
         Err(_) if probe.is_paused() => crate::sweep::mark_paused(&staging),
         Err(_) => crate::sweep::clear_paused(&staging),
@@ -3534,6 +4221,7 @@ pub async fn pack_reinstall(
         java_path: None,
         strategy: Default::default(),
         threads: None,
+        cache_roots: Vec::new(),
         icon_url: None,
         source: (!kept_source.trim().is_empty() && kept_source != "zip").then_some(kept_source),
         project_id: (!kept_project.trim().is_empty()).then_some(kept_project),
@@ -3635,9 +4323,11 @@ pub fn save_settings(
 ) -> Result<crate::settings::Settings, String> {
     let saved = crate::settings::save(&paths, settings)?;
     launcher_core::download::set_strategy(strategy_of(saved.download_strategy.as_deref()));
+    launcher_core::download::set_http2(saved.use_http2);
     launcher_core::download::set_speed_limit(launcher_core::download::tier_limit(
         saved.download_speed,
     ));
+    crate::versions::set_isolation_mode(&saved.isolation_mode);
     Ok(saved)
 }
 
@@ -3648,6 +4338,8 @@ pub fn save_settings(
 pub struct AccountsView {
     pub players: Vec<PlayerView>,
     pub current: Option<String>,
+    /// 每个来源档自己的顺序（`all` / `offline` / `microsoft` / 第三方服务器 URL）。
+    pub orders: std::collections::BTreeMap<String, Vec<String>>,
     /// 加过的第三方认证服务器（只给界面显示名字与地址，元数据留在磁盘上）。
     pub servers: Vec<AuthServerView>,
 }
@@ -3662,6 +4354,15 @@ pub struct PlayerView {
     pub kind: launcher_core::auth::AccountKind,
     pub avatar: Option<String>,
     pub server: Option<String>,
+    /// 整张皮肤（data URL），账号页画全身预览用。
+    pub skin: Option<String>,
+    pub cape: Option<String>,
+    /// `slim` 或 `classic`。
+    pub skin_model: Option<String>,
+    /// 选的是哪一款官方默认皮肤；自定义皮肤为 None。
+    pub skin_official: Option<String>,
+    /// 选的是哪一张内置披风；自选文件为 None。
+    pub cape_official: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -3672,15 +4373,13 @@ pub struct AuthServerView {
 }
 
 /// 读账户表；空表时把老设置里那个玩家名转成一个离线账户，避免升级后「一个账户都没有」。
+/// 读账户表。
+///
+/// 以前这里会在表为空时「顺手补一个离线账户」，结果删掉最后一个账户后
+/// 下一条命令又把它加回来，看起来就像删不掉。现在空表就是空表，
+/// 界面自己显示「未登录 / 还没有账户」。
 fn accounts_store(paths: &crate::portable::Paths) -> launcher_core::auth::Store {
-    let mut store = launcher_core::auth::Store::load(paths.data_dir());
-    if store.players.is_empty() {
-        let name = crate::settings::load(paths).username;
-        if store.add_offline(&name).is_ok() {
-            let _ = store.save(paths.data_dir());
-        }
-    }
-    store
+    launcher_core::auth::Store::load(paths.data_dir())
 }
 
 fn accounts_view(store: &launcher_core::auth::Store) -> AccountsView {
@@ -3695,9 +4394,27 @@ fn accounts_view(store: &launcher_core::auth::Store) -> AccountsView {
                 kind: player.kind,
                 avatar: player.avatar.clone(),
                 server: player.server.clone(),
+                skin: player.skin.clone(),
+                cape: player.cape.clone(),
+                skin_model: player.skin_model.clone(),
+                skin_official: player.skin_official.clone(),
+                cape_official: player.cape_official.clone(),
             })
             .collect(),
         current: store.current.clone(),
+        orders: {
+            let mut filters: Vec<String> = vec!["all".into(), "offline".into(), "microsoft".into()];
+            for server in &store.auth_servers {
+                filters.push(server.url.clone());
+            }
+            filters
+                .into_iter()
+                .map(|filter| {
+                    let order = store.order_for(&filter);
+                    (filter, order)
+                })
+                .collect()
+        },
         servers: store
             .auth_servers
             .iter()
@@ -3715,9 +4432,13 @@ pub fn list_accounts(paths: State<'_, Paths>) -> Result<AccountsView, String> {
 }
 
 #[tauri::command]
-pub fn add_offline_account(paths: State<'_, Paths>, name: String) -> Result<AccountsView, String> {
+pub fn add_offline_account(
+    paths: State<'_, Paths>,
+    name: String,
+    uuid: Option<String>,
+) -> Result<AccountsView, String> {
     let mut store = accounts_store(&paths);
-    let id = store.add_offline(&name)?;
+    let id = store.add_offline(&name, uuid.as_deref())?;
     store
         .select(&id)
         .map_err(|error| error.to_string())?;
@@ -3741,6 +4462,91 @@ pub fn rename_account(
     Ok(accounts_view(&store))
 }
 
+/// 离线账户挑皮肤：`本地文件` 与 `LittleSkin` 两条路都会给出 data URL 与手臂模型。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkinPick {
+    pub skin: String,
+    pub model: String,
+}
+
+#[tauri::command]
+pub async fn pick_skin_file(app: tauri::AppHandle) -> Result<Option<SkinPick>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .add_filter("皮肤图片", &["png"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|error| error.to_string())?;
+    let skin = tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::auth::local_skin(&path.to_string_lossy())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(Some(SkinPick {
+        skin,
+        model: "classic".into(),
+    }))
+}
+
+#[tauri::command]
+pub async fn fetch_littleskin_skin(name: String) -> Result<SkinPick, String> {
+    let (skin, model) = tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::auth::littleskin_skin(&name)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(SkinPick { skin, model })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapePick {
+    pub cape: String,
+}
+
+#[tauri::command]
+pub async fn pick_cape_file(app: tauri::AppHandle) -> Result<Option<CapePick>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .add_filter("披风图片", &["png"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = picked.into_path().map_err(|error| error.to_string())?;
+    let cape = tauri::async_runtime::spawn_blocking(move || {
+        launcher_core::auth::local_cape(&path.to_string_lossy())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(Some(CapePick { cape }))
+}
+
+#[tauri::command]
+pub fn set_offline_look(
+    paths: State<'_, Paths>,
+    id: String,
+    skin: Option<String>,
+    skin_model: Option<String>,
+    skin_official: Option<String>,
+    cape: Option<String>,
+    cape_official: Option<String>,
+) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    store.set_offline_look(&id, skin, skin_model, skin_official, cape, cape_official)?;
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
 #[tauri::command]
 pub fn remove_account(paths: State<'_, Paths>, id: String) -> Result<AccountsView, String> {
     let mut store = accounts_store(&paths);
@@ -3755,6 +4561,30 @@ pub fn remove_account(paths: State<'_, Paths>, id: String) -> Result<AccountsVie
 pub fn select_account(paths: State<'_, Paths>, id: String) -> Result<AccountsView, String> {
     let mut store = accounts_store(&paths);
     store.select(&id)?;
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
+#[tauri::command]
+pub fn reorder_accounts(
+    paths: State<'_, Paths>,
+    filter: String,
+    ids: Vec<String>,
+) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    store.reorder(&filter, &ids)?;
+    store
+        .save(paths.data_dir())
+        .map_err(|error| format!("账户表写不进去：{error}"))?;
+    Ok(accounts_view(&store))
+}
+
+#[tauri::command]
+pub fn clear_account(paths: State<'_, Paths>) -> Result<AccountsView, String> {
+    let mut store = accounts_store(&paths);
+    store.deselect();
     store
         .save(paths.data_dir())
         .map_err(|error| format!("账户表写不进去：{error}"))?;
@@ -3865,6 +4695,26 @@ pub fn remove_auth_server(paths: State<'_, Paths>, url: String) -> Result<Accoun
     Ok(accounts_view(&store))
 }
 
+/// 取服务器元数据：内置服务器只带了地址和名字，第一次登录时再补 metadata
+/// （注入参数要用它，缺了 authlib-injector 会报错）。
+fn ensure_server_meta(
+    store: &mut launcher_core::auth::Store,
+    data_dir: &std::path::Path,
+    server: launcher_core::authlib::Server,
+) -> Result<launcher_core::authlib::Server, String> {
+    if server.metadata.is_some() {
+        return Ok(server);
+    }
+    let mut fetched = launcher_core::authlib::fetch_server(&server.url)?;
+    // 名字以我们写好的为准（服务器元数据里那串不一定和界面上的叫法一致）。
+    if !server.name.trim().is_empty() && server.name != server.url {
+        fetched.name = server.name;
+    }
+    store.add_server(fetched.clone());
+    let _ = store.save(data_dir);
+    Ok(fetched)
+}
+
 /// 用账号密码登录第三方认证服务器；一个账号下有多个角色时全部加进来。
 #[tauri::command]
 pub async fn add_third_party_account(
@@ -3877,8 +4727,9 @@ pub async fn add_third_party_account(
     tauri::async_runtime::spawn_blocking(move || {
         let mut store = launcher_core::auth::Store::load(&data_dir);
         // 服务器可能被手动删过，登录前先确认元数据还在（不在就重新拉一次）。
-        let server = match store.auth_servers.iter().find(|server| server.url == url) {
-            Some(server) => server.clone(),
+        let saved = store.auth_servers.iter().find(|server| server.url == url).cloned();
+        let server = match saved {
+            Some(server) => ensure_server_meta(&mut store, &data_dir, server)?,
             None => {
                 let fetched = launcher_core::authlib::fetch_server(&url)?;
                 store.add_server(fetched.clone());
@@ -3900,6 +4751,12 @@ pub async fn add_third_party_account(
                 access: None,
                 access_expires: 0,
                 server: Some(server.url.clone()),
+                oauth: None,
+                skin: profile.skin,
+                cape: profile.cape,
+                skin_model: profile.skin_model,
+                skin_official: None,
+                cape_official: None,
             };
             // 一个账号下可能有多个角色，都加进来；最后添加的那个成为当前账户。
             launcher_core::auth::set_session(&mut account, &profile.token);
@@ -3912,6 +4769,158 @@ pub async fn add_third_party_account(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// 外链登录的中间状态：设备码这种东西只在本进程里活几十秒，没必要落盘。
+static OPENID_LOGINS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (launcher_core::authlib::Server, launcher_core::authlib::DeviceLogin)>>,
+> = std::sync::OnceLock::new();
+
+fn openid_logins(
+) -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (launcher_core::authlib::Server, launcher_core::authlib::DeviceLogin)>,
+> {
+    OPENID_LOGINS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 外链登录第一段：拿到设备码，交给界面显示（用户到浏览器确认）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceLoginView {
+    pub session: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub interval: u64,
+    pub expires_in: u64,
+}
+
+#[tauri::command]
+pub async fn start_openid_login(
+    paths: State<'_, Paths>,
+    url: String,
+) -> Result<DeviceLoginView, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = launcher_core::auth::Store::load(&data_dir);
+        let saved = store.auth_servers.iter().find(|server| server.url == url).cloned();
+        let server = match saved {
+            Some(server) => ensure_server_meta(&mut store, &data_dir, server)?,
+            None => {
+                let fetched = launcher_core::authlib::fetch_server(&url)?;
+                store.add_server(fetched.clone());
+                let _ = store.save(&data_dir);
+                fetched
+            }
+        };
+        let login = launcher_core::authlib::start_device_login(&server)?;
+        let session = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_millis())
+                .unwrap_or_default()
+        );
+        {
+            let mut live = openid_logins().lock().map_err(|_| "登录状态被锁住了".to_string())?;
+            live.insert(session.clone(), (server, login.clone()));
+        }
+        Ok::<_, String>(DeviceLoginView {
+            session,
+            user_code: login.user_code,
+            verification_uri: login.verification_uri,
+            interval: login.interval,
+            expires_in: login.expires_in,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 外链登录第二段：轮询一次。`state` 为 `pending` / `slow_down` / `denied` / `expired` / `done`。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePollView {
+    pub state: String,
+    pub accounts: Option<AccountsView>,
+}
+
+#[tauri::command]
+pub async fn poll_openid_login(
+    paths: State<'_, Paths>,
+    session: String,
+) -> Result<DevicePollView, String> {
+    let data_dir = paths.data_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (server, login) = {
+            let live = openid_logins().lock().map_err(|_| "登录状态被锁住了".to_string())?;
+            live.get(&session)
+                .cloned()
+                .ok_or_else(|| "这次登录已经过期了，重新点一次。".to_string())?
+        };
+        match launcher_core::authlib::poll_device_login(&server, &login)? {
+            launcher_core::authlib::DevicePoll::Pending => Ok::<_, String>(DevicePollView {
+                state: "pending".into(),
+                accounts: None,
+            }),
+            launcher_core::authlib::DevicePoll::SlowDown => Ok(DevicePollView {
+                state: "slow_down".into(),
+                accounts: None,
+            }),
+            launcher_core::authlib::DevicePoll::Denied => {
+                remove_login(&session);
+                Ok(DevicePollView {
+                    state: "denied".into(),
+                    accounts: None,
+                })
+            }
+            launcher_core::authlib::DevicePoll::Expired => {
+                remove_login(&session);
+                Ok(DevicePollView {
+                    state: "expired".into(),
+                    accounts: None,
+                })
+            }
+            launcher_core::authlib::DevicePoll::Ready(profile) => {
+                let mut store = launcher_core::auth::Store::load(&data_dir);
+                let mut account = launcher_core::auth::Account {
+                    id: String::new(),
+                    name: profile.name,
+                    uuid: profile.uuid.to_lowercase(),
+                    kind: launcher_core::auth::AccountKind::Thirdparty,
+                    avatar: profile.avatar,
+                    refresh: None,
+                    access: None,
+                    access_expires: 0,
+                    server: Some(server.url.clone()),
+                    oauth: profile.refresh_token.as_deref().and_then(launcher_core::auth::protect),
+                    skin: profile.skin,
+                    cape: profile.cape,
+                    skin_model: profile.skin_model,
+                    skin_official: None,
+                    cape_official: None,
+                };
+                launcher_core::auth::set_session(&mut account, &profile.token);
+                store.add_third_party(account);
+                store
+                    .save(&data_dir)
+                    .map_err(|error| format!("账户表写不进去：{error}"))?;
+                remove_login(&session);
+                Ok(DevicePollView {
+                    state: "done".into(),
+                    accounts: Some(accounts_view(&store)),
+                })
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn remove_login(session: &str) {
+    if let Ok(mut live) = openid_logins().lock() {
+        live.remove(session);
+    }
 }
 
 // ---------------------------------------------------------------- 模组
@@ -5549,3 +6558,111 @@ mod text_decoding {
     }
 }
 
+
+#[cfg(test)]
+mod loader_label_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn labymod_label_uses_the_recorded_version() {
+        let meta = json!({
+            "libraries": [
+                {"name": "net.labymod:dnsjava:4.0.0"},
+                {"name": "net.labymod:labymod-api:3.3.4"}
+            ],
+            "_ybmcl": {"loaders": [{"loader": "labymod", "version": "50.3"}]}
+        });
+        let loaders = loaders_from_libraries(&meta);
+        assert_eq!(loaders.len(), 1);
+        assert_eq!(loaders[0].loader, "labymod");
+        assert_eq!(loaders[0].version, "50.3");
+    }
+
+    #[test]
+    fn neoforge_label_prefers_the_argument_version() {
+        let meta = json!({
+            "libraries": [
+                {"name": "net.neoforged:neoforge:26.3.0.113"},
+                {"name": "net.neoforged.fancymodloader:loader:12.0.12"}
+            ],
+            "arguments": {"game": ["--fml.neoForgeVersion", "26.3.0.113"]}
+        });
+        let loaders = loaders_from_libraries(&meta);
+        assert!(loaders.iter().any(|item| item.loader == "neoforge"
+            && item.version == "26.3.0.113"));
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn same_instance_can_start_more_than_once() {
+        let mut sessions = Sessions::default();
+        let first = sessions.begin("26.3-NeoForge");
+        let second = sessions.begin("26.3-NeoForge");
+        assert_ne!(first, second);
+        assert_eq!(sessions.runs.len(), 2);
+        // 还没挂进程，都算没在跑。
+        assert_eq!(sessions.running(), 0);
+        assert_eq!(sessions.last, Some(second));
+    }
+
+    #[test]
+    fn finished_runs_are_pruned() {
+        let mut sessions = Sessions::default();
+        for _ in 0..25 {
+            sessions.begin("26.3");
+        }
+        assert_eq!(sessions.runs.len(), 20);
+    }
+}
+
+#[cfg(test)]
+mod java_fix_tests {
+    use super::*;
+
+    fn line(text: &str) -> LogLine {
+        LogLine {
+            stream: "stderr".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn class_version_error_asks_for_a_newer_java() {
+        let logs = vec![line(
+            "java.lang.UnsupportedClassVersionError: net/minecraft/client/main/Main has been compiled by a more recent version of the Java Runtime (class file version 69.0)",
+        )];
+        assert!(matches!(java_fix(&logs), Some(JavaFix::Up(Some(25)))));
+    }
+
+    #[test]
+    fn module_errors_ask_for_an_older_java() {
+        for text in [
+            "Unsupported JVM module path: java.base/java.lang.invoke",
+            "java.lang.IllegalAccessError: module java.base does not \"opens java.lang\"",
+        ] {
+            assert!(matches!(java_fix(&[line(text)]), Some(JavaFix::Down)));
+        }
+    }
+
+    #[test]
+    fn jvm_crash_only_swaps_the_build() {
+        let logs = vec![line(
+            "# EXCEPTION_ACCESS_VIOLATION (0xc0000005) at pc=0x00007ffb",
+        )];
+        assert!(matches!(java_fix(&logs), Some(JavaFix::SameBuild)));
+    }
+
+    #[test]
+    fn ordinary_crashes_do_not_blame_java() {
+        let logs = vec![
+            line("java.lang.ClassNotFoundException: cpw.mods.modlauncher.Launcher"),
+            line("Error: Could not find or load main class net.minecraft.client.main.Main"),
+        ];
+        assert!(java_fix(&logs).is_none());
+    }
+}

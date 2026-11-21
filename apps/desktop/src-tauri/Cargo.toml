@@ -1,6 +1,6 @@
 [package]
 name = "ybumcl-desktop"
-version = "0.2.5"
+version = "0.2.6"
 description = "延边大学我的世界启动器 / Yanbian University Minecraft Launcher"
 authors = ["YBUMCL"]
 edition = "2024"
@@ -51,3 +51,7 @@ tauri-plugin-dialog = "2"
 flate2 = "1"
 # 中文 Windows 上的整合包会把日志按 GBK 写（月份名等），读的时候得能认出来。
 encoding_rs = "0.8"
+# 错误报告打成 zip（和 launcher-core 用同一个版本，别引两套）。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 运行日志的文件名与头部要本地时间；只要格式化，不带时区数据库。
+time = { version = "0.3", features = ["formatting", "local-offset"] }

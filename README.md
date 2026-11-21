@@ -48,11 +48,13 @@ Windows 10 / 11。Java 会自动找（JAVA_HOME、PATH、各家厂商的安装�
 
 ### 账户
 
-离线账户，玩家名保存在设置里，新建实例默认沿用。
+- 离线账户：玩家名保存下来，新建实例默认沿用。
+- 微软正版账户：设备码登录，令牌过期可以在账户卡片上「重新登录」。
+- 外置登录（authlib-injector）：填服务器地址后按服务器的账户体系登录。
+- 皮肤：微软账户可以选官方皮肤，也能用 LittleSkin；实例列表和账户页用 3D 预览显示。
 
 ## 目前不做
 
-- 微软正版登录
 - 自动更新
 - macOS / Linux
 
@@ -64,6 +66,7 @@ pnpm desktop          # 开发模式（前端热更新 + Tauri 窗口）
 pnpm build            # 只构建前端到 build/
 pnpm desktop:build    # 发布版 exe，产物在 target/release/YBUMCL.exe
 pnpm check            # svelte-check
+pnpm verify           # 门禁：svelte-kit sync + svelte-check + 前端构建 + cargo check
 pnpm test:core        # Rust 核心测试
 ```
 

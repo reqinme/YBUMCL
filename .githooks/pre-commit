@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# 提交门禁：只对本次暂存的改动跑最便宜的检查，避免全量构建拖慢提交。
+# 启用：git config core.hooksPath .githooks
+set -u
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+rust_changed=$(printf '%s\n' "$staged" | grep -cE '\.rs$' || true)
+web_changed=$(printf '%s\n' "$staged" | grep -cE '\.(svelte|ts|js|mjs)$' || true)
+
+status=0
+
+if [ "$rust_changed" -gt 0 ]; then
+  cargo="${HOME}/.cargo/bin/cargo"
+  [ -x "$cargo" ] || cargo=$(command -v cargo || true)
+  if [ -z "$cargo" ]; then
+    echo "pre-commit: 未找到 cargo，跳过 Rust 检查"
+  else
+    echo "pre-commit: cargo check --workspace"
+    "$cargo" check --workspace --quiet || status=1
+  fi
+fi
+
+if [ "$web_changed" -gt 0 ] && [ "$status" -eq 0 ]; then
+  echo "pre-commit: svelte-check"
+  pnpm exec svelte-kit sync >/dev/null 2>&1
+  pnpm exec svelte-check --tsconfig ./tsconfig.json --threshold error || status=1
+fi
+
+if [ "$status" -ne 0 ]; then
+  echo "pre-commit: 检查未通过，提交已中止（可用 git commit --no-verify 跳过）"
+fi
+exit "$status"

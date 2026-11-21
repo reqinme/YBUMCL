@@ -8,6 +8,10 @@
   import { resolveIconUrl } from "$lib/version-icon";
   import { currentVersion, pickCurrent, setCurrentVersion } from "$lib/current-version.svelte";
   import { absorbCategories, isStarred, starredIds } from "$lib/starred.svelte";
+  import { folderState, loadFolders } from "$lib/game-folders.svelte";
+  import { absorbOrder, orderFor } from "$lib/view-order.svelte";
+  import { sortVersions } from "$lib/version-sort";
+  import { onVersionsChanged } from "$lib/api";
 
   let versions = $state<VersionView[]>([]);
   /// 当前游戏目录，星标按目录分开记。
@@ -19,30 +23,57 @@
   /// 实例自己的图标（`versions/<id>/icon.png` 或 PCL 设过的），没有就按状态用内置方块图。
   let icons = $state<Record<string, string>>({});
 
-  /// 左栏只列打了星的实例；没打星的一个都不占位。
-  const shown = $derived(versions.filter((item) => isStarred(gameDir, item.id)));
+  /// 左栏列「当前文件夹」的全部实例：星标置顶，其余按用户选的排序方式排。
+  const shown = $derived(
+    sortVersions(versions, orderFor(gameDir), (id) => isStarred(gameDir, id))
+  );
   const selected = $derived(shown.find((item) => item.id === selectedId) ?? shown[0] ?? null);
   const collapsed = $derived(settings?.homeRailCollapsed ?? false);
   const memory = $derived(selected?.maxMemoryMb || settings?.memoryMb || 0);
   const username = $derived(settings?.username || "");
 
-  onMount(async () => {
+  /// 读当前文件夹的版本；左栏和「启动」用的都是这一份。
+  async function loadVersions(): Promise<void> {
     try {
-      const [settingsValue, list, dir, cats] = await Promise.all([
-        api.loadSettings(),
-        api.listVersions(),
-        api.defaultGameDir(),
-        api.listCategories()
-      ]);
-      settings = settingsValue;
+      const [list, cats] = await Promise.all([api.listVersions(), api.listCategories()]);
       versions = list;
-      gameDir = dir;
-      absorbCategories(dir, cats.tags);
-      selectedId = pickCurrent(shown);
+      gameDir = folderState.active;
+      absorbCategories(gameDir, cats.tags);
+      absorbOrder(gameDir, cats.order);
+      selectedId = pickCurrent(
+        sortVersions(list, orderFor(gameDir), (id) => isStarred(gameDir, id))
+      );
       void loadIcons(list);
     } catch (e) {
       showError("读取版本列表失败", "主页没拿到版本清单。", String(e));
     }
+  }
+
+  let unlisten: (() => void) | null = null;
+
+  onMount(() => {
+    void boot();
+    return () => unlisten?.();
+  });
+
+  async function boot(): Promise<void> {
+    try {
+      settings = await api.loadSettings();
+    } catch {
+      /* 读不到设置就先用默认值 */
+    }
+    await loadFolders();
+    await loadVersions();
+    // 版本页切了文件夹，主页跟着换；装完/删完也重读一次。
+    unlisten = await onVersionsChanged(() => {
+      if (folderState.active === gameDir) void loadVersions();
+    });
+  }
+
+  // 文件夹在别处被切换时（版本页点选、加了新目录），这里同步重读。
+  $effect(() => {
+    const active = folderState.active;
+    if (active && active !== gameDir) void loadVersions();
   });
 
   async function loadIcons(list: VersionView[]): Promise<void> {
@@ -241,6 +272,7 @@
 
   .rail-list {
     flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     gap: 4px;

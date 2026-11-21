@@ -23,10 +23,11 @@ use std::path::PathBuf;
 
 /// `--mirror` 现在是「官方 + 镜像都试，谁快用谁」的策略。
 fn strategy_from(mirror: bool) -> launcher_core::download::DownloadStrategy {
+    // 和设置里的默认值保持一致：顺序换源；`--mirror` 走竞速，`--official` 只走官方。
     if mirror {
         launcher_core::download::DownloadStrategy::Race
     } else {
-        launcher_core::download::DownloadStrategy::OfficialOnly
+        launcher_core::download::DownloadStrategy::Sequential
     }
 }
 
@@ -150,6 +151,15 @@ fn instance(
             java_path: None,
             strategy,
             threads: Some(16),
+            cache_roots: std::env::var("YBUMCL_CACHE_ROOTS")
+                .map(|value| {
+                    value
+                        .split(';')
+                        .filter(|item| !item.trim().is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
             overwrite,
         },
         CancellationToken::default(),
@@ -176,6 +186,7 @@ fn vanilla(dir: &str, game: &str, strategy: launcher_core::download::DownloadStr
             quilt_loader: None,
             strategy,
             threads: Some(16),
+            cache_roots: Vec::new(),
         },
         CancellationToken::default(),
         on_progress,
@@ -203,6 +214,7 @@ fn loader_install(
                 quilt_loader: (loader == "quilt").then(|| version.to_owned()),
                 strategy,
                 threads: Some(16),
+                cache_roots: Vec::new(),
             },
             CancellationToken::default(),
             on_progress,
@@ -233,6 +245,7 @@ fn loader_install(
             java_path,
             strategy,
             threads: Some(16),
+            cache_roots: Vec::new(),
         },
         CancellationToken::default(),
         on_progress,

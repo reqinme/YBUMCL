@@ -18,11 +18,14 @@ use thiserror::Error;
 /// 账户：离线档案与微软（设备代码）登录。
 pub mod auth;
 pub mod authlib;
+pub mod yggdrasil;
 pub mod cleanroom;
 /// 崩溃报告诊断：认识几类高置信度的原因，认不出来就返回空。
 pub mod crash;
+pub mod crashlog;
 pub mod curseforge;
 pub mod dates;
+mod base;
 pub mod download;
 pub mod export;
 pub mod icons;
@@ -37,6 +40,8 @@ pub mod merge;
 pub mod modloader;
 pub mod mod_updates;
 pub mod modpack;
+/// 安装进度：把「原版下载」和「加载器安装」两段的进度折成一条。
+pub mod progress;
 pub mod modrinth;
 pub mod modicons;
 pub mod mods;
@@ -157,6 +162,18 @@ pub struct LaunchRequest {
     /// 第三方认证服务器：非空时给 JVM 加 authlib-injector 的 agent 参数。
     #[serde(default)]
     pub authlib: Option<AuthlibInject>,
+    /// 离线账户的皮肤（`data:image/png;base64,…`）：非空时起本地 Yggdrasil 并注入。
+    #[serde(default)]
+    pub skin: Option<String>,
+    /// 离线账户皮肤的手臂模型：`classic` / `slim`。
+    #[serde(default)]
+    pub skin_model: Option<String>,
+    /// 离线账户的披风（`data:image/png;base64,…`）。
+    #[serde(default)]
+    pub cape: Option<String>,
+    /// 数据目录里的 `authlib-injector.jar`；离线账户要靠它把皮肤送进游戏。
+    #[serde(default)]
+    pub authlib_jar: Option<String>,
     /// 直接进存档：加 `--quickPlaySingleplayer <存档文件夹名>`（1.20+ 才有这个开关）。
     #[serde(default)]
     pub quick_play: Option<String>,
@@ -428,6 +445,8 @@ fn loader_main(main: &str) -> bool {
             | "com.cleanroommc.modlauncher.Launcher"
             | "cpw.mods.bootstraplauncher.BootstrapLauncher"
             | "net.neoforged.bootstraplauncher.BootstrapLauncher"
+            // NeoForge 26.x 换了启动器，入口从 bootstraplauncher 挪到 fml 的启动类。
+            | "net.neoforged.fml.startup.Client"
             | "com.cleanroommc.bootstraplauncher.BootstrapLauncher"
             | "net.minecraft.launchwrapper.Launch"
             | "cpw.mods.fml.relauncher.ServerLaunchWrapper"
@@ -1107,12 +1126,35 @@ fn dedupe_classpath(classpath: &mut Vec<PathBuf>, names: &[String]) {
         keep
     });
 }
+/// 把 `data:image/png;base64,…` 解成原始字节。
+fn data_url_bytes(data: &str) -> Option<Vec<u8>> {
+    let (head, body) = data.split_once(',')?;
+    if !head.starts_with("data:") {
+        return None;
+    }
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(body).ok()
+}
+
 fn offline_uuid(username: &str) -> String {
     let mut bytes = md5::compute(format!("OfflinePlayer:{username}")).0;
     bytes[6] = (bytes[6] & 0x0f) | 0x30;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+/// 离线启动用的假 token：32 位十六进制，形状上就是一个 UUID。
+fn offline_token() -> String {
+    let seed = format!(
+        "{}:{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    );
+    md5::compute(seed).0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn normalize_uuid(uuid: &str) -> Result<String> {
     let compact = uuid.replace('-', "");
     if compact.len() != 32 || !compact.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1641,24 +1683,31 @@ fn prepare(
         }
     }
     let offline = request.access_token.as_deref().is_none_or(str::is_empty);
-    let token = request
-        .access_token
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("0");
+    // 离线账户也带一个随机 token：部分服务器与插件见到空 token 会当成「没登录」。
+    let token = match request.access_token.as_deref().filter(|s| !s.is_empty()) {
+        Some(token) => token.to_owned(),
+        None => offline_token(),
+    };
     if token.chars().any(char::is_control) {
         return Err(CoreError::InvalidInput(
             "Access token contains control characters".into(),
         ));
     }
-    let uuid =
-        if offline {
-            offline_uuid(&request.username)
-        } else {
-            normalize_uuid(request.uuid.as_deref().ok_or_else(|| {
-                CoreError::InvalidInput("Authenticated launch requires UUID".into())
-            })?)?
-        };
+    // 账户表里存了 UUID 就用它（改名不再换人、也能手填），没存才按名字推导。
+    let uuid = match request
+        .uuid
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => normalize_uuid(text)?,
+        None if offline => offline_uuid(&request.username),
+        None => {
+            return Err(CoreError::InvalidInput(
+                "Authenticated launch requires UUID".into(),
+            ))
+        }
+    };
     let natives_dir = version_dir.join("launcher-natives");
     inside(&root, &natives_dir)?;
     let runtime_string = java_launch_path(&runtime);
@@ -1668,20 +1717,12 @@ fn prepare(
         ("game_directory", runtime_string.clone()),
         ("assets_root", java_launch_path(&assets)),
         ("assets_index_name", asset_id.into()),
-        ("auth_uuid", uuid),
-        ("auth_access_token", token.into()),
-        (
-            "auth_session",
-            format!(
-                "token:{token}:{}",
-                if offline {
-                    offline_uuid(&request.username)
-                } else {
-                    normalize_uuid(request.uuid.as_deref().unwrap())?
-                }
-            ),
-        ),
-        ("user_type", if offline { "legacy" } else { "msa" }.into()),
+        ("auth_uuid", uuid.clone()),
+        ("auth_access_token", token.clone()),
+        ("auth_session", format!("token:{token}:{uuid}")),
+        // 离线账户也用 msa：HMCL 的注释说用 mojang 会被个别服务器判成
+        // invalid session token，legacy 在部分插件里同样会被当成未登录。
+        ("user_type", "msa".into()),
         (
             "version_type",
             request
@@ -1850,6 +1891,8 @@ fn prepare(
                     arg.as_str(),
                     "java.base/java.util.jar=cpw.mods.securejarhandler"
                         | "java.base/java.lang.invoke=cpw.mods.securejarhandler"
+                        // NeoForge 26.x 的启动器要自己打开 invoke 包，不再走 securejarhandler。
+                        | "java.base/java.lang.invoke=ALL-UNNAMED"
                         | "java.base/java.lang=ALL-UNNAMED"
                         | "java.base/java.util=ALL-UNNAMED"
                         | "java.base/sun.nio.ch=ALL-UNNAMED"
@@ -1990,6 +2033,8 @@ fn prepare(
                 "neoforged.",
                 "fabric.",
                 "quilt.",
+                // Quilt 的命名空间开关：-Dloader.experimental.minecraft.targetNamespace=official
+                "loader.",
                 "net.labymod.",
                 "labymod.",
             ]
@@ -2208,8 +2253,31 @@ fn prepare(
     if request.initial_memory_mb > 0 {
         args.push(format!("-Xms{}M", request.initial_memory_mb));
     }
+    // 离线账户带皮肤：起一个只服务自己的本地 Yggdrasil，让 authlib-injector
+    // 把皮肤交给游戏（离线账户没有会话服务器，HMCL 也是这么干的）。
+    let mut local_inject: Option<(String, String)> = None;
+    if !request.username.is_empty() {
+        if let (Some(skin), Some(jar)) = (request.skin.as_deref(), request.authlib_jar.as_deref()) {
+            if let Some(png) = data_url_bytes(skin) {
+                let model = request.skin_model.as_deref().unwrap_or("classic");
+                let cape = request.cape.as_deref().and_then(data_url_bytes);
+                if let Ok(server) =
+                    crate::yggdrasil::start(&request.username, &uuid, png, model, cape)
+                {
+                    local_inject = Some((jar.to_owned(), server.url.clone()));
+                    jvm.push(format!("-javaagent:{jar}={}", server.url));
+                    jvm.push("-Dauthlibinjector.side=client".into());
+                    use base64::Engine;
+                    let prefetched =
+                        base64::engine::general_purpose::STANDARD.encode(server.metadata.as_bytes());
+                    jvm.push(format!("-Dauthlibinjector.yggdrasil.prefetched={prefetched}"));
+                }
+            }
+        }
+    }
     // 第三方登录：authlib-injector 的 agent 要排在所有 JVM 参数之后、main class
     // 之前（它靠 agentmain 改 classloader，位置错了游戏端还是走正版验证）。
+    if local_inject.is_none() {
     if let Some(authlib) = request.authlib.as_ref() {
         let metadata = authlib
             .metadata
@@ -2220,6 +2288,7 @@ fn prepare(
         jvm.push(format!("-javaagent:{}={}", authlib.jar, authlib.server));
         jvm.push("-Dauthlibinjector.side=client".into());
         jvm.push(format!("-Dauthlibinjector.yggdrasil.prefetched={prefetched}"));
+    }
     }
     if let Some(save) = request.quick_play.as_deref() {
         if !save.is_empty() {

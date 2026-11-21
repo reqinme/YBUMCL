@@ -2,6 +2,23 @@ use super::*;
 use serde_json::json;
 use std::{collections::BTreeMap, io::Cursor, sync::atomic::AtomicUsize};
 
+#[test]
+fn maven_mirror_path_drops_repository_segment() {
+    // NeoForge / Forge 的 artifact URL 带 `releases`，BMCLAPI 的 maven 代理不认这个前缀。
+    assert_eq!(
+        mirror_maven_path("/releases/net/neoforged/JarJarMetadata/0.4.1/x.jar"),
+        "/net/neoforged/JarJarMetadata/0.4.1/x.jar"
+    );
+    assert_eq!(
+        mirror_maven_path("/snapshots/net/minecraft/x.jar"),
+        "/net/minecraft/x.jar"
+    );
+    assert_eq!(
+        mirror_maven_path("/net/fabricmc/loader/1.jar"),
+        "/net/fabricmc/loader/1.jar"
+    );
+}
+
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha1::digest(bytes))
 }
@@ -103,6 +120,7 @@ impl Fixture {
             quilt_loader: None,
             strategy: DownloadStrategy::default(),
             threads: None,
+            cache_roots: Vec::new(),
         }
     }
     fn fabric(&mut self) -> Value {
@@ -235,7 +253,7 @@ fn parallel_install_publishes_every_artifact_atomically() {
         f.request(),
         &CancellationToken::default(),
         |p| events.push(p),
-        None,
+        &[],
         4,
     )
     .unwrap();
@@ -260,7 +278,7 @@ fn parallel_install_publishes_every_artifact_atomically() {
         f.request(),
         &CancellationToken::default(),
         |_| {},
-        None,
+        &[],
         4,
     )
     .unwrap();
@@ -383,7 +401,7 @@ fn cancellation_stops_install_and_emits_terminal_event() {
                 token.cancel();
             }
         },
-        None,
+        &[],
         1,
     );
     assert!(matches!(result, Err(DownloadError::Cancelled)));
@@ -628,7 +646,7 @@ fn verified_cache_copies_only_requested_artifacts_without_network_or_aliasing() 
         destination.request(),
         &CancellationToken::default(),
         |_| {},
-        Some(&cache.root),
+        &[cache.root.clone()],
         1,
     )
     .unwrap();
@@ -667,7 +685,7 @@ fn corrupt_cache_falls_back_to_network_and_is_never_repaired_in_place() {
         destination.request(),
         &CancellationToken::default(),
         |_| {},
-        Some(&cache.root),
+        &[cache.root.clone()],
         1,
     )
     .unwrap();
@@ -714,7 +732,7 @@ fn cache_linked_directories_fall_back_to_network() {
         destination.request(),
         &CancellationToken::default(),
         |_| {},
-        Some(&linked.root),
+        &[linked.root.clone()],
         1,
     )
     .unwrap();

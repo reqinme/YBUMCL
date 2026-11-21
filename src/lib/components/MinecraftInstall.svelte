@@ -67,7 +67,7 @@
   type Choice = { version: string; stable: boolean };
 
   let manifest = $state<RemoteVersionManifest | null>(null);
-  let strategy = $state<DownloadStrategy>("race");
+  let strategy = $state<DownloadStrategy>("sequential");
   let threads = $state<number | undefined>(undefined);
   let channel = $state<Channel>("release");
   let pickedVersion = $state("");
@@ -402,7 +402,7 @@
 
   async function loadVersions() {
     try {
-      manifest = await api.fetchRemoteVersions("race" as DownloadStrategy);
+      manifest = await api.fetchRemoteVersions("sequential" as DownloadStrategy);
       if (pickedVersion) return;
       // 修改页要「原地换」：先把实例现在的基础版本选上，别一上来就挑最新快照。
       const current = currentGame
@@ -428,7 +428,7 @@
     void (async () => {
       try {
         const settings = await api.loadSettings();
-        strategy = settings.downloadStrategy ?? "race";
+        strategy = settings.downloadStrategy ?? "sequential";
         threads = settings.concurrentDownloads || undefined;
       } catch {
         // 读不到设置就按默认的竞速策略装。

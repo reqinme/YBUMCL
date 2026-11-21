@@ -1,15 +1,18 @@
 mod caches;
 mod categories;
 mod clipboard_files;
+mod crashreport;
 mod commands;
 mod favorites;
 mod game_folders;
 mod icon_cache;
+mod install_watch;
 mod instance_cache;
 mod mod_projects;
 mod instances;
 mod portable;
 mod recycle;
+mod runlog;
 mod settings;
 mod single;
 mod sweep;
@@ -65,6 +68,8 @@ pub fn run() {
             return;
         }
     };
+    // 启动器日志按「启动次数」轮转（保留 5 份），要赶在写第一行日志之前。
+    let _ = runlog::rotate_launcher_logs(&paths.log_dir());
     // 下载源策略是进程级状态：先按设置初始化，后面所有下载路径都按它走。
     commands::sync_global_strategy(&paths);
     if !single::acquire_or_focus(paths.data_dir()) {
@@ -125,15 +130,23 @@ pub fn run() {
             commands::copy_file,
             commands::list_accounts,
             commands::add_offline_account,
+            commands::set_offline_look,
+            commands::pick_cape_file,
+            commands::pick_skin_file,
+            commands::fetch_littleskin_skin,
             commands::rename_account,
             commands::remove_account,
             commands::select_account,
+            commands::clear_account,
+            commands::reorder_accounts,
             commands::ms_login_start,
             commands::ms_login_poll,
             commands::refresh_account,
             commands::add_auth_server,
             commands::remove_auth_server,
             commands::add_third_party_account,
+            commands::start_openid_login,
+            commands::poll_openid_login,
             commands::patch_instance_core,
             commands::backup_instance_core,
             commands::export_launch_script,
@@ -151,6 +164,10 @@ pub fn run() {
             commands::memory_info,
             commands::launch_version,
             commands::game_snapshot,
+            commands::list_runs,
+            commands::run_history,
+            commands::export_crash_report,
+            commands::stop_run,
             commands::fetch_remote_versions,
             commands::fetch_fabric_loaders,
             commands::fetch_legacy_fabric_loaders,
@@ -311,6 +328,21 @@ pub fn run() {
                         }
                     }
                     Err(error) => eprintln!("merge legacy instances: {error}"),
+                }
+                // 实例一律合并式（每个实例自带核心，同 PCL）：继承式的旧实例
+                // 现场拍平，空壳目录顺手清掉，用户不用重装。
+                match launcher_core::merge::flatten_inheriting_versions(&game_dir) {
+                    Ok(ids) => {
+                        for id in ids {
+                            eprintln!("flattened instance: {id}");
+                        }
+                    }
+                    Err(error) => eprintln!("flatten instances: {error}"),
+                }
+                if let Ok(moved) = launcher_core::merge::migrate_scaffolds(&game_dir) {
+                    for id in moved {
+                        println!("scaffold moved out of versions: {id}");
+                    }
                 }
                 match launcher_core::merge::prune_incomplete(&game_dir) {
                     Ok(removed) => {

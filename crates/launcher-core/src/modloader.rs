@@ -23,7 +23,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -75,6 +75,9 @@ pub struct ModLoaderInstallRequest {
     /// 并发下载数，1..=16，缺省用默认值。
     #[serde(default)]
     pub threads: Option<u32>,
+    /// 其它游戏目录：本目录缺的资源先从这些目录按 SHA1 复制，不发网络请求。
+    #[serde(default)]
+    pub cache_roots: Vec<String>,
 }
 fn invalid(message: impl Into<String>) -> DownloadError {
     DownloadError::Invalid(message.into())
@@ -735,14 +738,20 @@ impl Drop for Stage {
     }
 }
 fn write_new(path: &Path, data: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| io_error(path, e))?;
-    file.write_all(data)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| io_error(path, e).into())
+    // create_new 在并行安装里会撞车（同一个基础版本的 json 被两个任务同时写），
+    // 改成临时文件 + 原子替换：谁最后写完谁生效，两边内容其实一样。
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+    }
+    let part = path.with_extension("part");
+    {
+        let mut file = File::create(&part).map_err(|e| io_error(&part, e))?;
+        file.write_all(data)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| io_error(&part, e))?;
+    }
+    let _ = fs::remove_file(path);
+    fs::rename(&part, path).map_err(|e| io_error(path, e).into())
 }
 fn zip_bytes(zip: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     let mut entry = zip
@@ -792,6 +801,11 @@ fn audit_urls(value: &Value) -> Result<()> {
 struct Profile {
     id: String,
     version: Value,
+    /// 安装器自带的原始版本 json（启动类路径应该用它）。
+    /// `version` 里混进了安装器专用库（如 `net.neoforged:neoforge:<ver>:universal`），
+    /// 这些库留在启动类路径上会让 FML 误判成 dev/joined 环境，去 classpath 找
+    /// Minecraft 类，最后报「patched Minecraft jar is missing」。
+    launch: Option<Value>,
     install: Value,
     /// 安装器自己要下载的库：先用镜像替它备好，安装器校验 SHA1 后会直接跳过。
     libraries: Vec<InstallerLibrary>,
@@ -878,6 +892,30 @@ fn add_installer_classifier_libraries(mut version: Value, install: &Value) -> Va
     version
 }
 
+/// 老格式（spec != 1）的 version.json 缺少安装器跑完补丁后才写的加载器库
+/// （Forge 1.13–1.16 的 `fmlcore`/`fmlloader`）；`install_profile.json` 里有，
+/// 按名字并进去（只补不改，避免把加载器换成 universal）。
+fn merge_profile_libraries(mut version: Value, install: &Value) -> Value {
+    let Some(install_libs) = install["libraries"].as_array() else {
+        return version;
+    };
+    let Some(version_libs) = version["libraries"].as_array_mut() else {
+        return version;
+    };
+    for library in install_libs {
+        let Some(name) = library["name"].as_str() else {
+            continue;
+        };
+        let present = version_libs
+            .iter()
+            .any(|entry| entry["name"].as_str() == Some(name));
+        if !present {
+            version_libs.push(library.clone());
+        }
+    }
+    version
+}
+
 fn inspect_installer(path: &Path, r: &ModLoaderInstallRequest) -> Result<Profile> {
     let mut zip = zip::ZipArchive::new(File::open(path).map_err(|e| io_error(path, e))?)
         .map_err(|e| invalid(e.to_string()))?;
@@ -921,6 +959,11 @@ fn inspect_installer(path: &Path, r: &ModLoaderInstallRequest) -> Result<Profile
         safe_relative(name)?;
         json(&zip_bytes(&mut zip, name)?)?
     };
+    // headless 安装器（NeoForge / Fabric 系）自带的版本 json 就是启动类路径；
+    // install_profile 里那些库（`neoforge:<ver>:universal` 等）只给安装器和处理器用，
+    // 混进启动类路径会让 FML 误判成 dev/joined 环境。老格式 Forge 相反，universal
+    // 本来就在启动类路径上，所以那边继续用合并后的版本。
+    let launch = headless.then(|| version.clone());
     let version = add_installer_classifier_libraries(version, &install);
     let id = version["id"]
         .as_str()
@@ -939,11 +982,33 @@ fn inspect_installer(path: &Path, r: &ModLoaderInstallRequest) -> Result<Profile
     Ok(Profile {
         id,
         version,
+        launch,
         install,
         libraries,
         headless,
     })
 }
+/// 带「第几个 / 共几个」的进度：界面把 processors 显示成 x/y，而不是一直 0/0。
+fn event_at(
+    emit: &impl Fn(InstallProgress),
+    version_id: &str,
+    stage: &str,
+    done: u64,
+    total: u64,
+    path: &str,
+) {
+    emit(InstallProgress {
+        version_id: version_id.to_owned(),
+        stage: stage.to_owned(),
+        path: path.to_owned(),
+        completed_files: done,
+        total_files: total,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        percent: None,
+    });
+}
+
 fn event(emit: &impl Fn(InstallProgress), version_id: &str, stage: &str, path: &str) {
     emit(InstallProgress {
         version_id: version_id.to_owned(),
@@ -1443,10 +1508,12 @@ fn run_processors(
         for raw in &step.args {
             args.push(processor_arg(raw, &tokens, &http, stage, mirror, cancel)?);
         }
-        event(
+        event_at(
             progress,
             profile_id,
             "modloader-install",
+            index as u64,
+            total,
             &format!("processor {}/{total}: {main}", index + 1),
         );
         // 单个 processor 失败多是偶发（文件刚写完、杀软还在扫），重试一次就够；
@@ -1481,9 +1548,23 @@ fn run_processors(
                     );
                     thread::sleep(Duration::from_millis(600));
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(invalid(format!(
+                        "加载器处理器 {}/{} 失败（{main}）：{error}",
+                        index + 1,
+                        total
+                    )));
+                }
             }
         }
+        event_at(
+            progress,
+            profile_id,
+            "modloader-install",
+            index as u64 + 1,
+            total,
+            &format!("processor {}/{} 完成", index + 1, total),
+        );
     }
     if let Some(patched) = tokens.get("PATCHED") {
         let path = PathBuf::from(patched);
@@ -1497,223 +1578,9 @@ fn run_processors(
     Ok(())
 }
 
-/// 列出 `versions/` 下现有哪些目录名（用安装器前后的差集找它写出的新版本）。
-fn version_dirs(root: &Path) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Ok(entries) = fs::read_dir(root.join("versions")) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    names.push(name.to_string());
-                }
-            }
-        }
-    }
-    names
-}
-
-/// 安装器跑完后新增的、名字里带 forge、且里面有同名 json 的版本目录。
-fn installer_written_json(stage: &Path, before: &[String]) -> Option<PathBuf> {
-    let entries = fs::read_dir(stage.join("versions")).ok()?;
-    let mut found: Vec<PathBuf> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let name = entry.file_name().to_str()?.to_string();
-            if !name.to_ascii_lowercase().contains("forge")
-                || before.iter().any(|old| old.eq_ignore_ascii_case(&name))
-            {
-                return None;
-            }
-            let json = path.join(format!("{name}.json"));
-            json.is_file().then_some(json)
-        })
-        .collect();
-    found.sort();
-    found.into_iter().next()
-}
-
-/// 老安装器只认 `--installClient`；NeoForge 1.20.1 那条线没有，只能看 help 输出判断。
-fn installer_supports_client_cli(java: &Path, jar: &Path) -> bool {
-    // 输出重定向到文件而不是管道：安装器偶尔会派生子进程，管道读端会一直等下去。
-    let probe =
-        std::env::temp_dir().join(format!("ybmcl-installer-probe-{}.log", std::process::id()));
-    let Ok(file) = fs::File::create(&probe) else {
-        return false;
-    };
-    let Ok(stdout) = file.try_clone() else {
-        return false;
-    };
-    let stderr = file;
-    let mut command = Command::new(java_path(java));
-    command
-        .arg("-Djava.awt.headless=true")
-        .arg("-jar")
-        .arg(java_path(jar))
-        .arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    let text = fs::read_to_string(&probe).unwrap_or_default();
-    let _ = fs::remove_file(&probe);
-    text.contains("installClient")
-}
-
-/// 拉库文件用的短超时客户端：库动辄几十上百个，单个请求卡 240 s 会把整次安装拖死。
-fn library_client() -> Result<&'static Client> {
-    static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            Client::builder()
-                .user_agent("YBUMCL/0.1")
-                .connect_timeout(Duration::from_secs(3))
-                // 安装器依赖都是几百 KB 的小文件；单次 10 s 足够，
-                // 免得连不上的官方源把三轮预取拖成几十分钟。
-                .timeout(Duration::from_secs(10))
-                .build()
-                .ok()
-        })
-        .as_ref()
-        .ok_or_else(|| invalid("cannot build the library http client"))
-}
-
-fn prefetch_installer_libraries(
-    _http: &Client,
-    stage: &Path,
-    libraries: &[InstallerLibrary],
-    mirror: bool,
-    cancel: &CancellationToken,
-    emit: &(impl Fn(InstallProgress) + Sync),
-) -> Result<()> {
-    let http = library_client()?;
-    let total = libraries.len() as u64;
-    let done = AtomicU64::new(0);
-    let mut missing: Vec<&InstallerLibrary> = libraries.iter().collect();
-    // 安装器只会去官方 maven 取没预取到的库，而那条线常常连不上；
-    // 多跑几轮，直到每个库都落在 staging 里。
-    for _pass in 0..3 {
-        let pending = std::mem::take(&mut missing);
-        let next = AtomicU64::new(0);
-        // 第一轮多数文件走同一个镜像，8 路能明显缩短总时长；
-        // 如果有文件没下来（可能是镜像抖动），后面几轮退回 4 路，避免一直挂着。
-        let workers = pending.len().clamp(1, if _pass == 0 { 8 } else { 4 });
-        thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed) as usize;
-                    let Some(library) = pending.get(index) else {
-                        return;
-                    };
-                    if cancel.is_cancelled() {
-                        return;
-                    }
-                    let target = stage.join("libraries").join(&library.path);
-                    if fs::metadata(&target).is_ok() {
-                        done.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    let source = mirror_maven(&library.url, mirror);
-                    let mut fetched = None;
-                    // bmclapi 的 maven 镜像最快（一个 jar 不到 1 s）；
-                    // maven.neoforged.net 在这边完全连不上，排在最后只浪费时间。
-                    let bmcl = format!("https://bmclapi2.bangbang93.com/maven/{}", library.path);
-                    // 镜像地址可能和改写后的 source 重复，去重后再试，少一轮白等的 10 秒。
-                    let mut candidates = vec![bmcl];
-                    for candidate in [source, library.url.clone()] {
-                        if !candidates.contains(&candidate) {
-                            candidates.push(candidate);
-                        }
-                    }
-                    for candidate in candidates {
-                        match fetch_once(http, &candidate, 64 * 1024 * 1024, cancel, &mut |_| {}) {
-                            Ok(bytes) if hash_bytes(&bytes) == library.sha1 => {
-                                fetched = Some(bytes);
-                                break;
-                            }
-                            Ok(_) => continue,
-                            Err(DownloadError::Cancelled) => return,
-                            Err(_) => continue,
-                        }
-                    }
-                    let Some(bytes) = fetched else { continue };
-                    if let Some(parent) = target.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    if fs::write(&target, &bytes).is_err() {
-                        continue;
-                    }
-                    let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    emit(InstallProgress {
-                        version_id: String::new(),
-                        stage: "modloader-libraries".into(),
-                        path: library.path.clone(),
-                        completed_files: finished.min(total),
-                        total_files: total,
-                        downloaded_bytes: 0,
-                        total_bytes: 0,
-                        percent: None,
-                    });
-                });
-            }
-        });
-        check(cancel)?;
-        missing = pending
-            .into_iter()
-            .filter(|item| fs::metadata(stage.join("libraries").join(&item.path)).is_err())
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-    }
-    // 预取只是加速：Forge 安装器会把加载器自己那份库从安装器包里解出来，
-    // 上游 maven 本来就不提供某些条目（1.16.5 的 forge-<ver>.jar 就是 404），
-    // 所以拉不到不能当成失败，交给安装器自己解包。
-    let names: Vec<&str> = missing
-        .iter()
-        .take(3)
-        .map(|item| item.path.as_str())
-        .collect();
-    emit(InstallProgress {
-        version_id: String::new(),
-        stage: "modloader-install".into(),
-        path: format!(
-            "安装器依赖没预取到（{} 等 {} 个），交给安装器自己解包",
-            names.join(" / "),
-            missing.len()
-        ),
-        completed_files: total,
-        total_files: total,
-        downloaded_bytes: 0,
-        total_bytes: 0,
-        percent: None,
-    });
-    Ok(())
-}
+// 说明：加载器库不再单独「预取」。处理器缺 classpath 时按坐标现取，处理器跑完
+// 再由 install_profile_libraries 按最终 profile 补齐，两条路都走常规下载层
+// （跨目录缓存复用、读超时、顺序换源）。
 
 fn collect(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     no_links(directory)?;
@@ -1936,6 +1803,27 @@ fn checked_java(r: &ModLoaderInstallRequest) -> Result<PathBuf> {
     }
     Ok(java)
 }
+
+/// 另一个安装刚装好、还没被它收尾删掉的加载器外壳可以复用：
+/// 同一个加载器版本 + 同一个原版版本，处理器产物必然一样，重跑一遍要一分多钟。
+fn reusable_shell(root: &Path, id: &str) -> bool {
+    let path = root.join("versions").join(id).join(format!("{id}.json"));
+    let Ok(bytes) = fs::read(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    value
+        .get("mainClass")
+        .and_then(|main| main.as_str())
+        .is_some_and(|main| !main.is_empty())
+        && value
+            .get("libraries")
+            .and_then(|libraries| libraries.as_array())
+            .is_some_and(|libraries| !libraries.is_empty())
+}
+
 fn install_forge_family(
     r: &ModLoaderInstallRequest,
     root: &Path,
@@ -1968,7 +1856,48 @@ fn install_forge_family(
         }
     };
     // 安装器 jar 走下载层：有镜像路由时按设置里的策略竞速/优先，没镜像就只走官方。
-    let bytes = crate::download::fetch_file_bytes(&url, cancel)?;
+    // 这个文件 5–8 MB，下载期间必须上报字节，否则界面只能干等「0 B / 0 B」。
+    let received = AtomicU64::new(0);
+    let known = AtomicU64::new(0);
+    let last = Mutex::new(Instant::now() - Duration::from_secs(1));
+    let announce = || {
+        let due = last
+            .lock()
+            .map(|mut at| {
+                if at.elapsed() >= Duration::from_millis(300) {
+                    *at = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if due {
+            progress(InstallProgress {
+                version_id: r.game_version.clone(),
+                stage: "modloader-installer".into(),
+                path: String::new(),
+                completed_files: 0,
+                total_files: 1,
+                downloaded_bytes: received.load(Ordering::Relaxed),
+                total_bytes: known.load(Ordering::Relaxed),
+                percent: None,
+            });
+        }
+    };
+    let bytes = crate::download::fetch_file_bytes_progress(
+        &url, cancel, &received, &known, &announce,
+    )?;
+    progress(InstallProgress {
+        version_id: r.game_version.clone(),
+        stage: "modloader-installer".into(),
+        path: String::new(),
+        completed_files: 1,
+        total_files: 1,
+        downloaded_bytes: bytes.len() as u64,
+        total_bytes: known.load(Ordering::Relaxed).max(bytes.len() as u64),
+        percent: None,
+    });
     if let Some(expected) = expected {
         if hash_bytes(&bytes) != expected {
             return Err(DownloadError::Integrity(
@@ -1980,6 +1909,22 @@ fn install_forge_family(
     let jar = stage.0.join("installer.jar");
     write_new(&jar, &bytes)?;
     let mut profile = inspect_installer(&jar, r)?;
+    if reusable_shell(root, &profile.id) {
+        event(
+            progress,
+            &profile.id,
+            "modloader-publish",
+            "Reusing the loader profile installed by another task",
+        );
+        let path = crate::download::tidy_path(&root.join("versions").join(&profile.id));
+        return Ok(InstallSummary {
+            version_id: profile.id,
+            path,
+            downloaded_files: 0,
+            skipped_files: 0,
+            downloaded_bytes: 0,
+        });
+    }
     event(progress, &profile.id, "modloader-prepare", "");
     let mut summary = crate::download::install_version_with_cache(
         InstallRequest {
@@ -1989,6 +1934,7 @@ fn install_forge_family(
             quilt_loader: None,
             strategy: r.strategy,
             threads: r.threads,
+            cache_roots: r.cache_roots.clone(),
         },
         cancel.clone(),
         |mut p| {
@@ -2011,133 +1957,86 @@ fn install_forge_family(
             progress,
             &profile.id,
             "modloader-install",
-            "Running official headless CLIENT installer",
+            "Running installer processors (built-in)",
         );
-        // 安装器自己还会去官方 maven 取「安装后版本」里声明的库
-        // （NeoForge 的 cpw.mods:bootstraplauncher 就在 version.json 里，不在 install_profile 里），
-        // 那条线连不上就直接失败，所以两份清单一起预取。
-        let mut preload = profile.libraries.clone();
-        preload.extend(installer_libraries(&profile.version));
-        prefetch_installer_libraries(
-            &http,
+        // 不再单独预取：处理器缺 classpath 时会按坐标现取（processor_library），
+        // 处理器跑完再由 install_profile_libraries 按最终 profile 补齐——两条路都走
+        // 常规下载层，有跨目录缓存复用、超时兜底和顺序换源。
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        }
+        let serialized =
+            serde_json::to_vec_pretty(&profile.version).map_err(|e| invalid(e.to_string()))?;
+        write_new(&path, &serialized)?;
+        // 不再跑官方安装器：直接按 install_profile 的 processors 把客户端补丁做出来。
+        run_processors(
+            java,
             &stage.0,
-            &preload,
+            &jar,
+            &profile.install,
+            &r.game_version,
+            &profile.id,
             r.strategy.allows_mirror(),
             cancel,
             progress,
         )?;
-        if installer_supports_client_cli(java, &jar) {
-            run_installer(
-                java,
-                &jar,
-                &stage.0,
-                &stage.0,
-                &[
-                    "--installClient".into(),
-                    java_path(&stage.0).to_string_lossy().into(),
-                ],
-                None,
-                cancel,
-                |line| event(progress, &profile.id, "modloader-install", line),
-            )?;
-        } else {
-            // 这条线（NeoForge 1.20.1）的安装器只留了 GUI，客户端补丁得自己按 install_profile 跑。
-            event(
-                progress,
-                &profile.id,
-                "modloader-install",
-                "Installer has no client CLI; running its processors",
-            );
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
-            }
-            let serialized =
-                serde_json::to_vec_pretty(&profile.version).map_err(|e| invalid(e.to_string()))?;
-            write_new(&path, &serialized)?;
-            // 版本 json 与它的库都由上面的 preload/prefetch 准备好了；
-            // 这里只差按 install_profile 把客户端补丁跑出来。
-            run_processors(
-                java,
-                &stage.0,
-                &jar,
-                &profile.install,
-                &r.game_version,
-                &profile.id,
-                r.strategy.allows_mirror(),
-                cancel,
-                progress,
-            )?;
-            // 1.16.x 的安装器在跑完处理器后会把 `fmlcore`/`fmlloader` 这些库写进
-            // 自己的版本 json（jar 里那份是没有的），以生成出来的这份为准，
-            // 否则启动时 modlauncher 找不到 fmlclient 目标。
-            if let Ok(bytes) = fs::read(&path) {
-                if let Ok(value) = json(&bytes) {
-                    let complete = value["libraries"]
-                        .as_array()
-                        .is_some_and(|libraries| !libraries.is_empty());
-                    if complete {
-                        profile.version = add_installer_classifier_libraries(value, &profile.install);
-                        let serialized = serde_json::to_vec_pretty(&profile.version)
-                            .map_err(|e| invalid(e.to_string()))?;
-                        write_new(&path, &serialized)?;
-                    }
+        // 处理器产物（srg/patched jar 等）落进 libraries 后，按最终 profile 补齐
+        // 其余可下载的库，避免启动时缺件。
+        crate::download::install_profile_libraries(
+            &stage.0.to_string_lossy(),
+            &profile.id,
+            r.strategy,
+            r.threads.map(|n| n as usize),
+            cancel.clone(),
+            |mut p| {
+                if p.stage == "complete" {
+                    p.stage = "modloader-prepare".into();
                 }
-            }
+                progress(p);
+            },
+        )?;
+        // 处理器和库都齐了，最后把版本 json 换回「启动用」的那份：安装期间混进来的
+        // 安装器专用库（`neoforge:<ver>:universal` 等）不能进启动类路径，
+        // 否则 FML 会以为这是 dev/joined 环境，去 classpath 找 Minecraft 类。
+        if let Some(launch) = profile.launch.as_ref() {
+            let serialized =
+                serde_json::to_vec_pretty(launch).map_err(|e| invalid(e.to_string()))?;
+            write_new(&path, &serialized)?;
         }
     } else if !forge_pre_113(&r.game_version) {
-        // 1.13+ 的 Forge 安装器虽然还是老格式（install_profile 没有 `spec`），
-        // jar 里那份 version.json 却不带 `fmlcore`/`fmlloader`——那些库是
-        // `--installClient` 跑出来时才写进版本 json 的，不跑就会在启动时报
-        // `Cannot find launch target fmlclient`。
+        // 1.13+ 的老格式 Forge（install_profile 没有 `spec`）：jar 里那份 version.json
+        // 不带 `fmlcore`/`fmlloader`，官方安装器是跑完处理器才把它们写进版本 json 的。
+        // 这里不跑安装器，改为在写 json 前把 install_profile 的库按名字并进来，
+        // 然后自己按 install_profile 跑 processors。
         event(
             progress,
             &profile.id,
             "modloader-install",
-            "Running Forge client installer",
+            "Running installer processors (built-in)",
         );
         write_new(
             &stage.0.join("launcher_profiles.json"),
             b"{\"profiles\":{}}",
         )?;
-        let version_dirs_before = version_dirs(&stage.0);
-        let mut preload = profile.libraries.clone();
-        preload.extend(installer_libraries(&profile.version));
-        prefetch_installer_libraries(
-            &http,
+        profile.version = merge_profile_libraries(profile.version, &profile.install);
+        // 预取已经去掉：库由处理器按需取、跑完再统一补齐，见上面 headless 分支的说明。
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        }
+        let serialized =
+            serde_json::to_vec_pretty(&profile.version).map_err(|e| invalid(e.to_string()))?;
+        write_new(&path, &serialized)?;
+        run_processors(
+            java,
             &stage.0,
-            &preload,
+            &jar,
+            &profile.install,
+            &r.game_version,
+            &profile.id,
             r.strategy.allows_mirror(),
             cancel,
             progress,
         )?;
-        run_installer(
-            java,
-            &jar,
-            &stage.0,
-            &stage.0,
-            &[
-                "--installClient".into(),
-                java_path(&stage.0).to_string_lossy().into(),
-            ],
-            None,
-            cancel,
-            |line| event(progress, &profile.id, "modloader-install", line),
-        )?;
-        // 安装器写的是它自己 id 的目录（`forge-1.16.5-36.2.34`），不会写我们的
-        // 实例名，所以要按 PCL 的办法找出新增的那个目录。
-        let generated_path =
-            installer_written_json(&stage.0, &version_dirs_before).unwrap_or_else(|| path.clone());
-        let generated = fs::read(&generated_path).map_err(|e| io_error(&generated_path, e))?;
-        let value = json(&generated)?;
-        profile.version = add_installer_classifier_libraries(value, &profile.install);
-        let serialized =
-            serde_json::to_vec_pretty(&profile.version).map_err(|e| invalid(e.to_string()))?;
-        // 安装器可能已经在这个路径上写了自己那份 json（update 会保留 fml 库），
-        // 直接覆盖，不能再用 write_new。
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| io_error(&path, e))?;
-        }
-        write_new(&path, &serialized)?;
         // 安装器自己下载的库不一定齐，按刚写好的 json 再补齐一遍
         // （PCL 的「下载游戏支持库文件（副加载器）」）。
         crate::download::install_profile_libraries(
@@ -2416,67 +2315,112 @@ fn fetch_legacy_libraries(
 /// OptiFine 官网要先打开 adloadx 页面拿到 downloadx 令牌，再带 Referer 取 jar。
 /// 镜像站现在只有 25 KB/s 左右，官网这条能跑到 1.5 MB/s，所以官网优先、失败再退回镜像。
 fn optifine_jar_bytes(
-    installer_url: &str,
     http: &Client,
     cancel: &CancellationToken,
-) -> Result<Option<Vec<u8>>> {
-    let name = installer_url.rsplit('/').next().unwrap_or_default();
+    name: &str,
+) -> (Option<Vec<u8>>, String) {
     if !name.starts_with("OptiFine_") || !name.ends_with(".jar") {
-        return Ok(None);
+        return (None, format!("文件名 {name} 不是官网的 OptiFine_*.jar"));
     }
     // 官网偶尔长时间不回包，这条链路单独设超时，失败就退回镜像。
     // 45 s 是实测值：官网从国内经常要 20-40 s 才回第一个字节，25 s 会误判成失败。
     let short = std::time::Duration::from_secs(45);
     let page = format!("https://optifine.net/adloadx?f={name}");
-    let Ok(response) = http
+    let response = match http
         .get(&page)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .timeout(short)
         .send()
-    else {
-        return Ok(None);
+    {
+        Ok(response) => response,
+        Err(error) => return (None, format!("官网页面打不开：{error}")),
     };
-    let Ok(html) = response.text() else {
-        return Ok(None);
+    let html = match response.text() {
+        Ok(html) => html,
+        Err(error) => return (None, format!("官网页面读不出来：{error}")),
     };
     let Some(rest) = html.split("downloadx?").nth(1) else {
-        return Ok(None);
+        return (None, "官网说没有这个版本（页面上没有下载链接）".to_owned());
     };
     let query: String = rest
         .chars()
         .take_while(|c| !matches!(c, '"' | '\'' | '<' | ' ' | '\n'))
         .collect();
     if query.is_empty() {
-        return Ok(None);
+        return (None, "官网下载链接是空的".to_owned());
     }
     if cancel.is_cancelled() {
-        return Err(DownloadError::Cancelled);
+        return (None, "已取消".to_owned());
     }
     let url = format!("https://optifine.net/downloadx?{query}");
-    let Ok(response) = http
+    let response = match http
         .get(&url)
         .header("Referer", &page)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .timeout(std::time::Duration::from_secs(180))
         .send()
-    else {
-        return Ok(None);
+    {
+        Ok(response) => response,
+        Err(error) => return (None, format!("官网下载失败：{error}")),
     };
-    let Ok(bytes) = response.bytes() else {
-        return Ok(None);
+    let bytes = match response.bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => return (None, format!("官网下载中断：{error}")),
     };
-    if !bytes.starts_with(b"PK") {
-        return Ok(None);
+    if !installable_optifine(&bytes) {
+        return (None, "官网返回的不是 OptiFine 安装器".to_owned());
     }
-    Ok(Some(bytes.to_vec()))
+    (Some(bytes.to_vec()), String::new())
+}
+
+/// 镜像给的 302 会跳到各家 CDN（不在 `known_host` 里），所以走下载层那套
+/// 「https + 端口 443」的宽松跳转，而不是本模块的严格白名单。
+fn optifine_mirror_bytes(
+    mirrored: &str,
+    cancel: &CancellationToken,
+) -> Result<(Option<Vec<u8>>, String)> {
+    match crate::download::fetch_file_bytes(mirrored, cancel) {
+        Ok(bytes) if installable_optifine(&bytes) => Ok((Some(bytes), String::new())),
+        Ok(bytes) => Ok((
+            None,
+            format!("镜像返回的不是安装器（{} 字节）", bytes.len()),
+        )),
+        Err(DownloadError::Cancelled) => Err(DownloadError::Cancelled),
+        Err(error) => Ok((None, format!("{error}"))),
+    }
+}
+
+/// 安装器 jar 的判定：`PK` 开头、能当 zip 打开、里面确实有 OptiFine 的类。
+/// 不这么做的话，镜像返回一张错误页（HTML/JSON）也会被当成安装器。
+fn installable_optifine(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"PK") || bytes.len() < 200 * 1024 {
+        return false;
+    }
+    let cursor = std::io::Cursor::new(bytes);
+    let Ok(mut zip) = zip::ZipArchive::new(cursor) else {
+        return false;
+    };
+    (0..zip.len()).any(|index| {
+        zip.by_index(index)
+            .map(|entry| {
+                let name = entry.name().to_ascii_lowercase();
+                name.starts_with("optifine/") || name.contains("/optifine/")
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// OptiFine 安装器有两条来源：官网 `adloadx` 页（慢，但版本常新）和 BMCLAPI 镜像。
 /// 按下载策略决定「竞速 / 谁先谁后」：竞速时两边同时开，谁先给出完整 jar 用谁，
 /// 另一边立刻取消；串行时按策略顺序试，前一条拿不到再换另一条。
+///
+/// `official_name` 是官网那边的文件名（`OptiFine_<游戏版本>_<OptiFine 版本>.jar`）。
+/// 以前从镜像 URL 取文件名（镜像给的是 `/optifine/1.21.11/HD_U/J9`，取出来只有 `J9`），
+/// 永远过不了 `OptiFine_*.jar` 的检查，官网这条等于从没试过。
 fn optifine_installer_bytes(
     strategy: crate::download::DownloadStrategy,
     mirrored: &str,
+    official_name: &str,
     http: &Client,
     cancel: &CancellationToken,
     progress: &(impl Fn(InstallProgress) + Sync),
@@ -2486,105 +2430,155 @@ fn optifine_installer_bytes(
     use std::sync::mpsc;
 
     let note = |text: &str| event(progress, game, "modloader-installer", text);
-    let official = |token: &CancellationToken| optifine_jar_bytes(mirrored, http, token);
-    let mirror = |token: &CancellationToken| -> Result<Option<Vec<u8>>> {
-        match fetch_progress(http, mirrored, 64 * 1024 * 1024, token, |_| {}) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(DownloadError::Cancelled) => Err(DownloadError::Cancelled),
-            // 403/超时/重定向失败都只说明「这条来源这次不行」，交给另一条。
-            Err(_) => Ok(None),
-        }
-    };
-    let missing = |text: &str| DownloadError::Invalid(text.into());
+    let official = |token: &CancellationToken| optifine_jar_bytes(http, token, official_name);
+    let mirror = |token: &CancellationToken| optifine_mirror_bytes(mirrored, token);
+    let missing = |text: String| DownloadError::Invalid(text);
 
     match strategy {
-        DownloadStrategy::OfficialOnly => match official(cancel)? {
-            Some(bytes) => Ok(bytes),
-            None => Err(missing(
-                "OptiFine 官网没取到安装器，当前策略没开镜像下载",
-            )),
+        DownloadStrategy::OfficialOnly => match official(cancel) {
+            (Some(bytes), _) => Ok(bytes),
+            (None, why) => Err(missing(format!(
+                "OptiFine 官网没取到安装器（{why}），当前策略没开镜像下载"
+            ))),
         },
         DownloadStrategy::MirrorOnly => match mirror(cancel)? {
-            Some(bytes) => Ok(bytes),
-            None => Err(missing(
-                "OptiFine 镜像没取到安装器，当前策略没开官方源下载",
-            )),
+            (Some(bytes), _) => Ok(bytes),
+            (None, why) => Err(missing(format!(
+                "OptiFine 镜像没取到安装器（{why}），当前策略没开官方源下载"
+            ))),
         },
-        DownloadStrategy::OfficialFirst => {
-            if let Some(bytes) = official(cancel)? {
+        DownloadStrategy::Sequential | DownloadStrategy::OfficialFirst => {
+            let (first, first_why) = official(cancel);
+            if let Some(bytes) = first {
                 return Ok(bytes);
             }
-            note("OptiFine 官网没取到安装器，改从镜像下载（较慢）");
-            mirror(cancel)?.ok_or_else(|| missing("OptiFine 安装器两边都没取到"))
+            note(&format!("OptiFine 官网没取到（{first_why}），改从镜像下载"));
+            match mirror(cancel)? {
+                (Some(bytes), _) => Ok(bytes),
+                (None, second_why) => Err(missing(format!(
+                    "OptiFine 安装器两边都没取到：官网 {first_why}；镜像 {second_why}"
+                ))),
+            }
         }
         DownloadStrategy::MirrorFirst => {
-            if let Some(bytes) = mirror(cancel)? {
+            let (first, first_why) = mirror(cancel)?;
+            if let Some(bytes) = first {
                 return Ok(bytes);
             }
-            note("OptiFine 镜像没取到安装器，改从官网下载（较慢）");
-            official(cancel)?.ok_or_else(|| missing("OptiFine 安装器两边都没取到"))
+            note(&format!("OptiFine 镜像没取到（{first_why}），改从官网下载"));
+            match official(cancel) {
+                (Some(bytes), _) => Ok(bytes),
+                (None, second_why) => Err(missing(format!(
+                    "OptiFine 安装器两边都没取到：镜像 {first_why}；官网 {second_why}"
+                ))),
+            }
         }
         DownloadStrategy::Race => {
             let official_token = CancellationToken::default();
             let mirror_token = CancellationToken::default();
-            let (tx, rx) = mpsc::channel::<(&'static str, Result<Option<Vec<u8>>>)>();
+            let (tx, rx) = mpsc::channel::<(&'static str, Result<Option<Vec<u8>>>, String)>();
             thread::scope(|scope| {
                 {
                     let tx = tx.clone();
                     let token = official_token.clone();
                     scope.spawn(move || {
-                        let out = optifine_jar_bytes(mirrored, http, &token);
-                        let _ = tx.send(("官网", out));
+                        let (bytes, why) = optifine_jar_bytes(http, &token, official_name);
+                        let _ = tx.send(("官网", Ok(bytes), why));
                     });
                 }
                 {
                     let tx = tx.clone();
                     let token = mirror_token.clone();
                     scope.spawn(move || {
-                        let out = match fetch_progress(http, mirrored, 64 * 1024 * 1024, &token, |_| {
-                        }) {
-                            Ok(bytes) => Ok(Some(bytes)),
-                            Err(DownloadError::Cancelled) => Err(DownloadError::Cancelled),
-                            Err(_) => Ok(None),
+                        let sent = match optifine_mirror_bytes(mirrored, &token) {
+                            Ok((bytes, why)) => tx.send(("镜像", Ok(bytes), why)),
+                            Err(error) => tx.send(("镜像", Err(error), String::new())),
                         };
-                        let _ = tx.send(("镜像", out));
+                        let _ = sent;
                     });
                 }
                 drop(tx);
-                let mut reason = String::from("OptiFine 安装器两边都没取到");
-                for _ in 0..2 {
-                    loop {
-                        if cancel.is_cancelled() {
+                let mut reasons: Vec<String> = Vec::new();
+                while reasons.len() < 2 {
+                    if cancel.is_cancelled() {
+                        official_token.cancel();
+                        mirror_token.cancel();
+                        return Err(DownloadError::Cancelled);
+                    }
+                    match rx.recv_timeout(Duration::from_millis(120)) {
+                        Ok((_, Ok(Some(bytes)), _)) => {
                             official_token.cancel();
                             mirror_token.cancel();
-                            return Err(DownloadError::Cancelled);
+                            return Ok(bytes);
                         }
-                        match rx.recv_timeout(Duration::from_millis(120)) {
-                            Ok((_, Ok(Some(bytes)))) => {
-                                // 另一边还在下，直接掐掉，别让用户白等带宽。
-                                official_token.cancel();
-                                mirror_token.cancel();
-                                return Ok(bytes);
+                        Ok((which, Ok(None), why)) => reasons.push(format!("{which} {why}")),
+                        Ok((which, Err(error), _)) => {
+                            if matches!(error, DownloadError::Cancelled) {
+                                continue;
                             }
-                            Ok((which, Ok(None))) => {
-                                reason = format!("{which}没取到安装器");
-                                break;
-                            }
-                            Ok((which, Err(error))) => {
-                                reason = format!("{which}: {error}");
-                                break;
-                            }
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                return Err(DownloadError::Invalid(reason));
-                            }
+                            reasons.push(format!("{which} {error}"));
                         }
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
-                Err(DownloadError::Invalid(reason))
+                Err(DownloadError::Invalid(format!(
+                    "OptiFine 安装器两边都没取到：{}",
+                    reasons.join("；")
+                )))
             })
         }
     }
+}
+
+/// OptiFine 安装器把自己的 `launchwrapper-of-<版本>.jar` 塞在包根目录里，
+/// 但版本 json 里写的是 maven 坐标 `optifine:launchwrapper-of:<版本>`——
+/// 那个坐标在所有公共仓库都不存在（实测 libraries.minecraft.net、forge maven、
+/// 阿里云、BMCLAPI 全 404），官方安装器是靠从自己包里复制出来的。
+/// 这里照做：缺哪个就从安装器里解哪个，解完库清单自然命中。
+fn extract_optifine_bundled_libraries(root: &Path, jar: &[u8]) -> Result<Vec<String>> {
+    let mut extracted = Vec::new();
+    let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(jar)) else {
+        return Ok(extracted);
+    };
+    for index in 0..zip.len() {
+        let Ok(mut entry) = zip.by_index(index) else {
+            continue;
+        };
+        let name = entry.name().to_owned();
+        let Some(version) = name
+            .strip_prefix("launchwrapper-of-")
+            .and_then(|rest| rest.strip_suffix(".jar"))
+        else {
+            continue;
+        };
+        if version.is_empty() {
+            continue;
+        }
+        let target = root
+            .join("libraries")
+            .join("optifine")
+            .join("launchwrapper-of")
+            .join(version)
+            .join(&name);
+        if target.is_file() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if std::io::Read::read_to_end(&mut entry, &mut bytes).is_err() {
+            continue;
+        }
+        write_new(&target, &bytes)?;
+        extracted.push(format!("optifine:launchwrapper-of:{version}"));
+    }
+    Ok(extracted)
+}
+
+/// 官网的安装器文件名：`OptiFine_<游戏版本>_<OptiFine 版本>.jar`。
+/// 清单里的版本偶尔自带游戏版本前缀（`1.21.11_HD_U_J9`），先剥掉再用。
+fn optifine_official_name(game: &str, version: &str) -> String {
+    let version = version.trim_start_matches(&format!("{game}_"));
+    format!("OptiFine_{game}_{version}.jar")
 }
 
 fn install_optifine(
@@ -2599,7 +2593,16 @@ fn install_optifine(
     let http = client()?;
     let id = profile_label(r);
     event(progress, &r.game_version, "modloader-installer", "");
-    let bytes = optifine_installer_bytes(r.strategy, &package.url, &http, cancel, progress, &r.game_version)?;
+    let official_name = optifine_official_name(&r.game_version, &r.loader_version);
+    let bytes = optifine_installer_bytes(
+        r.strategy,
+        &package.url,
+        &official_name,
+        &http,
+        cancel,
+        progress,
+        &r.game_version,
+    )?;
     event(
         progress,
         &r.game_version,
@@ -2609,6 +2612,15 @@ fn install_optifine(
             bytes.len() as f64 / (1024.0 * 1024.0)
         ),
     );
+    let bundled = extract_optifine_bundled_libraries(root, &bytes)?;
+    for name in &bundled {
+        event(
+            progress,
+            &r.game_version,
+            "modloader-install",
+            &format!("从安装器解出 {}", name),
+        );
+    }
     let jar = stage.0.join("OptiFine-installer.jar");
     write_new(&jar, &bytes)?;
     event(progress, &id, "modloader-prepare", "");
@@ -2620,6 +2632,7 @@ fn install_optifine(
             quilt_loader: None,
             strategy: r.strategy,
             threads: r.threads,
+            cache_roots: r.cache_roots.clone(),
         },
         cancel.clone(),
         |mut p| {
@@ -2893,6 +2906,7 @@ fn write_profile_loader(
             quilt_loader: None,
             strategy: r.strategy,
             threads: r.threads,
+            cache_roots: r.cache_roots.clone(),
         },
         cancel.clone(),
         |mut p| {
@@ -2953,6 +2967,65 @@ fn write_profile_loader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optifine_official_names_follow_the_site() {
+        // 官网的文件名是 `OptiFine_<游戏版本>_<版本>.jar`；清单里给的是 `HD_U_J9` 这种。
+        assert_eq!(
+            optifine_official_name("1.21.11", "HD_U_J9"),
+            "OptiFine_1.21.11_HD_U_J9.jar"
+        );
+        assert_eq!(
+            optifine_official_name("1.21.11", "HD_U_J9_pre4"),
+            "OptiFine_1.21.11_HD_U_J9_pre4.jar"
+        );
+        assert_eq!(
+            optifine_official_name("1.20.1", "HD_U_I6"),
+            "OptiFine_1.20.1_HD_U_I6.jar"
+        );
+        assert_eq!(
+            optifine_official_name("1.12.2", "HD_U_G5"),
+            "OptiFine_1.12.2_HD_U_G5.jar"
+        );
+        assert_eq!(
+            optifine_official_name("1.8.9", "HD_U_M5"),
+            "OptiFine_1.8.9_HD_U_M5.jar"
+        );
+        assert_eq!(
+            optifine_official_name("1.7.10", "HD_U_E7"),
+            "OptiFine_1.7.10_HD_U_E7.jar"
+        );
+        // 清单里万一带了游戏版本前缀，不要拼出 `OptiFine_1.21.11_1.21.11_...`。
+        assert_eq!(
+            optifine_official_name("1.21.11", "1.21.11_HD_U_J9"),
+            "OptiFine_1.21.11_HD_U_J9.jar"
+        );
+    }
+    #[test]
+    fn optifine_installer_check_rejects_anything_but_a_real_jar() {
+        assert!(!installable_optifine(b"<html>404</html>"));
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            writer
+                .start_file("srg/net/optifine/Config.class", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored))
+                .expect("entry");
+            std::io::Write::write_all(&mut writer, vec![0u8; 300 * 1024].as_slice())
+                .expect("body");
+            writer.finish().expect("finish");
+        }
+        assert!(installable_optifine(buffer.get_ref()));
+        let mut empty = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut empty);
+            writer
+                .start_file("readme.txt", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored))
+                .expect("entry");
+            std::io::Write::write_all(&mut writer, vec![0u8; 300 * 1024].as_slice())
+                .expect("body");
+            writer.finish().expect("finish");
+        }
+        assert!(!installable_optifine(empty.get_ref()));
+    }
     #[test]
     fn legacy_forge_is_everything_before_one_thirteen() {
         assert!(forge_pre_113("1.7.10"));
@@ -3167,7 +3240,7 @@ mod tests {
         let mut zip = zip::ZipWriter::new(File::create(&jar).unwrap());
         zip.start_file(
             "META-INF/MANIFEST.MF",
-            zip::write::SimpleFileOptions::default(),
+            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
         )
         .unwrap();
         zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: MissingTestMain\r\n\r\n")
@@ -3234,7 +3307,8 @@ mod tests {
             required_java_for("1.12.2", ModLoader::Forge, "14.23.5.2859"),
             8
         );
-        assert_eq!(required_java_for("26.3", ModLoader::NeoForge, "66.0.1"), 21);
+        // 26.x 是年号版本，原版基线已经是 Java 25（原来是 21）。
+        assert_eq!(required_java_for("26.3", ModLoader::NeoForge, "66.0.1"), 25);
     }
     #[test]
     fn trust_boundaries() {
@@ -3311,7 +3385,7 @@ mod tests {
     fn installer_fixture_identity_and_headless_capability() {
         fn write_jar(path: &Path, install: &Value, version: &Value) {
             let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
-            let options = zip::write::SimpleFileOptions::default();
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             for (name, data) in [
                 ("install_profile.json", serde_json::to_vec(install).unwrap()),
                 ("version.json", serde_json::to_vec(version).unwrap()),
@@ -3331,6 +3405,7 @@ mod tests {
             java_path: String::new(),
             strategy: crate::download::DownloadStrategy::default(),
             threads: None,
+            cache_roots: Vec::new(),
         };
         let modern_version = serde_json::json!({"id":"official-id","inheritsFrom":"1.21.1","mainClass":"cpw.mods.bootstraplauncher.BootstrapLauncher"});
         let modern = serde_json::json!({"spec":1,"minecraft":"1.21.1","version":"official-id","json":"/version.json"});
@@ -3391,6 +3466,7 @@ mod tests {
             java_path: String::new(),
             strategy: crate::download::DownloadStrategy::default(),
             threads: None,
+            cache_roots: Vec::new(),
         };
         let profile = liteloader_profile("1.12.2-LiteLoader", &request).unwrap();
         assert_eq!(

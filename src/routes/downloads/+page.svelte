@@ -9,6 +9,7 @@
     clearStop,
     continueTask,
     endTask,
+    markStop,
     pauseTask,
     requeueTask,
     resumeTask,
@@ -25,6 +26,7 @@
   } from "$lib/tasks.svelte";
   import { showError } from "$lib/dialogs.svelte";
   import { trackInstall, untrackInstall } from "$lib/install-live";
+  import { launchInstallFlight, setBallColor } from "$lib/install-flight.svelte";
   import { supportsLoader, type LoaderKind } from "$lib/loader-ranges";
   import Dropdown from "$lib/components/Dropdown.svelte";
   import { SIDES, TAGS, type SideFilter, type TagOption } from "$lib/content-tags";
@@ -174,16 +176,19 @@
 
   let settings = $state<Settings | null>(null);
   /** 下载源策略：有镜像的文件按它处理，没镜像的一律走官方。 */
-  const strategy = $derived<DownloadStrategy>(settings?.downloadStrategy ?? "race");
+  const strategy = $derived<DownloadStrategy>(settings?.downloadStrategy ?? "sequential");
   const threads = $derived(settings?.concurrentDownloads ?? 64);
 
   let loading = $state(true);
   /// 命中缓存时清单的年龄；0 表示刚拉的。
   let manifestAgeMs = $state(0);
-  let busy = $state(false);
+  /// 正在跑的安装（可以不止一个）的任务卡 id；面板上的暂停/取消对着最近开始的那个。
+  let activeInstalls = $state<number[]>([]);
   let summary = $state<InstallSummary | null>(null);
-  /// 安装任务在任务列表里的 id：进度都推到那张卡片上，面板里不再放进度条。
+  /// 最近一次开始的安装任务 id：面板与暂停/取消都对着它，进度推到对应的任务卡上。
   let installTaskId = $state<number | null>(null);
+  /// 安装按钮本体：光球从它的中心起飞。
+  let installButton = $state<HTMLButtonElement | null>(null);
   let unlisten: Array<() => void> = [];
 
   /// 清单顺序当底子，愚人节版挪到它基于的正式版后面（否则按名字会飞到最上面）。
@@ -211,6 +216,8 @@
   );
 
   const chosen = $derived(LOADER_ORDER.filter((item) => picked[item] !== undefined));
+  /// 一个加载器都没选：这次是装纯原版。
+  const plain = $derived(chosen.length === 0);
   /// 已选的加载器里还有没拿到版本的（正在拉取或拉取失败）：不能开始安装。
   const waiting = $derived(chosen.some((kind) => failed[kind] || !(entries[kind]?.length)));
   /// 某个已选加载器在当前筛选段里没有任何版本（右侧会显示「无」）。
@@ -292,6 +299,7 @@
     loading = true;
     try {
       settings = await api.loadSettings().catch(() => null);
+      setBallColor(settings?.installBallColor);
           const [cached, dir] = await Promise.all([
         cachedManifest(strategy, force),
         api.defaultGameDir()
@@ -356,6 +364,20 @@
     ]);
   }
 
+  /// 不管上游接口怎么排，统一成「新→旧」，并把最上面那条标成最新版。
+  ///
+  /// Quilt 的接口顺序是乱的（0.20.0-beta.9 排在 0.29.2 前面），Fabric 的倒是新→旧，
+  /// 所以不能信上游，出口统一排一遍。同版本号时正式版排前面。
+  function ordered(entries: Choice[]): Choice[] {
+    const sorted = [...entries].sort((left, right) => {
+      const byVersion = compareVersion(right.version, left.version);
+      if (byVersion !== 0) return byVersion;
+      if (left.stable !== right.stable) return left.stable ? -1 : 1;
+      return 0;
+    });
+    return sorted.map((item, index) => ({ ...item, latest: index === 0 }));
+  }
+
   /// 拉某个加载器在当前游戏版本下的构建列表。
   async function fetchEntries(kind: Loader, game: string): Promise<Choice[]> {
       if (kind === "fabric" || kind === "legacyfabric" || kind === "quilt") {
@@ -365,12 +387,14 @@
             : kind === "legacyfabric"
               ? await withTimeout(api.fetchLegacyFabricLoaders(game))
               : await withTimeout(api.fetchQuiltLoaders(game));
-        return list.map((item) => ({
-          version: item.version,
-          stable: item.stable,
-          beta: !item.stable,
-          recommended: false
-        }));
+        return ordered(
+          list.map((item) => ({
+            version: item.version,
+            stable: item.stable,
+            beta: !item.stable,
+            recommended: false
+          }))
+        );
       }
       if (kind === "labymod") {
         const stable = await withTimeout(api.fetchLabymodVersions("production"));
@@ -388,21 +412,24 @@
         // 通道只看版本号里有没有 beta/alpha；「推荐版」「最新版」是徽标，不是通道：
         // 后端把官方 promotions 的那一个标成 recommended，最新版就是排序后的第一个。
         const sorted = [...list].sort((left, right) => compareVersion(right.version, left.version));
-        return sorted.map((item) => ({
-          version: item.version,
-          stable: !item.beta,
-          beta: !!item.beta,
-          recommended: !!item.recommended,
-          latest: item.version === sorted[0]?.version
-        }));
+        return ordered(
+          sorted.map((item) => ({
+            version: item.version,
+            stable: !item.beta,
+            beta: !!item.beta,
+            recommended: !!item.recommended
+          }))
+        );
       }
       const list: LoaderEntry[] = await withTimeout(api.fetchLoaderCatalog(kind, game));
-      return list.map((item) => ({
-        version: item.version,
-        stable: item.stable,
-        beta: !item.stable,
-        recommended: false
-      }));
+      return ordered(
+        list.map((item) => ({
+          version: item.version,
+          stable: item.stable,
+          beta: !item.stable,
+          recommended: false
+        }))
+      );
   }
 
   /// 选中游戏版本后，按静态范围并发查所有加载器；范围里没有的连请求都不发。
@@ -477,11 +504,12 @@
 
   /// 三段筛选之后真正可选的版本（正式版在前，测试版在后）。
   function visible(kind: Loader): Choice[] {
+    const list = entries[kind] ?? [];
     const { stable, beta } = groupsOf(kind);
     const mode = typeFilter[kind] ?? "all";
     if (mode === "stable") return stable;
     if (mode === "beta") return beta;
-    return [...stable, ...beta];
+    return list;
   }
 
   /// 默认挑：正式版优先（有推荐版就选推荐版），没有正式版才用测试版。
@@ -540,7 +568,6 @@
   }
 
   function toggleLoader(kind: Loader) {
-    if (busy) return;
     active = kind;
     if (picked[kind] !== undefined) {
       const rest = { ...picked };
@@ -582,7 +609,6 @@
   }
 
   function clearLoaders() {
-    if (busy) return;
     picked = {};
     active = null;
     nameTouched = false;
@@ -662,6 +688,7 @@
 
   async function install() {
     if (!selected) return;
+    // 名字就是落盘目录名：改了就另建一份，没改就就地装这个版本。
     const name = instName.trim() || defaultName;
     if (!name) throw new Error("请填实例名");
     if (chosen.some((kind) => !picked[kind])) {
@@ -675,6 +702,13 @@
     }
     if (nameTaken) {
       showError("名字重复了", `版本「${name}」已经存在，换一个名字再装。`);
+      return;
+    }
+    // 同一个实例名已经在装了：不新建任务，直接把那张卡亮出来。
+    const running = activeInstalls.find((id) => plans.get(id)?.name === name);
+    if (running !== undefined) {
+      installTaskId = running;
+      announce(`「${name}」正在安装，任务卡已经在这里了`);
       return;
     }
     const plan: InstallPlan = {
@@ -699,8 +733,8 @@
     const { name } = plan;
     if (installTaskId !== taskId) resumeTask(taskId);
     installTaskId = taskId;
+    activeInstalls = [...activeInstalls.filter((id) => id !== taskId), taskId];
     trackInstall(taskId);
-    busy = true;
     clearStop();
     pausedRun = false;
     summary = null;
@@ -709,15 +743,30 @@
       if (plan.javaPath === "" && plan.loaders.length > 0 && isModloader && !javaPlan?.path) {
         throw new Error(javaPlan?.message ?? "没有检测到可用的 Java");
       }
-      summary = await api.installGameInstance({
-        gameDir,
-        gameVersion: plan.gameVersion,
-        instanceName: name,
-        loaders: plan.loaders,
-        javaPath: plan.javaPath,
-        strategy,
-        threads
-      }, taskId);
+      // 同名就地装走普通版本安装；改了名（哪怕没选加载器）都要另立一份。
+      summary =
+        plan.loaders.length === 0 && plan.name === plan.gameVersion
+          ? await api.installGameVersion(
+              {
+                gameDir,
+                versionId: plan.gameVersion,
+                strategy,
+                threads
+              },
+              taskId
+            )
+          : await api.installGameInstance(
+              {
+                gameDir,
+                gameVersion: plan.gameVersion,
+                instanceName: name,
+                loaders: plan.loaders,
+                javaPath: plan.javaPath,
+                strategy,
+                threads
+              },
+              taskId
+            );
       // 刚装完，版本页的扫描缓存已经不准了。
       forgetScan(gameDir);
       setTaskOutput(taskId, { path: summary.path, kind: "dir" });
@@ -731,8 +780,10 @@
       }
     } catch (e) {
       const message = describeError(e);
-      // 暂停 / 取消是在「下载任务」页里点的，那边只留一个标记。
-      const stop = stopping ?? takeStop();
+      // 暂停 / 取消是在「下载任务」页里点的，那边只留一个标记；
+      // 并行安装时按任务 id 各查各的，别把别人的暂停算到自己头上。
+      const stop = stops.get(taskId) ?? stopping ?? takeStop();
+      stops.delete(taskId);
       stopping = null;
       if (message === "安装已取消") {
         if (stop === "pause") {
@@ -757,10 +808,11 @@
         setTaskResume(taskId, null);
       }
     } finally {
-      busy = false;
       stopping = null;
-      installTaskId = null;
-      untrackInstall();
+      activeInstalls = activeInstalls.filter((id) => id !== taskId);
+      untrackInstall(taskId);
+      // 面板对着最近开始的那次；它结束了就退回到还在跑的下一个。
+      installTaskId = activeInstalls.length ? activeInstalls[activeInstalls.length - 1] : null;
     }
   }
 
@@ -781,18 +833,30 @@
   let stopping: "pause" | "cancel" | null = $state(null);
   /// 这一轮是被「暂停」停下的：进度行的阶段文案要说「已暂停」而不是「已取消」。
   let pausedRun = $state(false);
+  /// 每次安装各自是怎么被停的：并行时不能用一个全局变量分辨谁被暂停、谁被取消。
+  const stops = new Map<number, "pause" | "cancel">();
 
   async function cancel(mode: "pause" | "cancel") {
-    stopping = mode;
-    pausedRun = mode === "pause";
+    const target = installTaskId ?? packTaskId;
+    if (target === null) return;
+    await cancelTask(target, mode);
+  }
+
+  /// 取消某一个具体的安装（并行时面板上会逐个列出，各自都能停）。
+  async function cancelTask(taskId: number, mode: "pause" | "cancel") {
+    if (activeInstalls.includes(taskId)) stops.set(taskId, mode);
+    if (installTaskId === taskId) {
+      stopping = mode;
+      pausedRun = mode === "pause";
+    }
     try {
-      await api.cancelInstall(installTaskId ?? packTaskId, mode);
+      markStop(mode);
+      await api.cancelInstall(taskId, mode);
       // 取消是「这一轮作废」：面板上不留进度，进度只在任务列表里查。
       // 暂停要保留，好让「重试」接着下。
-      if (mode === "cancel") {
-        summary = null;
-      }
+      if (mode === "cancel" && installTaskId === taskId) summary = null;
     } catch (e) {
+      stops.delete(taskId);
       stopping = null;
       showError("停不下来", "后台没有接住这次的停止请求。", String(e));
     }
@@ -3174,7 +3238,7 @@
     {#if cat === "packs"}
       <button class="btn" onclick={importPack} disabled={!gameDir || mrBusy}>导入整合包</button>
     {/if}
-    <button class="btn" onclick={() => loadManifest(true)} disabled={loading || busy}>刷新清单</button>
+    <button class="btn" onclick={() => loadManifest(true)} disabled={loading}>刷新清单</button>
   </header>
 
   <nav class="cats">
@@ -3240,7 +3304,7 @@
 
         <div class="field">
           <div class="chips">
-            <button class="chip" class:on={chosen.length === 0} onclick={clearLoaders} disabled={busy}>
+            <button class="chip" class:on={chosen.length === 0} onclick={clearLoaders}>
               原版
             </button>
             {#each LOADER_ORDER as item (item)}
@@ -3249,7 +3313,7 @@
                   class="chip"
                   class:on={picked[item] !== undefined}
                   onclick={() => toggleLoader(item)}
-                  disabled={busy}
+                  disabled={false}
                   title={PRIMARY.includes(item) ? "主加载器同时只能选一个" : undefined}
                 >
                   {LOADER_NAME[item]}
@@ -3266,7 +3330,6 @@
             bind:value={instName}
             oninput={() => (nameTouched = true)}
             class:warn={nameTaken}
-            disabled={busy}
             placeholder={defaultName}
           />
           {#if nameTaken}
@@ -3281,7 +3344,7 @@
             <span class="label">{LOADER_NAME[kind]}</span>
             {#if failed[kind]}
               <span class="loader-state">未拉取到</span>
-              <button class="btn ghost loader-retry" onclick={() => retry(kind)} disabled={busy}>
+              <button class="btn ghost loader-retry" onclick={() => retry(kind)}>
                 重试
               </button>
             {:else if !(entries[kind]?.length)}
@@ -3298,7 +3361,7 @@
                     class="seg-btn"
                     class:on={(typeFilter[kind] ?? "all") === entry.mode}
                     onclick={() => setFilter(kind, entry.mode as "all" | "stable" | "beta")}
-                    disabled={busy}
+                    disabled={false}
                   >
                     {entry.text}
                   </button>
@@ -3312,7 +3375,7 @@
                     if (!current) return;
                     openMenu = openMenu === kind ? null : kind;
                   }}
-                  disabled={busy || !current}
+                  disabled={!current}
                 >
                   <span class="select-version">{current ? labelOf(kind, current) : "无"}</span>
                   {#if current && dateOf(kind, current.version)}
@@ -3371,7 +3434,7 @@
                   value={extraPicked[mod.id] ?? ""}
                   placeholder="选择版本"
                   label={mod.name}
-                  disabled={busy || extraBusy}
+                  disabled={extraBusy}
                   onchange={(picked) => (extraPicked[mod.id] = picked)}
                   options={(extraVersions[mod.id] ?? []).map((version) => ({
                     value: version.id,
@@ -3391,19 +3454,15 @@
         <div class="actions">
           <button
             class="btn primary"
-            onclick={install}
-            disabled={busy || waiting || !selected || nameTaken || missingBuild.length > 0}
+            bind:this={installButton}
+            onclick={() => {
+              launchInstallFlight(installButton?.getBoundingClientRect() ?? null);
+              void install();
+            }}
+            disabled={waiting || !selected || nameTaken || missingBuild.length > 0}
           >
-            {busy ? "安装中…" : "安装"}
+            安装
           </button>
-          {#if busy}
-            <button class="btn" onclick={() => cancel("pause")} disabled={stopping !== null}>
-              暂停
-            </button>
-            <button class="btn" onclick={() => cancel("cancel")} disabled={stopping !== null}>
-              取消
-            </button>
-          {/if}
         </div>
 
       {/if}

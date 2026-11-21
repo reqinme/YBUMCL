@@ -38,6 +38,10 @@ export type VersionView = {
   icon: string;
   /** 启动次数 */
   launches: number;
+  /** 安装时间（unix 秒）；老实例回落到目录创建时间 */
+  installedAt?: number | null;
+  /** 最近一次启动时间（`logs/runs/index.json` 的 `started`），没启动过是 null */
+  lastStarted?: string | null;
   /** 整合包信息；手动装的实例是 null */
   pack: PackInfo | null;
   /** 内存分配方式：0 自动、1 自定义、2 跟随全局 */
@@ -93,6 +97,8 @@ export type Category = {
 export type CategorySnapshot = {
   categories: Category[];
   tags: Record<string, string[]>;
+  /** 这个目录的版本排序方式（`default` / `name` / `version` / `loader` / `recent`） */
+  order: string;
 };
 
 export type PackInfo = {
@@ -190,6 +196,9 @@ export type JavaPlan = {
 export type LogLine = {
   stream: string;
   text: string;
+  /// 多开时靠它区分是哪一份日志：同一实例的两份靠 runId 分开。
+  runId?: number;
+  versionId?: string;
 };
 
 export type GameSnapshot = {
@@ -246,6 +255,8 @@ export type LoaderEntry = {
 };
 
 export type InstallProgress = {
+  /// 哪一次安装发的事件（前端任务卡的 id）；多张卡同时在跑时靠它写回各自的卡。
+  installId?: number;
   versionId: string;
   stage: string;
   path: string;
@@ -399,7 +410,12 @@ export type CleanTarget = {
 
 /** 下载源策略：有镜像的文件按它处理；没有镜像的一律走官方。 */
 export type DownloadStrategy =
-  "race" | "official-first" | "mirror-first" | "mirror-only" | "official-only";
+  | "sequential"
+  | "race"
+  | "official-first"
+  | "mirror-first"
+  | "mirror-only"
+  | "official-only";
 
 export type Settings = {
   schemaVersion: number;
@@ -411,6 +427,15 @@ export type Settings = {
   downloadStrategy: DownloadStrategy;
   /** 最大线程数：同时下载的线程上限（1–256，PCL 同款，默认 64）。 */
   concurrentDownloads: number;
+  /** 隔离模式：always = 每个版本自己的 mods/存档（默认），auto = 目录里有 mods/saves 才隔离，
+   * never = 所有版本共用 .minecraft。 */
+  isolationMode: "all" | "off";
+  /** 复用其它已登记游戏目录里下过的资源（按 SHA1 命中即复制）。 */
+  reuseGameFolders: boolean;
+  /** 「安装光球」颜色（`#rrggbb`）：点安装后飞向下载圆环的那颗球。 */
+  installBallColor: string;
+  /** 下载协议：false = HTTP/1.1（默认），true = HTTP/2。 */
+  useHttp2: boolean;
   /** 下载限速档位（0–42，PCL 同款）：42 不限速，每个任务单独一份额度。 */
   downloadSpeed: number;
   homeRailCollapsed: boolean;
@@ -508,6 +533,29 @@ export type Account = {
   avatar: string | null;
   /// 第三方账户所属的认证服务器地址。
   server: string | null;
+  /// 整张皮肤与披风（`data:image/png;base64,…`），没有就是 null。
+  skin: string | null;
+  cape: string | null;
+  /// `slim` 或 `classic`。
+  skinModel: string | null;
+  /// 选的是哪一款官方默认皮肤（`steve`/`alex`/…），自定义皮肤为 null。
+  skinOfficial: string | null;
+  /// 选的是哪一张内置披风（`minecon2011`/…），自选文件为 null。
+  capeOfficial: string | null;
+};
+
+/// 第三方服务器的外链登录：先要设备码，再轮询。
+export type DeviceLogin = {
+  session: string;
+  userCode: string;
+  verificationUri: string;
+  interval: number;
+  expiresIn: number;
+};
+
+export type DevicePoll = {
+  state: "pending" | "slow_down" | "denied" | "expired" | "done";
+  accounts: AccountsView | null;
 };
 
 /// 加过的第三方认证服务器（左栏就是按这个列表生成的）。
@@ -516,9 +564,21 @@ export type AuthServer = {
   name: string;
 };
 
+/// 皮肤选择的结果：`skin` 是 data URL，`model` 是 `slim` 或 `classic`。
+export interface CapePick {
+  cape: string;
+}
+
+export interface SkinPick {
+  skin: string;
+  model: string;
+}
+
 export type AccountsView = {
   players: Account[];
   current: string | null;
+  /** 每个来源档自己的顺序：`all` / `offline` / `microsoft` / 第三方服务器 URL。 */
+  orders: Record<string, string[]>;
   servers: AuthServer[];
 };
 
@@ -717,6 +777,8 @@ export const api = {
   setVersionCategories: (version: string, categories: string[]) =>
     invoke<CategorySnapshot>("set_version_categories", { version, categories }),
   /// 打星 / 取消打星：星标就是「标星实例」这条内置分类上的 tag。
+  setVersionOrder: (order: string) =>
+    invoke<CategorySnapshot>("set_version_order", { order }),
   setStarred: (version: string, starred: boolean) =>
     invoke<CategorySnapshot>("set_starred", { version, starred }),
   /// 把旧版存在 localStorage 里的星标并进 categories.json。
@@ -736,14 +798,29 @@ export const api = {
       loaderVersion,
       versionId,
     }),
-  gameSnapshot: () => invoke<GameSnapshot>("game_snapshot"),
-  fetchRemoteVersions: (strategy: DownloadStrategy = "race") =>
+  gameSnapshot: (versionId?: string, runId?: number) =>
+    invoke<GameSnapshot>("game_snapshot", { versionId, runId }),
+  listRuns: () => invoke<RunView[]>("list_runs"),
+  stopRun: (runId: number) => invoke<void>("stop_run", { runId }),
+  runHistory: (limit?: number) =>
+    invoke<RunEntry[]>("run_history", { limit }),
+  exportCrashReport: (
+    target: string,
+    versionId: string,
+    runFile?: string | null,
+  ) =>
+    invoke<string>("export_crash_report", {
+      target,
+      versionId,
+      runFile: runFile ?? null,
+    }),
+  fetchRemoteVersions: (strategy: DownloadStrategy = "sequential") =>
     invoke<RemoteVersionManifest>("fetch_remote_versions", { strategy }),
   fetchQuiltLoaders: (gameVersion: string) =>
     invoke<FabricLoaderVersion[]>("fetch_quilt_loaders", { gameVersion }),
   fetchFabricLoaders: (
     gameVersion: string,
-    strategy: DownloadStrategy = "race",
+    strategy: DownloadStrategy = "sequential",
   ) =>
     invoke<FabricLoaderVersion[]>("fetch_fabric_loaders", {
       gameVersion,
@@ -1126,17 +1203,37 @@ export const api = {
   deleteOutput: (path: string) => invoke<void>("delete_output", { path }),
   pathExists: (path: string) => invoke<boolean>("path_exists", { path }),
   listAccounts: () => invoke<AccountsView>("list_accounts"),
-  addOfflineAccount: (name: string) =>
-    invoke<AccountsView>("add_offline_account", { name }),
+  addOfflineAccount: (name: string, uuid?: string) =>
+    invoke<AccountsView>("add_offline_account", { name, uuid }),
+  setOfflineLook: (args: {
+    id: string;
+    skin: string | null;
+    skinModel: string | null;
+    skinOfficial: string | null;
+    cape: string | null;
+    capeOfficial: string | null;
+  }) => invoke<AccountsView>("set_offline_look", args),
+  pickSkinFile: () => invoke<SkinPick | null>("pick_skin_file"),
+  pickCapeFile: () => invoke<CapePick | null>("pick_cape_file"),
+  fetchLittleskinSkin: (name: string) =>
+    invoke<SkinPick>("fetch_littleskin_skin", { name }),
   renameAccount: (id: string, name: string) =>
     invoke<AccountsView>("rename_account", { id, name }),
   removeAccount: (id: string) => invoke<AccountsView>("remove_account", { id }),
   selectAccount: (id: string) => invoke<AccountsView>("select_account", { id }),
+  clearAccount: () => invoke<AccountsView>("clear_account"),
+  reorderAccounts: (filter: string, ids: string[]) =>
+    invoke<AccountsView>("reorder_accounts", { filter, ids }),
   refreshAccount: (id: string) => invoke<AccountsView>("refresh_account", { id }),
   addAuthServer: (url: string) =>
     invoke<AccountsView>("add_auth_server", { url }),
   removeAuthServer: (url: string) =>
     invoke<AccountsView>("remove_auth_server", { url }),
+  /// 外链登录第一步：拿设备码。
+  startOpenidLogin: (url: string) => invoke<DeviceLogin>("start_openid_login", { url }),
+  /// 外链登录第二步：轮询一次状态（`done` 时带回账户表）。
+  pollOpenidLogin: (session: string) =>
+    invoke<DevicePoll>("poll_openid_login", { session }),
   addThirdPartyAccount: (url: string, username: string, password: string) =>
     invoke<AccountsView>("add_third_party_account", { url, username, password }),
   msLoginStart: () => invoke<DeviceCode>("ms_login_start"),
@@ -1236,10 +1333,76 @@ export function onFileSearch(
   );
 }
 
+export type GameExit = { runId: number; versionId: string; code: number | null };
+
+/// 「运行中实例」浮层里的一行。`index` 是同名实例里的第几份（从 1 开始）。
+export type RunView = {
+  runId: number;
+  versionId: string;
+  pid: number;
+  index: number;
+};
+
 export function onGameExit(
-  handler: (code: number | null) => void,
+  handler: (event: GameExit) => void,
 ): Promise<UnlistenFn> {
-  return listen<number | null>("game-exit", (event) => handler(event.payload));
+  return listen<GameExit>("game-exit", (event) => handler(event.payload));
+}
+
+/// 装完一个版本/加载器/整合包之后由后端广播：各页面据此重新读盘。
+export type VersionsChanged = { gameDir: string };
+
+export function onVersionsChanged(
+  handler: (event: VersionsChanged) => void,
+): Promise<UnlistenFn> {
+  return listen<VersionsChanged>("versions-changed", (event) =>
+    handler(event.payload),
+  );
+}
+
+/// 一次启动在 `logs/runs/index.json` 里的记录。
+export type RunEntry = {
+  runId: number;
+  versionId: string;
+  pid?: number;
+  started: string;
+  ended?: string;
+  exitCode?: number;
+  file: string;
+  crashed: boolean;
+};
+
+/// 崩溃规则表命中的一条。
+export type CrashHit = {
+  id: string;
+  severity: "fatal" | "error" | "warn" | string;
+  title: string;
+  detail: string;
+  fix: string;
+  evidence: string[];
+};
+
+/// 游戏非正常退出：规则表给出的诊断。
+export type GameCrash = {
+  runId: number;
+  versionId: string;
+  code: number | null;
+  hits: CrashHit[];
+};
+
+export function onGameCrash(
+  handler: (event: GameCrash) => void,
+): Promise<UnlistenFn> {
+  return listen<GameCrash>("game-crash", (event) => handler(event.payload));
+}
+
+/// Java 选错导致启动失败时，后端给出的「换成哪个 Java 再试一次」建议。
+export type JavaRetry = { versionId: string; javaPath: string; reason: string };
+
+export function onJavaRetry(
+  handler: (payload: JavaRetry) => void,
+): Promise<UnlistenFn> {
+  return listen<JavaRetry>("java-retry", (event) => handler(event.payload));
 }
 
 export function onInstallProgress(

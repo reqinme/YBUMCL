@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -53,6 +54,8 @@ pub struct PackInfo {
 pub struct VersionSettings {
     /// 隔离：mods/存档放在 `versions/<id>` 里，而不是共享的 `.minecraft`。
     pub isolated: bool,
+    /// 隔离是否已经判定过（PCL 只按规则判一次，之后以用户的选择为准）。
+    pub isolation_decided: bool,
     /// 空字符串表示"自动挑选"（由前端用 requiredJavaMajor + 已探测列表决定）。
     pub java_path: String,
     /// 0 表示"跟随全局设置"（旧字段，仅给老 json 兜底；新逻辑看 `memory_type`）。
@@ -104,6 +107,7 @@ impl Default for VersionSettings {
         // 新建版本的默认值：隔离开启（与 PCL 一致，避免 mods/存档互相污染）。
         Self {
             isolated: true,
+            isolation_decided: false,
             java_path: String::new(),
             max_memory_mb: 0,
             memory_type: 2,
@@ -179,7 +183,7 @@ impl VersionSettings {
 }
 
 /// 内置方块图的名字，和前端 `src/lib/version-icon.ts` 里的键一一对应。
-pub const ICON_BUILTINS: [&str; 14] = [
+pub const ICON_BUILTINS: [&str; 15] = [
     "CobbleStone",
     "CommandBlock",
     "GoldBlock",
@@ -194,6 +198,7 @@ pub const ICON_BUILTINS: [&str; 14] = [
     "NeoForge",
     "Quilt",
     "Cleanroom",
+    "LabyMod",
 ];
 
 fn sanitize_icon(icon: &str) -> String {
@@ -388,14 +393,35 @@ fn instance_path(game_dir: &Path, id: &str) -> PathBuf {
     instance_dir(game_dir, id).join(INSTANCE_FILE)
 }
 
+/// 全局隔离开关：true = 每个版本自己的 mods/存档（默认），false = 全部共用 `.minecraft`。
+static ISOLATION: AtomicBool = AtomicBool::new(true);
+
+/// 设置页 / 启动时调用：只有「隔离版本」和「不隔离版本」两种状态。
+pub fn set_isolation_mode(mode: &str) {
+    ISOLATION.store(mode != "off", Ordering::Relaxed);
+}
+
+fn isolation_on() -> bool {
+    ISOLATION.load(Ordering::Relaxed)
+}
+
 /// 读某个实例自己的设置；文件缺失或损坏都给默认值（不落盘）。
 pub fn load_instance(game_dir: &Path, id: &str) -> VersionSettings {
     let Ok(text) = fs::read_to_string(instance_path(game_dir, id)) else {
         return VersionSettings::default();
     };
-    serde_json::from_str::<VersionSettings>(&text)
+    let mut settings = serde_json::from_str::<VersionSettings>(&text)
         .map(VersionSettings::sanitized)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 只在第一次把全局开关落到实例记录里；用户手动改过就不再覆盖。
+    if !settings.isolation_decided {
+        settings.isolated = isolation_on();
+        settings.isolation_decided = true;
+        if instance_dir(game_dir, id).is_dir() {
+            let _ = save_instance(game_dir, id, settings.clone());
+        }
+    }
+    settings
 }
 
 /// 写某个实例自己的设置。实例目录必须已经存在——不替用户凭空建实例文件夹。
@@ -408,6 +434,9 @@ pub fn save_instance(game_dir: &Path, id: &str, settings: VersionSettings) -> Re
         return Err(format!("这个实例目录不存在：{}", dir.display()));
     }
     let path = dir.join(INSTANCE_FILE);
+    // 走到这里说明是用户显式保存（或迁移），之后不再按全局档位覆盖。
+    let mut settings = settings;
+    settings.isolation_decided = true;
     let text = serde_json::to_string_pretty(&settings.sanitized()).map_err(|e| e.to_string())?;
     let part = dir.join(format!("{INSTANCE_FILE}.part"));
     fs::write(&part, text).map_err(|e| format!("写入实例设置失败（{}）：{e}", path.display()))?;

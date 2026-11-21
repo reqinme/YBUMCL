@@ -54,6 +54,10 @@ pub struct Category {
 #[serde(rename_all = "camelCase", default)]
 pub struct DirCategories {
     pub categories: Vec<Category>,
+    /// 这个目录的版本排序方式（`default` / `name` / `version` / `loader` / `recent`）。
+    /// 空 = 没记录过，前端按「默认顺序」处理。
+    #[serde(default)]
+    pub order: String,
     /// 版本 id → 分类 id（只记非空的）。
     pub tags: BTreeMap<String, Vec<String>>,
 }
@@ -81,6 +85,8 @@ impl Default for Store {
 pub struct CategorySnapshot {
     pub categories: Vec<Category>,
     pub tags: BTreeMap<String, Vec<String>>,
+    /// 这个目录的排序方式，语义见 [`DirCategories::order`]。
+    pub order: String,
 }
 
 fn store_path(data_dir: &Path) -> PathBuf {
@@ -102,7 +108,25 @@ pub fn snapshot(data_dir: &Path, game_dir: &str) -> CategorySnapshot {
     CategorySnapshot {
         categories: dir.categories,
         tags: dir.tags,
+        order: dir.order,
     }
+}
+
+/// 记下这个目录的版本排序方式。
+pub fn set_order(data_dir: &Path, game_dir: &str, order: &str) -> Result<CategorySnapshot, String> {
+    let mut store = load(data_dir);
+    let key = dir_key(game_dir);
+    let mut dir = store.dirs.remove(&key).unwrap_or_default();
+    ensure_starred(&mut dir);
+    dir.order = order.to_owned();
+    let snapshot = CategorySnapshot {
+        categories: dir.categories.clone(),
+        tags: dir.tags.clone(),
+        order: dir.order.clone(),
+    };
+    store.dirs.insert(key, dir);
+    save(data_dir, &store)?;
+    Ok(snapshot)
 }
 
 /// 目录键：小写、去末尾分隔符，Windows 下不区分大小写。

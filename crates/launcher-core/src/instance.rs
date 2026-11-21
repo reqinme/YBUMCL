@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::base::{base_busy, base_lock, wait_lock, BaseLease, InstallLease};
 use crate::download::{
     self, CancellationToken, DownloadError, InstallProgress, InstallRequest, InstallSummary,
 };
@@ -43,6 +44,9 @@ pub struct InstanceRequest {
     pub strategy: download::DownloadStrategy,
     #[serde(default)]
     pub threads: Option<u32>,
+    /// 其它游戏目录：本目录缺的资源先从这些目录按 SHA1 复制，不发网络请求。
+    #[serde(default)]
+    pub cache_roots: Vec<String>,
     /// 允许覆盖同名实例（实例内追加/更换加载器的场景）。
     #[serde(default)]
     pub overwrite: bool,
@@ -117,6 +121,7 @@ fn same_instance(
     })
 }
 
+
 pub fn install_instance(
     request: InstanceRequest,
     cancel: CancellationToken,
@@ -127,6 +132,8 @@ pub fn install_instance(
         return Err(DownloadError::Invalid("unsafe game version".into()));
     }
     let root = instance_root(&request.game_dir)?;
+    let _lease = BaseLease::new(&game);
+    let _installs = InstallLease::new();
     let parts = loader_parts(&request.loaders)?;
     let name = match request.instance_name.as_deref().map(str::trim) {
         Some(name) if !name.is_empty() => name.to_owned(),
@@ -180,7 +187,8 @@ pub fn install_instance(
             merge::clear_incomplete(&root, &name);
             // 取消/失败时「原版底稿」可能只下到一半（还停在暂存态，没有 `<game>.json`）。
             // 它不归实例名管，不在这里清掉就会以「装了但缺文件」的样子留在版本页。
-            if cancel.is_cancel_requested() && name != game {
+            // 并行安装时别的任务可能正要用这份底稿，只有在没有别人在用时才清。
+            if cancel.is_cancel_requested() && name != game && !base_busy(&game) {
                 let base_json = root
                     .join("versions")
                     .join(&game)
@@ -190,7 +198,8 @@ pub fn install_instance(
                 }
             }
             // 取消就把这次留下的半截文件扫干净；assets/libraries 的完整文件不动。
-            if cancel.is_cancel_requested() {
+            // 别的安装可能正在写自己的 `.part`，只有咱一个在跑时才扫。
+            if cancel.is_cancel_requested() && crate::base::installs_active() <= 1 {
                 let swept = merge::sweep_parts(&root);
                 if swept > 0 {
                     event(&progress, &name, "instance-cleanup", "", 0, 0, 0);
@@ -212,23 +221,61 @@ fn build_instance(
 ) -> std::result::Result<InstanceSummary, DownloadError> {
     let strategy = request.strategy;
     let threads = request.threads;
-    // 1. 原版：合并的底稿，缺了就装。
-    let installed_base = !merge::version_json_path(root, game).is_file();
-    if installed_base {
-        event(progress, name, "instance-vanilla", "", 0, 0, 0);
-        download::install_version(
-            InstallRequest {
-                game_dir: request.game_dir.clone(),
-                version_id: game.to_owned(),
-                fabric_loader: None,
-                quilt_loader: None,
-                strategy,
-                threads,
-            },
-            cancel.clone(),
-            |step| progress(step),
-        )?;
-    }
+    // 1. 原版：合并的底稿，缺了就装。同一基础版本全局串行，装完再复核一次。
+    let installed_base = {
+        let lock = base_lock(game);
+        // 别人正在装同一个底稿时，等它、并在提示里说清楚，而不是干停在 0/0。
+        if lock.try_lock().is_err() {
+            event(progress, name, "instance-wait", "", 0, 0, 0);
+        }
+        let _serial = wait_lock(&lock, cancel)?;
+        let mut missing = !merge::base_json_path(root, game).is_file();
+        if missing {
+            // 旧版本把底稿放在 versions/<原版>：搬到缓存里，顺手去掉那张多余的版本卡。
+            let legacy = merge::version_json_path(root, game);
+            if legacy.is_file() {
+                let target = merge::scaffold_dir(root, game);
+                if let Some(parent) = target.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::remove_dir_all(&target);
+                if let Some(dir) = legacy.parent() {
+                    if fs::rename(dir, &target).is_ok() {
+                        missing = false;
+                    }
+                }
+            }
+        }
+        if missing {
+            event(progress, name, "instance-vanilla", "", 0, 0, 0);
+            // 已经持有这一版的锁，再走会加锁的入口会自己等自己。
+            download::install_version_locked(
+                InstallRequest {
+                    game_dir: request.game_dir.clone(),
+                    version_id: game.to_owned(),
+                    fabric_loader: None,
+                    quilt_loader: None,
+                    strategy,
+                    threads,
+                    cache_roots: request.cache_roots.clone(),
+                },
+                cancel.clone(),
+                |step| progress(step),
+            )?;
+            // 装完立刻搬进缓存：底稿不是用户版本，不该出现在版本列表里。
+            let from = root.join("versions").join(game);
+            let to = merge::scaffold_dir(root, game);
+            if from.is_dir() {
+                if let Some(parent) = to.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::remove_dir_all(&to);
+                let _ = fs::rename(&from, &to);
+            }
+        }
+        missing
+    };
+    let _ = installed_base;
     // 2. 逐个装加载器，拿到它们各自产出的版本 id。
     let java = pick_java(request, game, parts)?;
     let mut summary = InstallSummary {
@@ -243,6 +290,10 @@ fn build_instance(
     let optifine_as_mod =
         parts.len() > 1 && parts.iter().any(|part| part.kind == LoaderKind::OptiFine);
     let mut produced: Vec<LoaderPart> = Vec::with_capacity(parts.len());
+    // 加载器外壳（`versions/neoforge-<版本>` 之类）是安装期的共享工作目录：
+    // 两个安装用同一个加载器版本时会同时写它、还会互相把它删掉。这里按外壳 id
+    // 加锁 + 登记租约，锁只保护安装本身，租约一直留到收尾清理之后。
+    let mut shell_leases: Vec<crate::base::BaseLease> = Vec::new();
     for part in parts {
         check_cancelled(cancel)?;
         if optifine_as_mod && part.kind == LoaderKind::OptiFine {
@@ -254,8 +305,15 @@ fn build_instance(
             part.version.as_str()
         };
         event(progress, name, "instance-loader", stage_path, 0, 0, 0);
+        let shell = profile_id(part.kind, game, &part.version);
+        shell_leases.push(crate::base::BaseLease::new(&shell));
+        let shell_lock = crate::base::base_lock(&shell);
+        let _serial = crate::base::wait_lock(&shell_lock, cancel)?;
         // 同名加载器外壳是上次没清掉的中间产物，直接重写；真正的实例不碰。
-        clear_loader_profile(root, &profile_id(part.kind, game, &part.version));
+        // 还有别的安装在用它（合并阶段）时不能删，否则对方读不到版本 json。
+        if !crate::base::base_busy(&shell) {
+            clear_loader_profile(root, &shell);
+        }
         let id = match part.kind {
             LoaderKind::Fabric | LoaderKind::Quilt => {
                 let fabric = part.kind == LoaderKind::Fabric;
@@ -267,6 +325,7 @@ fn build_instance(
                         quilt_loader: (!fabric).then(|| part.version.clone()),
                         strategy,
                         threads,
+                        cache_roots: request.cache_roots.clone(),
                     },
                     cancel.clone(),
                     |step| progress(step),
@@ -325,6 +384,7 @@ fn build_instance(
                         java_path: java.clone(),
                         strategy,
                         threads: threads.map(|n| n.min(16)),
+                        cache_roots: request.cache_roots.clone(),
                     },
                     cancel.clone(),
                     |step| progress(step),
@@ -360,6 +420,7 @@ fn build_instance(
                 java_path: java.clone(),
                 strategy,
                 threads: threads.map(|n| n.min(16)),
+                cache_roots: request.cache_roots.clone(),
             },
             cancel.clone(),
             |step| progress(step),
@@ -409,7 +470,12 @@ fn build_instance(
         .cloned()
         .collect();
     let merged_parts = merge::merge_order(&rest);
-    merge::write_instance(root, &base, &merged_parts, name)?;
+    // 实例一律合并式（每个实例自带一份核心 jar，同 PCL）；LabyMod 的底稿
+    // 本身就是完整 profile，合进来之后实例也不再依赖它。
+    let flat = true;
+    merge::write_instance(root, &base, &merged_parts, name, flat, &game)?;
+    // LabyMod 被当成底稿排除在 `merged_parts` 之外，加载器清单单独补一遍。
+    merge::stamp_loaders_for(root, name, &game, &produced)?;
     // 合并后的实例 json 才是最终库清单。Forge 1.16.5 这类新版安装器只把库下到
     // 暂存目录、发布时漏掉（启动会报 Cannot find launch target fmlclient），
     // 这里按实例 json 再补一次；缓存命中时只做校验，几乎不花时间。
@@ -424,20 +490,45 @@ fn build_instance(
     summary.downloaded_files += filled.downloaded_files;
     summary.skipped_files += filled.skipped_files;
     summary.downloaded_bytes += filled.downloaded_bytes;
-    // 4. 中间产物清理：加载器 profile 目录、以及这次才装出来且无人引用的原版目录。
-    for part in &merged_parts {
-        if part.version_id != name && part.version_id != game {
-            merge::remove_version(root, &part.version_id);
-        }
-    }
+    // LabyMod 首次启动会自己下约 50 MB 资源（单连接只有 60–100 KB/s，要十几分钟）。
+    // 安装阶段先取到 `<实例>/labymod-neo/assets/`：它启动时按 sha1 校验，命中就跳过。
+    // 失败不影响安装——最坏是回到它自己慢慢下。
     if let Some(part) = &labymod {
-        if part.version_id != name && part.version_id != game {
+        let channel = part
+            .version
+            .split_once('@')
+            .map(|(_, channel)| channel)
+            .unwrap_or("production");
+        let dir = root.join("versions").join(name);
+        let _ = download::prefetch_labymod(&dir, channel, &cancel.clone(), |step| progress(step));
+    }
+    // 4. 中间产物清理：只删没人引用的加载器 profile 外壳。
+    //    原版目录必须留着——实例 json 靠 `inheritsFrom` 指回它，启动时由
+    //    `inheritance::resolve_version` 合并，删了就会退化成「没有游戏类」的实例。
+    for part in &merged_parts {
+        if part.version_id != name
+            && part.version_id != game
+            && !referenced_by_others(root, &part.version_id, name)
+            && !crate::base::base_busy(&part.version_id)
+        {
             merge::remove_version(root, &part.version_id);
         }
     }
-    if installed_base && name != game && !referenced_by_others(root, game, name) {
-        merge::remove_version(root, game);
+    // LabyMod 的 profile 就是实例的 `inheritsFrom` 目标（实例自己不写库），
+    // 删掉它实例就启动不了，所以这份外壳必须留着。
+    // 合并式下原版目录只是安装底稿，实例已经把 jar 复制走了；本次刚装出来、
+    // 又没有别的版本引用它时删掉，`versions/` 就只剩实例自己（同 PCL）。
+    for stale in [base.as_str(), game] {
+        if flat
+            && installed_base
+            && stale != name
+            && !referenced_by_others(root, stale, name)
+            && !base_busy(stale)
+        {
+            merge::remove_version(root, stale);
+        }
     }
+    drop(shell_leases);
     event(progress, name, "complete", "", 0, 0, 0);
     Ok(summary)
 }

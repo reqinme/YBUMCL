@@ -21,7 +21,7 @@ import {
  * 「官方优先」也得把镜像当备用，所以同样算「用」。
  */
 export function usesMirror(strategy: DownloadStrategy | undefined): boolean {
-  return (strategy ?? "race") !== "official-only";
+  return (strategy ?? "sequential") !== "official-only";
 }
 
 type Entry<T> = { at: number; value: T };
@@ -83,7 +83,7 @@ function hit<T>(entry: Entry<T> | null | undefined, ttl: number): Cached<T> | nu
 }
 
 export async function cachedManifest(
-  strategy: DownloadStrategy = "race",
+  strategy: DownloadStrategy = "sequential",
   force = false
 ): Promise<Cached<RemoteVersionManifest>> {
   if (!force) {

@@ -147,9 +147,14 @@ pub fn neoforge_legacy_game(game: &str) -> bool {
 }
 
 /// NeoForge 没有 Forge 那种 `promotions_slim.json`，界面默认取「最新稳定版」。
+///
+/// `rc` / `pre` / `dev` 也算预览：Quilt 就发过 `0.18.4-pre.2`，只认 beta/alpha/snapshot 的话
+/// 这类版本会被当成正式版，默认选中它就等于默认选了个预览。
 pub fn prerelease(version: &str) -> bool {
     let lower = version.to_ascii_lowercase();
-    lower.contains("beta") || lower.contains("alpha") || lower.contains("snapshot")
+    ["beta", "alpha", "snapshot", "rc", "pre", "dev"]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// NeoForge 版本的 Java 下限（21.1 起要 21，1.20.x 需要 17）。
@@ -689,6 +694,15 @@ pub fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prerelease_marks_betas_and_release_candidates() {
+        assert!(prerelease("0.31.0-beta.6"));
+        assert!(prerelease("0.18.4-pre.2"));
+        assert!(prerelease("1.0.0-rc.1"));
+        assert!(!prerelease("0.30.2"));
+        assert!(!prerelease("21.1.72"));
+    }
 
     #[test]
     fn neoforge_versions_map_back_to_minecraft() {

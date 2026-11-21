@@ -2,18 +2,76 @@
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
   import { goto } from "$app/navigation";
-  import { api, onGameLog, onGameExit, type LogLine } from "$lib/api";
+  import BackButton from "$lib/components/BackButton.svelte";
+  import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+  import {
+    api,
+    onGameCrash,
+    onGameExit,
+    onGameLog,
+    type CrashHit,
+    type GameCrash,
+    type LogLine,
+    type RunView,
+  } from "$lib/api";
 
   const versionId = $derived(page.url.searchParams.get("version") ?? "");
+  const wantedRun = $derived(Number(page.url.searchParams.get("run") ?? "") || 0);
 
   let logs = $state<LogLine[]>([]);
   let running = $state(true);
   let exitCode = $state<number | null>(null);
   let pid = $state<number | null>(null);
   let stick = $state(true);
+  /// 正在看的那一次启动。同一实例可以开多份，日志靠它分开。
+  let runId = $state<number>(0);
+  /// 这个实例的所有启动（含已结束的），用来切换。
+  let runs = $state<RunView[]>([]);
+  /// 这一份启动崩了之后，规则表给出的诊断。
+  let crash = $state<{ hits: CrashHit[] } | null>(null);
+  let exporting = $state(false);
+  let exportNote = $state("");
+
+  async function refreshRuns(): Promise<void> {
+    const all = await api.listRuns().catch(() => [] as RunView[]);
+    runs = all.filter((run) => run.versionId === versionId);
+  }
+
+  async function exportCrash(): Promise<void> {
+    if (exporting) return;
+    exporting = true;
+    exportNote = "";
+    try {
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[:T]/g, "-")
+        .slice(0, 19);
+      const target = await saveDialog({
+        defaultPath: `错误报告-${versionId}-${stamp}.zip`,
+        filters: [{ name: "zip", extensions: ["zip"] }],
+      });
+      if (!target) return;
+      const path = await api.exportCrashReport(target, versionId);
+      exportNote = `已导出：${path}`;
+    } catch (error) {
+      exportNote = `导出失败：${error}`;
+    } finally {
+      exporting = false;
+    }
+  }
+
+  function pickRun(id: number): void {
+    runId = id;
+    crash = null;
+    exportNote = "";
+    const query = new URLSearchParams(page.url.searchParams);
+    query.set("run", String(id));
+    void goto(`?${query.toString()}`, { replaceState: true, keepFocus: true, noScroll: true });
+  }
 
   let scroller = $state<HTMLDivElement | undefined>(undefined);
   let unlisten: Array<() => void> = [];
+  let runsTimer: ReturnType<typeof setInterval> | null = null;
 
   function push(line: LogLine) {
     logs.push(line);
@@ -21,8 +79,14 @@
   }
 
   onMount(async () => {
+    await refreshRuns();
+    // 同一实例可能在看日志期间又开了一份，切页用的列表得跟着变。
+    runsTimer = setInterval(() => {
+      void refreshRuns();
+    }, 2000);
+    runId = wantedRun || runs.reduce((newest, run) => Math.max(newest, run.runId), 0);
     try {
-      const snap = await api.gameSnapshot();
+      const snap = await api.gameSnapshot(versionId || undefined, runId || undefined);
       logs = snap.logs;
       running = snap.running;
       pid = snap.pid;
@@ -32,19 +96,36 @@
     }
     unlisten.push(
       await onGameLog((line) => {
+        // 多开时只显示这一份启动的日志。
+        if (runId !== 0) {
+          if (line.runId !== runId) return;
+        } else if (line.versionId && versionId && line.versionId !== versionId) {
+          return;
+        }
         push(line);
       })
     );
     unlisten.push(
-      await onGameExit((code) => {
+      await onGameCrash((event: GameCrash) => {
+        if (runId !== 0 && event.runId !== runId) return;
+        if (runId === 0 && event.versionId !== versionId) return;
+        crash = { hits: event.hits };
+      })
+    );
+    unlisten.push(
+      await onGameExit((event) => {
+        void refreshRuns();
+        if (runId !== 0 && event.runId !== runId) return;
+        if (runId === 0 && event.versionId !== versionId) return;
         running = false;
-        exitCode = code;
+        exitCode = event.code;
       })
     );
   });
 
   onDestroy(() => {
     for (const stop of unlisten) stop();
+    if (runsTimer !== null) clearInterval(runsTimer);
   });
 
   // 用户自己往上翻时就别再自动滚到底了。
@@ -63,13 +144,51 @@
 
 <div class="launch">
   <header class="bar">
-    <button class="btn" onclick={() => goto("/versions")}>← 返回</button>
+    <BackButton />
     <div class="meta">
       <h1>游戏日志</h1>
       {#if versionId}<span class="dim">{versionId}</span>{/if}
+      {#if runs.length > 1}
+        <div class="runs">
+          {#each runs as run, at (run.runId)}
+            <button
+              class="run-chip"
+              class:on={run.runId === runId}
+              title={`PID ${run.pid}`}
+              onclick={() => pickRun(run.runId)}
+            >
+              第 {run.index} 份
+            </button>
+          {/each}
+        </div>
+      {/if}
     </div>
     <span class="state" class:on={running}>{statusText()}</span>
   </header>
+
+  {#if crash}
+    <div class="crash">
+      <div class="crash-main">
+        <strong>{crash.hits[0]?.title ?? "游戏异常退出"}</strong>
+        {#if crash.hits[0]}
+          <span class="crash-detail">{crash.hits[0].detail}</span>
+        {/if}
+        {#if crash.hits[0]?.fix}
+          <span class="crash-fix">建议：{crash.hits[0].fix}</span>
+        {/if}
+        {#if crash.hits.length > 1}
+          <span class="crash-more">另有 {crash.hits.length - 1} 条可能原因</span>
+        {/if}
+        {#if exportNote}<span class="crash-note">{exportNote}</span>{/if}
+      </div>
+      <div class="crash-act">
+        <button class="b" onclick={exportCrash} disabled={exporting}>
+          {exporting ? "导出中…" : "导出错误报告"}
+        </button>
+        <button class="b ghost" onclick={() => (crash = null)}>关闭</button>
+      </div>
+    </div>
+  {/if}
 
   <div
     class="log"
@@ -92,6 +211,60 @@
 </div>
 
 <style>
+  .crash {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin: 0 24px 12px;
+    padding: 12px 16px;
+    border: 1px solid color-mix(in srgb, #ff6a6a 45%, transparent);
+    border-radius: 12px;
+    background: color-mix(in srgb, #ff6a6a 12%, transparent);
+  }
+  .crash-main {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+    min-width: 0;
+  }
+  .crash-main strong {
+    font-size: 14px;
+    color: #ffb4b4;
+  }
+  .crash-detail {
+    color: var(--dim);
+  }
+  .crash-fix {
+    color: #ffd9a8;
+  }
+  .crash-more,
+  .crash-note {
+    color: var(--dim);
+    font-size: 12px;
+  }
+  .crash-act {
+    display: flex;
+    gap: 8px;
+    flex: none;
+  }
+  .crash-act .b {
+    padding: 6px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: color-mix(in srgb, #ff6a6a 22%, transparent);
+    color: var(--fg);
+    cursor: pointer;
+  }
+  .crash-act .b:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .crash-act .ghost {
+    background: transparent;
+  }
+
   .launch {
     height: 100%;
     display: flex;
@@ -123,6 +296,26 @@
     font-size: 12px;
     -webkit-user-select: text;
     user-select: text;
+  }
+  /* 同一实例多开时，这里切换看哪一份。 */
+  .runs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 4px;
+  }
+  .run-chip {
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .run-chip.on {
+    color: var(--accent);
+    border-color: var(--border-strong);
+    background: var(--surface);
   }
   .state {
     font-size: 12px;

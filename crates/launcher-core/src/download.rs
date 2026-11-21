@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        mpsc, Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -44,7 +44,7 @@ const PARALLEL_DOWNLOADS: usize = 16;
 /// 设置里「最大线程数」的上限（PCL 同款 1..=256）。
 const MAX_PARALLEL_DOWNLOADS: u32 = 256;
 /// 小于这个体积的文件不分段：256 KiB 一段的话，握手加慢启动就吃掉大半时间。
-const CHUNK_MIN_FILE: u64 = 2 * 1024 * 1024;
+const CHUNK_MIN_FILE: u64 = 4 * 1024 * 1024;
 /// 每段至少这么大，一条连接才有足够的连续传输窗口。
 const CHUNK_MIN_PART: u64 = 2 * 1024 * 1024;
 const CHUNK_MIN_PARTS: usize = 2;
@@ -106,6 +106,19 @@ pub fn set_speed_limit(bytes_per_sec: u64) {
 }
 
 /// 当前设置里的限速（字节/秒，0 = 不限）。
+/// 下载是否走 HTTP/2（默认否，见 `Http::build` 的说明）。
+static HTTP2_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设置页里的「下载协议」开关。
+pub fn set_http2(enabled: bool) {
+    HTTP2_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// 环境变量 `YBUMCL_HTTP2=1` 优先，方便临时对比，不必去改设置。
+fn http2_enabled() -> bool {
+    HTTP2_ENABLED.load(Ordering::Relaxed) || std::env::var("YBUMCL_HTTP2").is_ok()
+}
+
 pub fn speed_limit() -> u64 {
     SPEED_LIMIT_BPS.load(Ordering::Relaxed)
 }
@@ -363,6 +376,9 @@ pub struct InstallRequest {
     /// 并发下载数，取值范围 1..=64，缺省用 PARALLEL_DOWNLOADS。
     #[serde(default)]
     pub threads: Option<u32>,
+    /// 其它游戏目录：本目录缺的资源先从这些目录按 SHA1 复制，不发网络请求。
+    #[serde(default)]
+    pub cache_roots: Vec<String>,
 }
 impl InstallRequest {
     /// PCL 的线程数 = 设置值 + 1（设置 1..=256 → 实际 2..=257），设置里那一个留给
@@ -456,6 +472,29 @@ fn host_allowed(host: &str) -> bool {
     ) || host.ends_with(".sakura.sld.tw")
 }
 
+/// 跳转目标是否可跟随。BMCLAPI 会把一个请求 302 到二三十台高校/加速镜像
+/// （`bmclapi22.sakura.sld.tw`、`bmclapi.mangofanfan.cn`……），这些主机名没法穷举，
+/// 所以跳转只守住底线：还是 HTTPS、还是 443、不是 IP 字面量、不是本机/内网域名。
+fn redirect_allowed(url: &Url) -> bool {
+    if url.scheme() != "https" || url.port_or_known_default() != Some(443) {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host_allowed(host) {
+        return true;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    !(host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal"))
+}
+
 fn trusted_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).map_err(|e| DownloadError::Invalid(e.to_string()))?;
     if url.scheme() != "https"
@@ -519,10 +558,12 @@ fn route_candidates(original: &Url) -> Vec<(Route, Url)> {
         host,
         "libraries.minecraft.net" | "maven.minecraftforge.net" | "maven.neoforged.net"
     ) {
+        // BMCLAPI 的 maven 代理只认 `/group/artifact/version/file`，不认
+        // `releases` / `snapshots` 仓库前缀（带上就 404）。
         push_route(
             &mut out,
             Route::Bmclapi,
-            format!("https://{MIRROR_HOST}/maven{path}"),
+            format!("https://{MIRROR_HOST}/maven{}", mirror_maven_path(path)),
         );
     }
     // Fabric / Quilt 的 maven（加载器安装包与依赖库）。
@@ -554,6 +595,13 @@ fn route_candidates(original: &Url) -> Vec<(Route, Url)> {
     // 元数据（清单/版本 json）都很小、镜像反而绕远，只有官方一条路。
     out.push((Route::Official, original.clone()));
     out
+}
+
+/// 去掉 maven 仓库前缀：`/releases/net/…` → `/net/…`。
+fn mirror_maven_path(path: &str) -> &str {
+    path.strip_prefix("/releases")
+        .or_else(|| path.strip_prefix("/snapshots"))
+        .unwrap_or(path)
 }
 
 fn push_route(out: &mut Vec<(Route, Url)>, route: Route, raw: String) {
@@ -594,6 +642,11 @@ const PROBE_BYTES: usize = 64 * 1024;
 const RACE_PREFETCH: usize = 8 * 1024;
 /// 竞速等第一个候选的最长时间；超时就当没有可用的竞速结果，走串行。
 const RACE_WAIT: Duration = Duration::from_secs(20);
+/// 单次流式请求的兜底 deadline；分段请求按段大小另算。
+///
+/// 读操作才受它约束（reqwest 阻塞客户端的 timeout 覆盖每一次 read），所以它防的
+/// 是「连接建好了但一个字节都不来」——实测出现过卡 40 分钟的先例。
+const DEFAULT_READ_DEADLINE: Duration = Duration::from_secs(300);
 /// 同时竞速的候选数。
 const RACE_WIDTH: usize = 3;
 
@@ -650,15 +703,28 @@ trait Source {
     fn saturated(&self) -> bool {
         false
     }
+    /// 清单没写文件大小时，试着探一次（HTTP 实现才有）。
+    ///
+    /// LabyMod 这类第三方清单只给 url、不给 size；不探的话大文件会退化成
+    /// 单连接下载——实测它单流只有 60 KB/s，24 MB 要六七分钟。
+    fn size_hint(&self, url: &str) -> Option<u64> {
+        let _ = url;
+        None
+    }
 }
 /// 下载源策略。判定规则只有一条：某个地址**有镜像路由**才按策略分流，
 /// 没有镜像路由（版本清单、json 这类）永远只走官方，否则会直接 404。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum DownloadStrategy {
-    /// 官方与镜像同时下，谁先到用谁。
-    #[default]
+    /// 官方与镜像同时下，谁先到用谁；请求量是候选数的倍数，只在确认镜像更快时用。
     Race,
+    /// 顺序换源（默认）：按测速排名先试一条，失败或太慢才换下一条，每个文件只开一条连接。
+    ///
+    /// 竞速要同时打三条连接、再用首块 8 KiB 定胜负，弱网下一次判错就把整批文件
+    /// 压在慢线上；顺序换源不会，代价是判错时多等一次失败（超时或慢速判定）。
+    #[default]
+    Sequential,
     /// 先官方，失败或太慢再换镜像。
     OfficialFirst,
     /// 先镜像，失败或太慢再换官方。
@@ -673,6 +739,7 @@ impl DownloadStrategy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Race => "race",
+            Self::Sequential => "sequential",
             Self::OfficialFirst => "official-first",
             Self::MirrorFirst => "mirror-first",
             Self::MirrorOnly => "mirror-only",
@@ -682,6 +749,7 @@ impl DownloadStrategy {
     pub fn parse(text: &str) -> Option<Self> {
         Some(match text.trim() {
             "race" => Self::Race,
+            "sequential" => Self::Sequential,
             "official-first" => Self::OfficialFirst,
             "mirror-first" => Self::MirrorFirst,
             "mirror-only" => Self::MirrorOnly,
@@ -704,7 +772,8 @@ impl DownloadStrategy {
     }
     fn code(self) -> u8 {
         match self {
-            Self::Race => 0,
+            Self::Sequential => 0,
+            Self::Race => 5,
             Self::OfficialFirst => 1,
             Self::MirrorFirst => 2,
             Self::MirrorOnly => 3,
@@ -717,7 +786,8 @@ impl DownloadStrategy {
             2 => Self::MirrorFirst,
             3 => Self::MirrorOnly,
             4 => Self::OfficialOnly,
-            _ => Self::Race,
+            5 => Self::Race,
+            _ => Self::Sequential,
         }
     }
 }
@@ -771,20 +841,44 @@ impl Http {
             .lock()
             .map(|known| known.contains(&host))
             .unwrap_or(false);
-        if flaky {
-            return build(&self.h1)
-                .send()
-                .map_err(|e| DownloadError::Network(e.to_string()));
-        }
-        match build(&self.client).send() {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                self.note_flaky(&host);
-                build(&self.h1).send().map_err(|fallback| {
-                    DownloadError::Network(format!("{error}；改走 HTTP/1.1 仍失败：{fallback}"))
-                })
+        let mut wait = None;
+        for attempt in 0..2 {
+            if let Some(seconds) = wait.take() {
+                thread::sleep(Duration::from_secs(seconds));
             }
+            let sent = if flaky {
+                build(&self.h1)
+                    .send()
+                    .map_err(|e| DownloadError::Network(e.to_string()))
+            } else {
+                match build(&self.client).send() {
+                    Ok(response) => Ok(response),
+                    Err(error) => {
+                        self.note_flaky(&host);
+                        build(&self.h1).send().map_err(|fallback| {
+                            DownloadError::Network(format!(
+                                "{error}；改走 HTTP/1.1 仍失败：{fallback}"
+                            ))
+                        })
+                    }
+                }
+            };
+            let response = sent?;
+            // BMCLAPI 短窗口限流 10 次，分段并发容易撞上 429；它给了 Retry-After，等够再来一次。
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+                let seconds = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .unwrap_or(2)
+                    .clamp(1, 15);
+                wait = Some(seconds);
+                continue;
+            }
+            return Ok(response);
         }
+        unreachable!("loop always returns or retries")
     }
     /// 告诉这层「现在装的是哪个版本」，用来补原版 jar 的镜像地址。
     fn with_version(mut self, version: &str) -> Self {
@@ -804,9 +898,10 @@ impl Http {
     /// `read` 是「多久没收到数据算超时」（边下边写的大文件只该用这个）。
     fn build(strategy: DownloadStrategy, timeout: Option<Duration>) -> Result<Self> {
         // 默认走 HTTP/1.1：实测同一台 forgecdn 边缘，h2 单连接只有 ~0.2 MB/s，
-        // h1 能到 ~8.7 MB/s（PCL 用的 .NET HttpClient 默认也是 h1）。`YBUMCL_HTTP2=1`
-        // 可以换回 h2 做对比，只在排查时用。
-        let use_h2 = std::env::var("YBUMCL_HTTP2").is_ok();
+        // h1 能到 ~8.7 MB/s（PCL 用的 .NET HttpClient 默认也是 h1）。我们的下载是
+        // 「一个文件一条连接、最多 64 条」，h2 会把这些连接合回一条 TCP，反而更慢；
+        // 设置页里可以手动切到 h2（`YBUMCL_HTTP2=1` 同样能强制开启，便于临时对比）。
+        let use_h2 = http2_enabled();
         Ok(Self {
             client: build_client(timeout, !use_h2)?,
             h1: build_client(timeout, true)?,
@@ -830,11 +925,9 @@ fn build_client(timeout: Option<Duration>, http1: bool) -> Result<Client> {
         .max_tls_version(reqwest::tls::Version::TLS_1_2)
         // 允许跳转，但每一跳都必须落在白名单主机上（镜像会 302 到自家 CDN）。
         .redirect(Policy::custom(|attempt| {
-            // BMCLAPI 会 302 到各家高校镜像，跳转后的路径里保留着 /bmclapi/。
-            let mirror_path = attempt.url().path().contains("/bmclapi/");
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
-            } else if attempt.url().host_str().is_some_and(host_allowed) || mirror_path {
+            } else if redirect_allowed(attempt.url()) {
                 attempt.follow()
             } else {
                 attempt.error("redirect to untrusted host")
@@ -880,6 +973,9 @@ impl Http {
         timeout: Option<Duration>,
     ) -> Result<(reqwest::blocking::Response, bool)> {
         let target = self.route(trusted_url(url)?);
+        // 没给 deadline 时兜一个：流式响应没有总超时，一条挂死的连接会把 worker
+        // 永久占住（实测卡 40 分钟）。600 s 够慢网下一整块，又不会真的挂死。
+        let timeout = Some(timeout.unwrap_or(DEFAULT_READ_DEADLINE));
         let response = self
             .get(&target, |client| {
                 let mut request = client.get(target.clone());
@@ -908,17 +1004,52 @@ impl Http {
         end: u64,
     ) -> Result<(reqwest::blocking::Response, bool)> {
         let target = self.route(trusted_url(url)?);
+        self.request_span_at(&target, start, end)
+    }
+    /// 对已解析出来的直链发分段请求——地址本身不再查白名单，只要求仍是 https + 443。
+    fn request_span_at(
+        &self,
+        target: &Url,
+        start: u64,
+        end: u64,
+    ) -> Result<(reqwest::blocking::Response, bool)> {
+        // 分段请求按「这段最慢 8 KB/s 也下得完」给 deadline：给太紧会把只是慢、
+        // 但确实在传的镜像整段掐掉（BMCLAPI 的 /download 镜像实测有 1~20 KB/s 的）。
+        let bytes = end.saturating_sub(start).saturating_add(1);
+        let deadline = Duration::from_secs((bytes / 8_192).clamp(120, 900));
         let response = self
-            .get(&target, |client| {
+            .get(target, |client| {
                 client
                     .get(target.clone())
                     .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+                    .timeout(deadline)
             })?
             .error_for_status()
             .map_err(|e| DownloadError::Network(e.to_string()))?;
         let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        self.remember_edge(&target, &response);
+        self.remember_edge(target, &response);
         Ok((response, partial))
+    }
+    /// 解析一次 302，返回最终地址与总大小。BMCLAPI 的 `/maven/` 会 302 到一台随机镜像的
+    /// 带签名直链，后续分段全打这条直链，就不用为每一段都回 BMCLAPI 挨一次限流。
+    fn resolve_mirror(&self, url: &str) -> Result<(Url, Option<u64>)> {
+        let target = self.route(trusted_url(url)?);
+        let response = self
+            .get(&target, |client| {
+                client
+                    .get(target.clone())
+                    .header(reqwest::header::RANGE, "bytes=0-0")
+                    .timeout(Duration::from_secs(20))
+            })?
+            .error_for_status()
+            .map_err(|e| DownloadError::Network(e.to_string()))?;
+        let total = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.rsplit('/').next())
+            .and_then(|tail| tail.trim().parse::<u64>().ok());
+        Ok((response.url().clone(), total))
     }
     /// 取文件总大小：先试 `Range: bytes=0-0` 读 `Content-Range` 的 `/total`，
     /// 服务器不认分段就退回 `Content-Length`；都拿不到就返回 None（不启用分块）。
@@ -1138,6 +1269,35 @@ impl Http {
             DownloadStrategy::OfficialFirst => {
                 all.sort_by_key(|(route, _)| *route != Route::Official);
             }
+            // 顺序换源：按「测到的速度 → 先验」排序，只开一条连接。
+            //
+            // Mojang 自己的静态分发（资源、库、client/server jar）实测比镜像快一个数量级
+            // （官方 17.1 MB/s vs BMCLAPI 1.4 MB/s），而 `Route::prior` 里官方只有
+            // 200 KB/s ——那是给清单/小 json 用的经验值，对这几类地址是反的。这类地址
+            // 直接官方优先，只有官方失败/太慢才换镜像；maven 类（加载器库）仍按测速。
+            DownloadStrategy::Sequential => {
+                let key = family(&original);
+                let speeds = self.speeds(key);
+                let official_first = matches!(
+                    original.host_str().unwrap_or_default(),
+                    "resources.download.minecraft.net"
+                        | "piston-data.mojang.com"
+                        | "piston-meta.mojang.com"
+                        | "libraries.minecraft.net"
+                        | "launchermeta.mojang.com"
+                        | "launcher.mojang.com"
+                );
+                let score = |route: Route| {
+                    if official_first {
+                        return if route == Route::Official { f64::MAX } else { 0.0 };
+                    }
+                    speeds
+                        .iter()
+                        .find(|(candidate, _)| *candidate == route)
+                        .map_or_else(|| route.prior(), |(_, speed)| *speed)
+                };
+                all.sort_by(|a, b| score(b.0).total_cmp(&score(a.0)));
+            }
             // 竞速：按测速结果排序，`race()` 会同时开这两条。
             DownloadStrategy::Race => {
                 let key = family(&original);
@@ -1275,6 +1435,9 @@ impl Source for Http {
     fn open(&self, url: &str) -> Result<Box<dyn Read>> {
         self.send(url)
     }
+    fn size_hint(&self, url: &str) -> Option<u64> {
+        self.probe_size(url).ok().flatten()
+    }
     fn open_from(&self, url: &str, offset: u64) -> Result<(Box<dyn Read>, bool)> {
         if let Some(result) = self.race(url, offset) {
             return result;
@@ -1395,8 +1558,153 @@ pub fn fetch_pack_archive(
 
 pub fn fetch_file_bytes(url: &str, cancel: &CancellationToken) -> Result<Vec<u8>> {
     const FILE_LIMIT: u64 = 512 * 1024 * 1024;
-    let source = Http::new(strategy())?;
-    fetch_limited(&source, url, cancel, FILE_LIMIT)
+    let source = Http::streaming(strategy())?;
+    // 先解析一次 302：BMCLAPI 的 `/maven/` 会把请求交给一台随机镜像，直链带签名；
+    // 之后所有分段直接打这台镜像，不再每段都回 BMCLAPI，避免撞上它的 429 限流。
+    if let Ok((final_url, Some(total))) = source.resolve_mirror(url) {
+        if total > 0 && total <= FILE_LIMIT && redirect_allowed(&final_url) {
+            let chunks = plan_chunks(total);
+            if chunks.len() >= 2 {
+                for _ in 0..2 {
+                    if let Some(bytes) =
+                        fetch_spread_at(&source, &final_url, &chunks, total, cancel, None)
+                    {
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
+    }
+    fetch_fast(&source, url, cancel, FILE_LIMIT)
+}
+
+/// 同 `fetch_file_bytes`，但每下一段就把「已收字节」写进 `received`、把总大小写进
+/// `known`（未知时为 0），并回调 `on_change`（节流交给调用方）。
+///
+/// 安装器 jar 有 5–8 MB，界面在这个阶段只能看到文件名；不给字节的话，任务卡会一直
+/// 停在「0 B / 0 B」，用户分不清是在下还是卡死了。
+pub fn fetch_file_bytes_progress(
+    url: &str,
+    cancel: &CancellationToken,
+    received: &AtomicU64,
+    known: &AtomicU64,
+    on_change: &(dyn Fn() + Sync),
+) -> Result<Vec<u8>> {
+    const FILE_LIMIT: u64 = 512 * 1024 * 1024;
+    let source = Http::streaming(strategy())?;
+    received.store(0, Ordering::Relaxed);
+    known.store(0, Ordering::Relaxed);
+    if let Ok((final_url, Some(total))) = source.resolve_mirror(url) {
+        if total > 0 && total <= FILE_LIMIT && redirect_allowed(&final_url) {
+            known.store(total, Ordering::Relaxed);
+            let chunks = plan_chunks(total);
+            if chunks.len() >= 2 {
+                for _ in 0..2 {
+                    // 上一轮可能只下了一半，重来前把计数清零，否则会显示「已下 16 MB / 共 8 MB」。
+                    received.store(0, Ordering::Relaxed);
+                    if let Some(bytes) = fetch_spread_at(
+                        &source,
+                        &final_url,
+                        &chunks,
+                        total,
+                        cancel,
+                        Some((received, on_change)),
+                    ) {
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
+    }
+    received.store(0, Ordering::Relaxed);
+    fetch_limited_counted(&source, url, cancel, FILE_LIMIT, received, on_change)
+}
+
+/// 按已经分好的段并发请求同一个直链；任何一段失败就返回 `None` 让上层重来。
+fn fetch_spread_at(
+    source: &Http,
+    url: &Url,
+    chunks: &[(u64, u64)],
+    total: u64,
+    cancel: &CancellationToken,
+    counted: Option<(&AtomicU64, &(dyn Fn() + Sync))>,
+) -> Option<Vec<u8>> {
+    let pieces: Vec<Mutex<Option<Vec<u8>>>> = chunks.iter().map(|_| Mutex::new(None)).collect();
+    thread::scope(|scope| {
+        for (index, (start, end)) in chunks.iter().copied().enumerate() {
+            let pieces = &pieces;
+            scope.spawn(move || {
+                if let Ok(bytes) = span_bytes_at(source, url, start, end, cancel) {
+                    if let Some((received, on_bytes)) = counted {
+                        received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        on_bytes();
+                    }
+                    if let Ok(mut slot) = pieces[index].lock() {
+                        *slot = Some(bytes);
+                    }
+                }
+            });
+        }
+    });
+    let mut result = Vec::with_capacity(total as usize);
+    for piece in &pieces {
+        let mut slot = piece.lock().ok()?;
+        result.extend_from_slice(&slot.take()?);
+    }
+    (result.len() as u64 == total).then_some(result)
+}
+
+fn fetch_fast(
+    source: &impl Source,
+    url: &str,
+    cancel: &CancellationToken,
+    limit: u64,
+) -> Result<Vec<u8>> {
+    const WINDOW: Duration = Duration::from_secs(15);
+    const FLOOR: f64 = 40.0 * 1024.0;
+    const ROUNDS: usize = 4;
+    let mut last = DownloadError::Network("no attempt".into());
+    for _ in 0..ROUNDS {
+        trusted_url(url)?;
+        cancel.check()?;
+        let started = Instant::now();
+        let mut reader = match source.open(url) {
+            Ok(reader) => reader,
+            Err(error) => {
+                last = error;
+                continue;
+            }
+        };
+        let mut result = Vec::new();
+        let mut chunk = [0u8; 65536];
+        loop {
+            cancel.check()?;
+            let n = match reader.read(&mut chunk) {
+                Ok(n) => n,
+                Err(error) => {
+                    last = DownloadError::Network(error.to_string());
+                    break;
+                }
+            };
+            if n == 0 {
+                return Ok(result);
+            }
+            source.throttle(n as u64);
+            if result.len() as u64 + n as u64 > limit {
+                return Err(DownloadError::Invalid("response exceeds size limit".into()));
+            }
+            result.extend_from_slice(&chunk[..n]);
+            let elapsed = started.elapsed();
+            if elapsed >= WINDOW && (result.len() as f64) / elapsed.as_secs_f64() < FLOOR {
+                last = DownloadError::Network(format!(
+                    "镜像太慢（{:.0} KB/s），换一个重试",
+                    (result.len() as f64 / 1024.0) / elapsed.as_secs_f64()
+                ));
+                break;
+            }
+        }
+    }
+    Err(last)
 }
 
 /// 图标这类「一张一张、一次几十张」的小图共用的客户端。
@@ -1849,6 +2157,7 @@ pub fn fetch_files_to(
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
                         tick(&name);
+                        let _slot = file_slot();
                         let result = fetch_job(
                             job,
                             cancel,
@@ -2156,6 +2465,95 @@ fn chunk_temp(part: &Path, index: usize, racer: usize) -> PathBuf {
 }
 
 /// 把一个闭区间读进内存（打包这类「不落盘」的调用用）。
+/// 镜像站（BMCLAPI 与它的随机子镜像）对短窗口内的请求数有硬上限，超了直接 429。
+/// 文件多、线程多的时候很容易自己把自己限死，所以按主机在进程内排队。
+const MIRROR_HOST_LIMIT: usize = 8;
+
+type HostSlot = Arc<(Mutex<usize>, Condvar)>;
+
+static HOST_GATES: Mutex<Vec<(String, HostSlot)>> = Mutex::new(Vec::new());
+
+/// 排队令牌；离开作用域时归还槽位。
+struct HostPermit {
+    slot: HostSlot,
+}
+
+impl Drop for HostPermit {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.slot.0.lock() {
+            *live = live.saturating_sub(1);
+            self.slot.1.notify_one();
+        }
+    }
+}
+
+fn mirror_host_limit(host: &str) -> usize {
+    let mirrored = host.ends_with("bangbang93.com")
+        || host.ends_with("sakura.sld.tw")
+        || host.ends_with("mangofanfan.cn");
+    if mirrored {
+        MIRROR_HOST_LIMIT
+    } else {
+        0
+    }
+}
+
+/// 镜像主机返回排队令牌；官方源不排队（官方不存在这种限流，排队只会白等）。
+fn host_gate(url: &str) -> Option<HostPermit> {
+    let host = Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
+    let limit = mirror_host_limit(&host);
+    if limit == 0 {
+        return None;
+    }
+    let slot = {
+        let mut gates = HOST_GATES.lock().ok()?;
+        match gates.iter().find(|(key, _)| key == &host) {
+            Some((_, slot)) => slot.clone(),
+            None => {
+                let slot: HostSlot = Arc::new((Mutex::new(0), Condvar::new()));
+                gates.push((host, slot.clone()));
+                slot
+            }
+        }
+    };
+    let mut live = slot.0.lock().ok()?;
+    while *live >= limit {
+        live = slot.1.wait(live).ok()?;
+    }
+    *live += 1;
+    drop(live);
+    Some(HostPermit { slot })
+}
+
+/// 进程级同时下载的文件数：同时开两个安装时两边共享这些槽位，
+/// 而不是各自按设置再开一整份线程。
+const GLOBAL_FILE_SLOTS: usize = 64;
+static FILE_SLOTS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+struct FileSlot;
+
+impl Drop for FileSlot {
+    fn drop(&mut self) {
+        if let Ok(mut live) = FILE_SLOTS.0.lock() {
+            *live = live.saturating_sub(1);
+            FILE_SLOTS.1.notify_one();
+        }
+    }
+}
+
+fn file_slot() -> FileSlot {
+    let mut live = FILE_SLOTS.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *live >= GLOBAL_FILE_SLOTS {
+        live = FILE_SLOTS
+            .1
+            .wait(live)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    *live += 1;
+    drop(live);
+    FileSlot
+}
+
 fn span_bytes(
     source: &Http,
     url: &str,
@@ -2163,6 +2561,7 @@ fn span_bytes(
     end: u64,
     cancel: &CancellationToken,
 ) -> Result<Vec<u8>> {
+    let _gate = host_gate(url);
     let (mut response, partial) = source.request_span(url, start, end)?;
     if !partial {
         return Err(DownloadError::Invalid(format!(
@@ -2184,6 +2583,47 @@ fn span_bytes(
         out.extend_from_slice(&chunk[..read]);
         if out.len() > want {
             return Err(DownloadError::Integrity(url.to_owned()));
+        }
+    }
+    if out.len() != want {
+        return Err(DownloadError::Network(format!(
+            "{url}: 分段只收到 {}/{want} 字节",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// [`span_bytes`] 的直链版本：地址已解析过，不再走白名单校验。
+fn span_bytes_at(
+    source: &Http,
+    url: &Url,
+    start: u64,
+    end: u64,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>> {
+    let _gate = host_gate(url.as_str());
+    let (mut response, partial) = source.request_span_at(url, start, end)?;
+    if !partial {
+        return Err(DownloadError::Invalid(format!(
+            "{url}: 服务器不支持分段下载"
+        )));
+    }
+    let want = (end - start + 1) as usize;
+    let mut out = Vec::with_capacity(want);
+    let mut chunk = [0u8; 262144];
+    loop {
+        cancel.check()?;
+        let read = response
+            .read(&mut chunk)
+            .map_err(|e| DownloadError::Network(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        source.throttle(read as u64);
+        out.extend_from_slice(&chunk[..read]);
+        if out.len() > want {
+            return Err(DownloadError::Integrity(url.to_string()));
         }
     }
     if out.len() != want {
@@ -3272,6 +3712,49 @@ fn loader_plan(game: &str, profile: &Value, kind: ProfileKind) -> Result<(String
     Ok((id.into(), jobs))
 }
 
+/// 26.x 起 Quilt 不再发布 intermediary 映射（meta 里根本没有 `intermediary` 字段），
+/// 但加载器默认仍按 intermediary 反混淆，启动时会直接抛
+/// `Requested target namespace intermediary not loaded`。官方开关就是切到 official。
+const QUILT_OFFICIAL_NAMESPACE: &str = "-Dloader.experimental.minecraft.targetNamespace=official";
+
+/// 查一眼加载器元数据里有没有映射。取不到就当作「有」，保持改动前的行为。
+fn quilt_has_intermediary(
+    source: &impl Source,
+    kind: ProfileKind,
+    game: &str,
+    loader: &str,
+    cancel: &CancellationToken,
+) -> bool {
+    let url = format!("{}/{game}/{loader}", kind.meta());
+    match fetch_limited(source, &url, cancel, 512 * 1024) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            // 字段缺失和 null 都算「没有映射」，26.x 的 meta 就是直接不给这个字段。
+            Ok(value) => value
+                .get("intermediary")
+                .is_some_and(|entry| !entry.is_null()),
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
+}
+
+fn inject_official_namespace(metadata: &mut Value) {
+    let Some(jvm) = metadata
+        .get_mut("arguments")
+        .and_then(|arguments| arguments.get_mut("jvm"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if jvm
+        .iter()
+        .any(|entry| entry.as_str() == Some(QUILT_OFFICIAL_NAMESPACE))
+    {
+        return;
+    }
+    jvm.insert(0, Value::String(QUILT_OFFICIAL_NAMESPACE.into()));
+}
+
 #[derive(Clone)]
 struct Artifact {
     path: String,
@@ -3458,6 +3941,7 @@ fn stream_once<S: Source>(
     on_downloaded: &(dyn Fn(u64) + Sync),
     tolerate_slow: bool,
 ) -> Result<()> {
+    let _gate = host_gate(&a.url);
     let existing = fs::metadata(part).map(|meta| meta.len()).unwrap_or(0);
     let resume = existing > 0 && !a.size.is_some_and(|size| existing >= size);
     let mut file = if resume {
@@ -3581,7 +4065,7 @@ enum WorkerMsg {
     Start { path: String },
     Progress,
     File { path: String, downloaded: bool },
-    Failed(DownloadError),
+    Failed { index: usize, path: String, error: DownloadError },
 }
 fn segment_path(part: &Path, index: usize) -> PathBuf {
     let mut name = part.as_os_str().to_owned();
@@ -3597,7 +4081,7 @@ fn fetch_chunked<S: Source + Sync>(
     cancel: &CancellationToken,
     on_downloaded: &(dyn Fn(u64) + Sync),
 ) -> Result<bool> {
-    let Some(size) = a.size else {
+    let Some(size) = a.size.or_else(|| source.size_hint(&a.url)) else {
         return Ok(false);
     };
     if size < CHUNK_MIN_FILE {
@@ -3749,7 +4233,7 @@ fn join_segments(
 fn transfer<S: Source + Sync>(
     source: &S,
     root: &Path,
-    cache_root: Option<&Path>,
+    cache_roots: &[PathBuf],
     cancel: &CancellationToken,
     a: &Artifact,
     bytes: &AtomicU64,
@@ -3761,20 +4245,30 @@ fn transfer<S: Source + Sync>(
     if existing_valid(&path, a, cancel)? {
         return Ok(false);
     }
+    // 没有校验和的库（OptiFine 安装器自带的 `optifine:OptiFine`、
+    // `optifine:launchwrapper-of` 就是）在公共仓库里根本不存在，
+    // 版本 json 也只写了坐标、没写 url；本地已经有就信它，不再去网络撞 404。
+    if a.hash.is_none() && path.is_file() {
+        return Ok(false);
+    }
     let parent = path
         .parent()
         .ok_or_else(|| DownloadError::Invalid(format!("artifact has no parent: {}", a.path)))?;
     fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
     inside(root, &path)?;
     let part = part_path(&path);
-    let cached = match cache_root {
-        Some(cache_root) => cache_file(cache_root, &a.path, a, cancel)?,
-        None => None,
-    };
+    let mut cached = None;
+    for cache_root in cache_roots {
+        if let Some(file) = cache_file(cache_root, &a.path, a, cancel)? {
+            cached = Some(file);
+            break;
+        }
+    }
     let reused = cached.is_some();
     match cached {
         Some(mut cached_file) => copy_cached_into(&mut cached_file, &part, a, cancel)?,
         None => {
+            let _slot = file_slot();
             let next_event = AtomicU64::new(512 * 1024);
             let notify = |added: u64| {
                 let total = bytes.fetch_add(added, Ordering::Relaxed) + added;
@@ -3816,7 +4310,7 @@ struct Progress {
 struct Installer<'a, S, F> {
     source: &'a S,
     root: PathBuf,
-    cache_root: Option<&'a Path>,
+    cache_roots: &'a [PathBuf],
     cancel: &'a CancellationToken,
     threads: usize,
     quilt_loader: Option<String>,
@@ -3867,10 +4361,13 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
             fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
             inside(&self.root, &path)?;
             let part = part_path(&path);
-            let cached = match self.cache_root {
-                Some(root) => cache_file(root, cache_path, a, self.cancel)?,
-                None => None,
-            };
+            let mut cached = None;
+            for cache_root in self.cache_roots {
+                if let Some(file) = cache_file(cache_root, cache_path, a, self.cancel)? {
+                    cached = Some(file);
+                    break;
+                }
+            }
             let reused = cached.is_some();
             match cached {
                 Some(mut cached_file) => copy_cached_into(&mut cached_file, &part, a, self.cancel)
@@ -3918,7 +4415,7 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         let Installer {
             source,
             root,
-            cache_root,
+            cache_roots,
             cancel,
             threads,
             quilt_loader: _,
@@ -3935,16 +4432,17 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         let batch_len = jobs.len() as f64;
         let source: &S = source;
         let root: &Path = root.as_path();
-        let cache_root: Option<&Path> = cache_root.as_deref();
+        let cache_roots: &[PathBuf] = cache_roots;
         let cancel: &CancellationToken = cancel;
         let workers = (*threads).min(jobs.len());
         let bytes = AtomicU64::new(progress.downloaded_bytes);
         let next = AtomicUsize::new(0);
         // A failed artifact stops new work but lets in-flight transfers publish, so the
         // install keeps every file it already validated (serial behavior).
+        // 失败不立刻停：先让其余文件跑完，最后统一重试，避免一个坏 CDN 连接毁掉整次安装。
         let stop = AtomicBool::new(false);
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
-        let mut failure: Option<DownloadError> = None;
+        let mut failures: Vec<(usize, DownloadError)> = Vec::new();
         thread::scope(|scope| {
             for _ in 0..workers {
                 let tx = tx.clone();
@@ -3965,7 +4463,7 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
                         {
                             break;
                         }
-                        match transfer(source, root, cache_root, cancel, artifact, bytes, &tx) {
+                        match transfer(source, root, cache_roots, cancel, artifact, bytes, &tx) {
                             Ok(downloaded) => {
                                 let path = artifact.path.clone();
                                 if tx.send(WorkerMsg::File { path, downloaded }).is_err() {
@@ -3973,10 +4471,12 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
                                 }
                             }
                             Err(error) => {
-                                let _ = tx.send(WorkerMsg::Failed(error.with_path(&artifact.path)));
-                                // Do not cancel in-flight transfers; just stop queueing more.
-                                stop.store(true, Ordering::Relaxed);
-                                break;
+                                // 单文件失败不再拖垮整批：记下来，跑完再单独重试一轮。
+                                let _ = tx.send(WorkerMsg::Failed {
+                                    index,
+                                    path: artifact.path.clone(),
+                                    error: error.with_path(&artifact.path),
+                                });
                             }
                         }
                     }
@@ -3996,10 +4496,9 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
                             summary.skipped_files += 1;
                         }
                     }
-                    WorkerMsg::Failed(error) => {
-                        if failure.is_none() {
-                            failure = Some(error);
-                        }
+                    WorkerMsg::Failed { index, path, error } => {
+                        progress.path = path;
+                        failures.push((index, error));
                     }
                 }
                 progress.stage = stage.into();
@@ -4029,8 +4528,27 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
                 done: weight_base + weight,
             };
         });
-        if let Some(error) = failure {
-            return Err(error);
+        // 第二轮：把失败的文件挨个再试一次（换连接、换线路通常就好了）。
+        // 这一轮串行跑，进度消息没人听，给个丢弃的通道免得 transfer 的 send 失败。
+        let (sink, _sink_rx) = mpsc::channel::<WorkerMsg>();
+        for (index, first) in failures {
+            cancel.check()?;
+            let Some(artifact) = jobs.get(index) else {
+                return Err(first);
+            };
+            progress.path = artifact.path.clone();
+            progress.stage = stage.into();
+            match transfer(source, root, cache_roots, cancel, artifact, &bytes, &sink) {
+                Ok(downloaded) => {
+                    progress.completed_files += 1;
+                    if downloaded {
+                        summary.downloaded_files += 1;
+                    } else {
+                        summary.skipped_files += 1;
+                    }
+                }
+                Err(error) => return Err(error.with_path(&artifact.path)),
+            }
         }
         cancel.check()?;
         Ok(())
@@ -4133,7 +4651,12 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         self.add(std::slice::from_ref(&profile));
         let staged = self.download(&profile, &format!("{}-profile", kind.stage()))?;
         self.advance(1.0);
-        let metadata = crate::read_json(&staged)?;
+        let mut metadata = crate::read_json(&staged)?;
+        if kind == ProfileKind::Quilt
+            && !quilt_has_intermediary(self.source, kind, game, loader, self.cancel)
+        {
+            inject_official_namespace(&mut metadata);
+        }
         let (id, mut jobs) = loader_plan(game, &metadata, kind)?;
         self.progress.version_id = id.clone();
         self.add(&jobs);
@@ -4169,7 +4692,11 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
         if destination.exists() {
             fs::remove_file(&destination).map_err(|e| io_error(&destination, e))?;
         }
-        fs::rename(&staged, &destination).map_err(|e| io_error(&destination, e))?;
+        // 写内存里这份而不是直接搬 staged：Quilt 的 jvm 参数是在读完之后补进去的。
+        let bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|error| DownloadError::Invalid(error.to_string()))?;
+        fs::write(&destination, bytes).map_err(|e| io_error(&destination, e))?;
+        let _ = fs::remove_file(&staged);
         // 这条线的实例 json 是加载器给的 profile（带 inheritsFrom），顺手记下基础版本。
         let key = match kind {
             ProfileKind::Fabric => "fabric",
@@ -4348,10 +4875,15 @@ fn plan(id: &str, metadata: &Value, assets: &Value) -> Result<Vec<Artifact>> {
         )?],
         _ => Vec::new(),
     };
-    for library in metadata["libraries"]
-        .as_array()
-        .ok_or_else(|| DownloadError::Invalid("libraries missing".into()))?
-    {
+    // 继承式实例可以不带自己的库清单（LabyMod 这类加载器本身就是一份完整 profile，
+    // 库由 `inheritsFrom` 指向的那份提供）；只有自包含的版本才必须写 `libraries`。
+    static NO_LIBRARIES: Vec<Value> = Vec::new();
+    let libraries = match metadata["libraries"].as_array() {
+        Some(libraries) => libraries,
+        None if metadata.get("inheritsFrom").is_some() => &NO_LIBRARIES,
+        None => return Err(DownloadError::Invalid("libraries missing".into())),
+    };
+    for library in libraries {
         if !rules_allow(library.get("rules"))? {
             continue;
         }
@@ -4472,6 +5004,23 @@ pub fn install_version(
 ) -> Result<InstallSummary> {
     let strategy = request.strategy;
     let version = request.version_id.clone();
+    // 同一个 `versions/<game>` 同时只许一个安装写：并行点两次「装原版」时，
+    // 另一个会等这个装完、看到 json 已存在就直接跳过。
+    let _lease = crate::base::BaseLease::new(&version);
+    let lock = crate::base::base_lock(&version);
+    let _serial = crate::base::wait_lock(&lock, &cancel)?;
+    install_with(&Http::new(strategy)?.with_version(&version), request, &cancel, emit)
+}
+
+/// 调用方已经持有 `versions/<game>` 的锁（实例安装的原版阶段），这里不再加锁。
+pub(crate) fn install_version_locked(
+    request: InstallRequest,
+    cancel: CancellationToken,
+    emit: impl FnMut(InstallProgress),
+) -> Result<InstallSummary> {
+    let strategy = request.strategy;
+    let version = request.version_id.clone();
+    let _lease = crate::base::BaseLease::new(&version);
     install_with(&Http::new(strategy)?.with_version(&version), request, &cancel, emit)
 }
 /// Installs using an optional, untrusted cache of matching game-relative artifacts.
@@ -4487,12 +5036,22 @@ pub fn install_version_with_cache(
     let strategy = request.strategy;
     let threads = request.thread_count();
     let version = request.version_id.clone();
+    let _lease = crate::base::BaseLease::new(&version);
+    let lock = crate::base::base_lock(&version);
+    let _serial = crate::base::wait_lock(&lock, &cancel)?;
+    let mut cache_roots = vec![cache_root.to_path_buf()];
+    for extra in &request.cache_roots {
+        let path = PathBuf::from(extra);
+        if path.is_absolute() && path != *cache_root && !cache_roots.iter().any(|known| *known == path) {
+            cache_roots.push(path);
+        }
+    }
     install_with_cache(
         &Http::new(strategy)?.with_version(&version),
         request,
         &cancel,
         emit,
-        Some(cache_root),
+        &cache_roots,
         threads,
     )
 }
@@ -4523,7 +5082,7 @@ pub fn install_legacy_fabric(
     let mut installer = Installer {
         source: &source,
         root,
-        cache_root: None,
+        cache_roots: &[],
         cancel: &cancel,
         threads: threads.unwrap_or(4).max(1),
         quilt_loader: None,
@@ -4568,7 +5127,7 @@ fn install_with(
     emit: impl FnMut(InstallProgress),
 ) -> Result<InstallSummary> {
     let threads = request.thread_count();
-    install_with_cache(source, request, cancel, emit, None, threads)
+    install_with_cache(source, request, cancel, emit, &[], threads)
 }
 /// 补齐一个已存在的完整版本 profile（自带 assetIndex 与库清单）缺的文件，
 /// 用于 Cleanroom 这类安装器只写 json 与主 jar、其余靠自己清单下载的加载器。
@@ -4744,6 +5303,151 @@ pub fn install_labymod(
     install_profile_assets(game_dir, &id, strategy, threads, cancel, emit)
 }
 
+/// 预取 LabyMod 运行时资源到 `<版本目录>/labymod-neo/assets/`。
+///
+/// LabyMod 首次启动会自己下约 50 MB（`common.jar` 就有 34 MB），它单连接只有
+/// 60–100 KB/s，实测要十几分钟。这里用我们自己的分段下载器先取过来——它启动时
+/// 按 sha1 校验，命中就跳过。
+///
+/// 连接数控制在 16：2 个文件并行、每个文件由 `plan_chunks` 按大小切（最大 8 段）。
+/// 实测同一条线 16 条连接约 0.95 MB/s，再多会因为出口限速掉到 0.4 MB/s。
+pub fn prefetch_labymod(
+    version_dir: &Path,
+    channel: &str,
+    cancel: &CancellationToken,
+    emit: impl FnMut(InstallProgress) + Send,
+) -> Result<u64> {
+    let url = format!("{LABYMOD_MANIFEST}/{channel}/latest.json");
+    let bytes = fetch_file_bytes(&url, cancel)?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| DownloadError::Invalid(format!("bad LabyMod manifest: {e}")))?;
+    let commit = value["commitReference"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let assets = value["assets"].as_object().cloned().unwrap_or_default();
+    if commit.is_empty() || assets.is_empty() {
+        return Ok(0);
+    }
+    let dir = version_dir.join("labymod-neo").join("assets");
+    fs::create_dir_all(&dir).map_err(|e| io_error(&dir, e))?;
+    let total = assets.len() as u64;
+    let mut jobs: Vec<(String, String, PathBuf)> = Vec::new();
+    for (name, sha1) in &assets {
+        let Some(sha1) = sha1.as_str() else {
+            continue;
+        };
+        if !safe_component(name) {
+            continue;
+        }
+        let target = dir.join(format!("{name}.jar"));
+        if target.is_file() && file_sha1(&target).map(|hash| hash == sha1).unwrap_or(false) {
+            continue;
+        }
+        jobs.push((name.clone(), sha1.to_owned(), target));
+    }
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+    // 大文件先下：`common.jar` 一个就占三分之二，若排在最后，前面几个小文件
+    // 下完才开始它，总时间就被它一个人卡住（实测 6 个文件顺序不对要多花半分钟）。
+    if let Ok(source) = Http::streaming(strategy()) {
+        let sizes: Vec<u64> = jobs
+            .iter()
+            .map(|(name, sha1, _)| {
+                let url = format!(
+                    "{LABYMOD_DOWNLOAD}/assets/labymod4/{channel}/{commit}/{name}/{sha1}.jar"
+                );
+                source.probe_size(&url).ok().flatten().unwrap_or(0)
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        order.sort_by_key(|index| std::cmp::Reverse(sizes[*index]));
+        let mut sorted = Vec::with_capacity(jobs.len());
+        for index in order {
+            sorted.push(jobs[index].clone());
+        }
+        jobs = sorted;
+    }
+    let done = AtomicUsize::new(0);
+    let received = AtomicU64::new(0);
+    let queue = Mutex::new(jobs.into_iter());
+    let emit = Mutex::new(emit);
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let workers = 2.min(queue.lock().map(|q| q.len()).unwrap_or(1).max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let job = {
+                    let mut queue = queue.lock().unwrap_or_else(|poison| poison.into_inner());
+                    queue.next()
+                };
+                let Some((name, sha1, target)) = job else {
+                    break;
+                };
+                let url = format!(
+                    "{LABYMOD_DOWNLOAD}/assets/labymod4/{channel}/{commit}/{name}/{sha1}.jar"
+                );
+                let bytes = match fetch_file_bytes(&url, cancel) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        errors
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .push(format!("{name}: {error}"));
+                        continue;
+                    }
+                };
+                if bytes_sha1(&bytes) != sha1 {
+                    errors
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(format!("{name}: sha1 mismatch"));
+                    continue;
+                }
+                let temp = target.with_extension("part");
+                if let Err(error) = fs::write(&temp, &bytes) {
+                    errors
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(format!("{name}: {error}"));
+                    continue;
+                }
+                let _ = fs::remove_file(&target);
+                if let Err(error) = fs::rename(&temp, &target) {
+                    errors
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(format!("{name}: {error}"));
+                    continue;
+                }
+                let files = done.fetch_add(1, Ordering::Relaxed) + 1;
+                let bytes = received.fetch_add(bytes.len() as u64, Ordering::Relaxed)
+                    + bytes.len() as u64;
+                emit.lock().unwrap_or_else(|poison| poison.into_inner())(
+                    InstallProgress {
+                        version_id: String::new(),
+                        stage: "labymod-prefetch".into(),
+                        path: name,
+                        completed_files: files as u64,
+                        total_files: total,
+                        downloaded_bytes: bytes,
+                        total_bytes: 0,
+                        percent: None,
+                    },
+                );
+            });
+        }
+    });
+    let errors = errors.into_inner().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(first) = errors.first() {
+        return Err(DownloadError::Invalid(format!(
+            "预取 LabyMod 资源失败（{first}）"
+        )));
+    }
+    Ok(received.load(Ordering::Relaxed))
+}
+
 pub fn install_profile_assets(
     game_dir: &str,
     version_id: &str,
@@ -4795,7 +5499,7 @@ fn install_profile_part(
     let mut installer = Installer {
         source: &Http::new(strategy)?.with_version(version_id),
         root,
-        cache_root: None,
+        cache_roots: &[],
         cancel: &cancel,
         threads: threads.unwrap_or(4).max(1),
         quilt_loader: None,
@@ -4846,7 +5550,7 @@ fn install_with_cache(
     request: InstallRequest,
     cancel: &CancellationToken,
     emit: impl FnMut(InstallProgress),
-    cache_root: Option<&Path>,
+    cache_roots: &[PathBuf],
     threads: usize,
 ) -> Result<InstallSummary> {
     if !safe_component(&request.version_id) || request.game_dir.trim().is_empty() {
@@ -4875,7 +5579,7 @@ fn install_with_cache(
     let mut installer = Installer {
         source,
         root,
-        cache_root,
+        cache_roots,
         cancel,
         threads,
         quilt_loader: request.quilt_loader.clone(),

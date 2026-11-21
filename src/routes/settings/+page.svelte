@@ -14,6 +14,17 @@
   import { api, type JavaInstallation, type LauncherInfo, type Settings } from "$lib/api";
   import { notifySettingsSaved } from "$lib/settings-live.svelte";
   import { speedTierOptions } from "$lib/speed";
+  import { setBallColor } from "$lib/install-flight.svelte";
+
+  /// 安装光球的预设配色，第一个就是主题绿。
+  const ballPresets = [
+    { value: "#a8cc84", label: "主题绿" },
+    { value: "#6fd3c9", label: "青" },
+    { value: "#6aa8ff", label: "蓝" },
+    { value: "#b48cff", label: "紫" },
+    { value: "#f0c46a", label: "金" },
+    { value: "#ff7a6a", label: "红" }
+  ];
 
   let settings = $state<Settings | null>(null);
   let info = $state<LauncherInfo | null>(null);
@@ -27,6 +38,7 @@
         api.info(),
         cachedJava().then((cached) => cached.value)
       ]);
+      setBallColor(settings?.installBallColor);
     } catch (e) {
       showError("读取设置失败", "设置文件或者环境信息没有读出来。", String(e));
     }
@@ -91,7 +103,8 @@
             bind:value={settings.downloadStrategy}
             label="下载源策略"
             options={[
-              { value: "race", label: "两者竞速（先到先用，默认）" },
+              { value: "sequential", label: "顺序换源（默认，最稳）" },
+              { value: "race", label: "两者竞速（先到先用，请求最多）" },
               { value: "official-first", label: "官方源优先" },
               { value: "mirror-first", label: "镜像源优先" },
               { value: "mirror-only", label: "仅镜像源" },
@@ -102,6 +115,20 @@
         <label>
           <span>同时下载的文件数（1–256）</span>
           <input type="number" min="1" max="256" bind:value={settings.concurrentDownloads} />
+        </label>
+        <label>
+          <span>下载协议</span>
+          <Dropdown
+            value={settings.useHttp2 ? "h2" : "h1"}
+            label="下载协议"
+            onchange={(next) => {
+              if (settings) settings.useHttp2 = next === "h2";
+            }}
+            options={[
+              { value: "h1", label: "HTTP/1.1（默认）" },
+              { value: "h2", label: "HTTP/2" }
+            ]}
+          />
         </label>
         <label>
           <span>速度限制</span>
@@ -115,8 +142,26 @@
           />
         </label>
       </div>
+      <label>
+        <span>版本隔离</span>
+        <Dropdown
+          value={settings.isolationMode}
+          label="版本隔离"
+          onchange={(next) => {
+            if (settings) settings.isolationMode = next as "all" | "off";
+          }}
+          options={[
+            { value: "all", label: "隔离版本" },
+            { value: "off", label: "不隔离版本" }
+          ]}
+        />
+      </label>
+      <label class="row">
+        <input type="checkbox" bind:checked={settings.reuseGameFolders} />
+        <span>复用其它游戏目录里下过的资源</span>
+      </label>
       <p class="dim">
-        官方源在校园网里可能很慢；镜像由社区维护，与官方内容一致（按 SHA1 校验）。只有存在镜像的文件才按这里的策略走，没有镜像的条目（比如原版清单）一律直接连官方。同时下载的文件数调大通常更快，但实际连接数有 64 条的上限，再往上调通常不会再快。
+        官方源在校园网里可能很慢；镜像由社区维护，与官方内容一致（按 SHA1 校验）。只有存在镜像的文件才按这里的策略走，没有镜像的条目（比如原版清单）一律直接连官方。同时下载的文件数调大通常更快。
       </p>
     </section>
 
@@ -214,6 +259,39 @@
         <input type="checkbox" bind:checked={settings.showSplash} />
         <span>启动时播放开场动画（也可以点任意处跳过）</span>
       </label>
+
+      <div class="ball-pick">
+        <span class="ball-preview" style="--c: {settings.installBallColor}" aria-hidden="true"></span>
+        <div class="ball-copy">
+          <strong>安装光球颜色</strong>
+          <p class="dim">点「安装」后飞向顶栏下载圆环的那颗球。换颜色后，球的流光和落地光晕一起变。</p>
+          <div class="swatches">
+            {#each ballPresets as preset (preset.value)}
+              <button
+                type="button"
+                class="swatch"
+                class:on={settings.installBallColor === preset.value}
+                style="--c: {preset.value}"
+                title={preset.label}
+                aria-label={preset.label}
+                onclick={() => {
+                  if (!settings) return;
+                  settings.installBallColor = preset.value;
+                  setBallColor(preset.value);
+                }}
+              ></button>
+            {/each}
+            <label class="custom" title="自定义颜色">
+              <input
+                type="color"
+                bind:value={settings.installBallColor}
+                oninput={() => settings && setBallColor(settings.installBallColor)}
+              />
+              <span>自定义</span>
+            </label>
+          </div>
+        </div>
+      </div>
     </section>
   {/if}
 
@@ -255,6 +333,92 @@
     font-size: 15px;
     font-weight: 600;
   }
+  /* 安装光球：预览球和真正飞的那颗用同一套渐变。 */
+  .ball-pick {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    margin-top: 14px;
+    padding: 4px 0 0;
+  }
+  .ball-preview {
+    flex: none;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background:
+      radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0) 38%),
+      radial-gradient(
+        circle at 50% 56%,
+        color-mix(in srgb, var(--c) 38%, #05070a 62%) 0%,
+        var(--c) 56%,
+        color-mix(in srgb, var(--c) 42%, #ffffff 58%) 100%
+      );
+    box-shadow:
+      0 0 16px 3px color-mix(in srgb, var(--c) 50%, transparent),
+      inset 0 -4px 9px rgba(0, 0, 0, 0.38);
+  }
+  .ball-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+  }
+  .ball-copy strong {
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .ball-copy p {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .swatches {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 2px;
+  }
+  .swatch {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    background: var(--c);
+    box-shadow: inset 0 -3px 6px rgba(0, 0, 0, 0.35);
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+    transition:
+      outline-color 0.15s ease,
+      transform 0.15s ease;
+  }
+  .swatch:hover {
+    transform: translateY(-1px);
+  }
+  .swatch.on {
+    outline-color: rgba(255, 255, 255, 0.75);
+  }
+  .custom {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+  }
+  .custom input {
+    width: 26px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 6px;
+    background: transparent;
+    cursor: pointer;
+  }
+
   .spacer {
     flex: 1;
   }

@@ -1,0 +1,760 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "loader.class-file-version",
+      "priority": 94,
+      "severity": "error",
+      "title": "加载器读不了游戏类（Java 太新）",
+      "detail": "加载器自带的 ASM 认不出当前 Java 的 class 文件版本。",
+      "fix": "把这个实例的 Java 降到加载器支持的版本，或升级加载器。",
+      "any": [
+        "Unsupported class file major version"
+      ]
+    },
+    {
+      "id": "java.too-old",
+      "priority": 100,
+      "severity": "fatal",
+      "title": "Java 版本太旧",
+      "detail": "游戏是用更高版本的 Java 编译的，现在这套跑不动它。",
+      "fix": "换用版本 json 里要求的 Java（看「需要什么 / 选了谁」那几行日志）。",
+      "any": [
+        "UnsupportedClassVersionError",
+        "compiled by a more recent version of the Java Runtime"
+      ]
+    },
+    {
+      "id": "java.too-new",
+      "priority": 99,
+      "severity": "fatal",
+      "title": "Java 版本太新",
+      "detail": "这套加载器或模组还不认现在这个 Java，启动阶段就抛了。",
+      "fix": "降到版本要求的 Java（旧版 Forge 通常要 8 或 17）。",
+      "any": [
+        "Unsupported JVM module path",
+        "module java.base does not",
+        "IllegalAccessError"
+      ]
+    },
+    {
+      "id": "java.out-of-memory",
+      "priority": 98,
+      "severity": "fatal",
+      "title": "内存不足（Java 堆）",
+      "detail": "分配的内存不够用，JVM 直接退出。",
+      "fix": "在实例设置里把内存调大（别超过物理内存的 70%）。",
+      "any": [
+        "java.lang.OutOfMemoryError",
+        "Java heap space",
+        "GC overhead limit exceeded"
+      ]
+    },
+    {
+      "id": "java.metaspace",
+      "priority": 97,
+      "severity": "fatal",
+      "title": "元空间不足",
+      "detail": "加载的类太多，Metaspace 撑满了。",
+      "fix": "调大内存，或减少同时装的模组数量。",
+      "any": [
+        "OutOfMemoryError: Metaspace",
+        "Metaspace"
+      ]
+    },
+    {
+      "id": "java.direct-buffer",
+      "priority": 96,
+      "severity": "fatal",
+      "title": "直接内存不足",
+      "detail": "堆外内存耗尽，常见于光影与大型模组。",
+      "fix": "调大内存，或加 -XX:MaxDirectMemorySize。",
+      "any": [
+        "OutOfMemoryError: Direct buffer memory"
+      ]
+    },
+    {
+      "id": "java.native-thread",
+      "priority": 95,
+      "severity": "fatal",
+      "title": "系统线程数不够",
+      "detail": "JVM 要创建新线程但系统拒绝了。",
+      "fix": "关掉一些后台程序，或减少内存设置后重试。",
+      "any": [
+        "unable to create native thread",
+        "OutOfMemoryError: unable to create"
+      ]
+    },
+    {
+      "id": "java.stack-overflow",
+      "priority": 94,
+      "severity": "error",
+      "title": "调用栈溢出",
+      "detail": "某个模组递归太深，把栈撑爆了。",
+      "fix": "先禁用刚装的模组排查，必要时加 -Xss。",
+      "any": [
+        "StackOverflowError"
+      ]
+    },
+    {
+      "id": "java.vm-init",
+      "priority": 93,
+      "severity": "fatal",
+      "title": "JVM 初始化失败",
+      "detail": "Java 还没开始跑游戏就起不来了，通常是内存参数或 Java 本身有问题。",
+      "fix": "检查内存设置是否超过物理内存，或换一套 Java。",
+      "any": [
+        "Error occurred during initialization of VM",
+        "Could not reserve enough space for",
+        "Invalid maximum heap size"
+      ]
+    },
+    {
+      "id": "java.bad-vm-option",
+      "priority": 92,
+      "severity": "fatal",
+      "title": "JVM 参数不被支持",
+      "detail": "启动参数里有这套 Java 不认识的选项。",
+      "fix": "清掉自定义 JVM 参数，或换匹配的 Java 版本。",
+      "any": [
+        "Unrecognized VM option",
+        "Unrecognized option:",
+        "Unrecognized option at"
+      ]
+    },
+    {
+      "id": "java.g1-option",
+      "priority": 91,
+      "severity": "fatal",
+      "title": "G1 参数在新 Java 上被移除",
+      "detail": "旧配置里的 G1 参数在当前 Java 上已不存在。",
+      "fix": "把 JVM 参数里 G1NewSizePercent / G1MaxNewSizePercent 删掉。",
+      "any": [
+        "G1NewSizePercent",
+        "G1MaxNewSizePercent"
+      ]
+    },
+    {
+      "id": "java.agent",
+      "priority": 90,
+      "severity": "fatal",
+      "title": "Java agent 加载失败",
+      "detail": "某个 -javaagent 指向的 jar 不存在或损坏。",
+      "fix": "检查 JVM 参数里的 -javaagent（常见于优化模组和启动器注入）。",
+      "any": [
+        "agent library failed to init",
+        "Error opening zip file or JAR manifest missing",
+        "Failed to find Premain-Class"
+      ]
+    },
+    {
+      "id": "java.encoding",
+      "priority": 89,
+      "severity": "warn",
+      "title": "编码设置有问题",
+      "detail": "JVM 用的字符集和系统不一致，可能出现乱码或读不了配置。",
+      "fix": "启动参数里加 -Dfile.encoding=UTF-8。",
+      "any": [
+        "Unsupported encoding",
+        "Malformed input or unmappable character"
+      ]
+    },
+    {
+      "id": "launcher.no-main",
+      "priority": 88,
+      "severity": "fatal",
+      "title": "找不到主类",
+      "detail": "启动计划里的主类不存在，实例文件可能不完整。",
+      "fix": "重新安装这个实例，或检查版本 json 的 mainClass。",
+      "any": [
+        "Could not find or load main class",
+        "Error: Could not find or load main class"
+      ]
+    },
+    {
+      "id": "launcher.missing-class",
+      "priority": 87,
+      "severity": "error",
+      "title": "缺少类",
+      "detail": "运行时找不到某个类，通常是库没下全或被别的模组覆盖。",
+      "fix": "重新安装加载器与实例，确认 libraries 完整。",
+      "any": [
+        "NoClassDefFoundError",
+        "ClassNotFoundException"
+      ]
+    },
+    {
+      "id": "launcher.native-lib",
+      "priority": 86,
+      "severity": "error",
+      "title": "本地库加载失败",
+      "detail": "某个 .dll / native 库没加载起来（LWJGL、GLFW、模组自带的都算）。",
+      "fix": "检查是否 64 位 Java、natives 是否解压完整。",
+      "any": [
+        "UnsatisfiedLinkError",
+        "java.lang.UnsatisfiedLinkError",
+        "Can't load library"
+      ]
+    },
+    {
+      "id": "launcher.native-bits",
+      "priority": 85,
+      "severity": "fatal",
+      "title": "Java 位数与系统不匹配",
+      "detail": "32 位 Java 配 64 位系统（或反过来）跑不起来。",
+      "fix": "换 64 位 Java。",
+      "any": [
+        "Can't load AMD 64-bit",
+        "wrong ELF class",
+        "Error: This Java instance does not support"
+      ]
+    },
+    {
+      "id": "launcher.download-failed",
+      "priority": 84,
+      "severity": "error",
+      "title": "安装时下载失败",
+      "detail": "某次安装中有文件没下下来，实例可能不完整。",
+      "fix": "重新安装；网络差时可在设置里换下载源。",
+      "any": [
+        "Download failed",
+        "镜像太慢",
+        "下载失败"
+      ]
+    },
+    {
+      "id": "launcher.installer-failed",
+      "priority": 83,
+      "severity": "error",
+      "title": "加载器安装器报错",
+      "detail": "安装阶段的报错，不是游戏本身崩。",
+      "fix": "看日志里的缺失库，重新安装加载器。",
+      "any": [
+        "There was an error during installation",
+        "These libraries failed to download"
+      ]
+    },
+    {
+      "id": "fml.patched-jar-missing",
+      "priority": 82,
+      "severity": "fatal",
+      "title": "找不到打过补丁的 Minecraft jar",
+      "detail": "NeoForge 以为这是开发/合并环境，没走生产路径。",
+      "fix": "重新安装 NeoForge；启动类路径里不应出现 neoforge 的 universal jar。",
+      "any": [
+        "The patched Minecraft jar is missing"
+      ]
+    },
+    {
+      "id": "fml.joined-environment",
+      "priority": 81,
+      "severity": "fatal",
+      "title": "被当成开发环境启动",
+      "detail": "类路径里混进了安装器用的库，FML 误判成 joined/dev 环境。",
+      "fix": "重新安装，让版本 json 的启动库清单只含运行期库。",
+      "any": [
+        "Detected a joined NeoForge and Minecraft configuration",
+        "does not have a Minecraft-Dists attribute"
+      ]
+    },
+    {
+      "id": "fml.missing-dependencies",
+      "priority": 80,
+      "severity": "error",
+      "title": "模组缺少前置",
+      "detail": "某个模组要求的前置没有装或版本不对。",
+      "fix": "按日志里列出的 modId 补装对应前置。",
+      "any": [
+        "Missing or unsupported mandatory dependencies",
+        "Missing dependency",
+        "requires any version of"
+      ]
+    },
+    {
+      "id": "fml.duplicate-mods",
+      "priority": 79,
+      "severity": "error",
+      "title": "模组重复",
+      "detail": "同一个模组有两个副本，加载时冲突。",
+      "fix": "在 mods 目录里删掉重复的那份。",
+      "any": [
+        "Duplicate mods",
+        "Duplicate mod",
+        "duplicatemod"
+      ]
+    },
+    {
+      "id": "fml.mixin-failed",
+      "priority": 78,
+      "severity": "error",
+      "title": "Mixin 注入失败",
+      "detail": "有模组试图修改游戏代码但目标不匹配（常见于版本对不上）。",
+      "fix": "更新或删除报错里提到的模组，确认它支持当前游戏版本。",
+      "any": [
+        "Mixin apply failed",
+        "MixinTransformerError",
+        "Critical injection failure",
+        "InvalidMixinException"
+      ]
+    },
+    {
+      "id": "fml.mod-loading-failed",
+      "priority": 77,
+      "severity": "error",
+      "title": "加载模组失败",
+      "detail": "FML 在加载阶段抛错退出了。",
+      "fix": "看日志里紧跟的模组名，先移除它再试。",
+      "any": [
+        "Error loading mods",
+        "LoadingFailedException",
+        "ModLoadingException"
+      ]
+    },
+    {
+      "id": "fml.forge-mismatch",
+      "priority": 76,
+      "severity": "error",
+      "title": "模组与 Forge 版本不匹配",
+      "detail": "模组要求的 Forge 版本和装的不一致。",
+      "fix": "换成模组支持的 Forge 版本，或更新模组。",
+      "any": [
+        "requires forge",
+        "Incompatible mod set",
+        "This mod requires Forge"
+      ]
+    },
+    {
+      "id": "fml.neoforge-mismatch",
+      "priority": 75,
+      "severity": "error",
+      "title": "模组与 NeoForge 版本不匹配",
+      "detail": "模组要求的 NeoForge 版本和装的不一致。",
+      "fix": "换成模组支持的 NeoForge 版本，或更新模组。",
+      "any": [
+        "requires NeoForge",
+        "requires neoforge"
+      ]
+    },
+    {
+      "id": "fml.secure-jar",
+      "priority": 74,
+      "severity": "fatal",
+      "title": "安全 jar 处理器启动失败",
+      "detail": "Forge/NeoForge 的 securejarhandler 没能拉起。",
+      "fix": "重新安装加载器，确认 bootstraplauncher 等库存在。",
+      "any": [
+        "securejarhandler",
+        "Unable to launch Java"
+      ]
+    },
+    {
+      "id": "fml.access-transformer",
+      "priority": 73,
+      "severity": "error",
+      "title": "访问转换器失败",
+      "detail": "加载器的 AccessTransformer 配置不对。",
+      "fix": "重新安装加载器；确认版本 json 里的参数完整。",
+      "any": [
+        "AccessTransformer",
+        "IllegalAccessError: class"
+      ]
+    },
+    {
+      "id": "fabric.loader-failed",
+      "priority": 72,
+      "severity": "error",
+      "title": "Fabric Loader 启动失败",
+      "detail": "Fabric 的加载阶段抛错。",
+      "fix": "更新 Fabric Loader，确认没有混装 Forge 系模组。",
+      "any": [
+        "LoaderException",
+        "fabric-loader",
+        "net.fabricmc.loader"
+      ]
+    },
+    {
+      "id": "quilt.loader-failed",
+      "priority": 71,
+      "severity": "error",
+      "title": "Quilt Loader 启动失败",
+      "detail": "Quilt 的加载阶段抛错。",
+      "fix": "更新 Quilt Loader，确认模组兼容。",
+      "any": [
+        "quilt-loader",
+        "org.quiltmc.loader"
+      ]
+    },
+    {
+      "id": "lwjgl.glfw-window",
+      "priority": 70,
+      "severity": "error",
+      "title": "创建游戏窗口失败",
+      "detail": "GLFW 起不来窗口，多与显卡驱动或远程桌面有关。",
+      "fix": "更新显卡驱动；远程桌面下先在本机登录一次。",
+      "any": [
+        "GLFW error",
+        "Failed to create window",
+        "GLFW_INIT_FAILED"
+      ]
+    },
+    {
+      "id": "render.opengl",
+      "priority": 69,
+      "severity": "error",
+      "title": "OpenGL 初始化失败",
+      "detail": "显卡驱动没提供可用的 OpenGL 上下文。",
+      "fix": "更新显卡驱动；笔记本确认用的是独显。",
+      "any": [
+        "Pixel format not accelerated",
+        "The driver does not appear to support OpenGL",
+        "unsupported OpenGL",
+        "OpenGL is not supported"
+      ]
+    },
+    {
+      "id": "render.angle",
+      "priority": 68,
+      "severity": "error",
+      "title": "图形后端（D3D/ANGLE）出错",
+      "detail": "渲染后端报告设备丢失或初始化失败。",
+      "fix": "换回 OpenGL 渲染，或更新显卡驱动。",
+      "any": [
+        "DXGI_ERROR_DEVICE_REMOVED",
+        "D3D11",
+        "ANGLE"
+      ]
+    },
+    {
+      "id": "render.gpu-crash",
+      "priority": 67,
+      "severity": "fatal",
+      "title": "显卡驱动崩溃",
+      "detail": "驱动层崩了，JVM 跟着挂。",
+      "fix": "更新驱动、关掉光影，或降低渲染距离。",
+      "any": [
+        "EXCEPTION_ACCESS_VIOLATION",
+        "A fatal error has been detected by the Java Runtime Environment"
+      ]
+    },
+    {
+      "id": "render.igpu",
+      "priority": 66,
+      "severity": "warn",
+      "title": "疑似核显驱动问题",
+      "detail": "日志里出现了 Intel 核显的驱动模块。",
+      "fix": "更新核显驱动，或强制用独显运行。",
+      "any": [
+        "ig7icd",
+        "igdumdim",
+        "ig9icd"
+      ]
+    },
+    {
+      "id": "assets.missing-objects",
+      "priority": 65,
+      "severity": "error",
+      "title": "游戏资源缺失",
+      "detail": "assets 目录里缺文件，进游戏会缺材质/声音。",
+      "fix": "重新安装这个版本，让资源补齐。",
+      "any": [
+        "Failed to download asset",
+        "Missing asset",
+        "Unable to load asset"
+      ]
+    },
+    {
+      "id": "assets.bad-index",
+      "priority": 64,
+      "severity": "error",
+      "title": "资源索引读取失败",
+      "detail": "assets/indexes 里的索引文件损坏或缺失。",
+      "fix": "重新安装版本以重建索引。",
+      "any": [
+        "Unable to load asset index",
+        "assets/indexes",
+        "index 17.json"
+      ]
+    },
+    {
+      "id": "auth.invalid-session",
+      "priority": 63,
+      "severity": "error",
+      "title": "登录态失效",
+      "detail": "账号令牌过期或验证服务器不可用。",
+      "fix": "在账户页重新登录后启动。",
+      "any": [
+        "Invalid session",
+        "Failed to verify username",
+        "authentication servers are down"
+      ]
+    },
+    {
+      "id": "auth.token",
+      "priority": 62,
+      "severity": "error",
+      "title": "令牌有问题",
+      "detail": "刷新令牌失败。",
+      "fix": "重新登录账号。",
+      "any": [
+        "Invalid token",
+        "Invalid refresh token",
+        "ForbiddenOperationException"
+      ]
+    },
+    {
+      "id": "net.dns-host",
+      "priority": 61,
+      "severity": "error",
+      "title": "域名解析失败",
+      "detail": "连不上认证/资源服务器，DNS 或网络不通。",
+      "fix": "检查网络、代理与 DNS 设置。",
+      "any": [
+        "UnknownHostException",
+        "Name or service not known"
+      ]
+    },
+    {
+      "id": "net.timeout",
+      "priority": 60,
+      "severity": "error",
+      "title": "连接超时",
+      "detail": "服务器没在超时时间内响应。",
+      "fix": "换网络或开代理后重试。",
+      "any": [
+        "SocketTimeoutException",
+        "ConnectException",
+        "Connection timed out"
+      ]
+    },
+    {
+      "id": "net.tls",
+      "priority": 59,
+      "severity": "error",
+      "title": "TLS 握手失败",
+      "detail": "证书链或系统时间不对，握手过不去。",
+      "fix": "校准系统时间；检查代理是否替换了证书。",
+      "any": [
+        "SSLHandshakeException",
+        "PKIX path building failed",
+        "certificate_unknown"
+      ]
+    },
+    {
+      "id": "net.reset",
+      "priority": 58,
+      "severity": "warn",
+      "title": "连接被重置",
+      "detail": "对端把连接掐了，常见于代理或镜像限流。",
+      "fix": "换个下载源或代理再试。",
+      "any": [
+        "Connection reset",
+        "EOFException",
+        "Remote host terminated"
+      ]
+    },
+    {
+      "id": "file.access-denied",
+      "priority": 57,
+      "severity": "error",
+      "title": "文件访问被拒绝",
+      "detail": "没有权限读写游戏目录。",
+      "fix": "别把游戏装在 Program Files；检查杀毒软件是否锁定目录。",
+      "any": [
+        "AccessDeniedException",
+        "拒绝访问",
+        "Access is denied",
+        "Permission denied"
+      ]
+    },
+    {
+      "id": "file.locked",
+      "priority": 56,
+      "severity": "error",
+      "title": "文件被占用",
+      "detail": "另一个进程正拿着这个文件（常见于同实例多开）。",
+      "fix": "关掉其它游戏进程后重试。",
+      "any": [
+        "being used by another process",
+        "另一个程序正在使用",
+        "The process cannot access the file"
+      ]
+    },
+    {
+      "id": "file.no-space",
+      "priority": 55,
+      "severity": "fatal",
+      "title": "磁盘空间不足",
+      "detail": "写文件时磁盘满了。",
+      "fix": "清理磁盘后重试。",
+      "any": [
+        "not enough space on the disk",
+        "No space left on device",
+        "磁盘空间不足"
+      ]
+    },
+    {
+      "id": "file.not-found",
+      "priority": 54,
+      "severity": "error",
+      "title": "文件或路径不存在",
+      "detail": "要读的文件被删了或路径不对。",
+      "fix": "重新安装该实例；确认游戏目录没被移动。",
+      "any": [
+        "系统找不到指定的文件",
+        "系统找不到指定的路径",
+        "The system cannot find the file specified",
+        "The system cannot find the path specified"
+      ]
+    },
+    {
+      "id": "file.bad-jar",
+      "priority": 53,
+      "severity": "error",
+      "title": "jar 文件损坏",
+      "detail": "某个 jar 不是有效的 zip。",
+      "fix": "删掉报错里那个 jar，重新安装。",
+      "any": [
+        "invalid CEN header",
+        "zip END header not found",
+        "Invalid or corrupt jarfile",
+        "error in opening zip file"
+      ]
+    },
+    {
+      "id": "mc.crash-report",
+      "priority": 52,
+      "severity": "error",
+      "title": "游戏生成了崩溃报告",
+      "detail": "日志里带出了标准崩溃报告头。",
+      "fix": "打开 crash-reports 目录看完整堆栈。",
+      "any": [
+        "---- Minecraft Crash Report ----"
+      ]
+    },
+    {
+      "id": "mc.world-corrupt",
+      "priority": 51,
+      "severity": "error",
+      "title": "存档读取失败",
+      "detail": "某个世界或区块文件损坏。",
+      "fix": "从备份恢复存档；必要时删掉损坏区块。",
+      "any": [
+        "Failed to load world",
+        "Chunk file at",
+        "Exception loading chunk"
+      ]
+    },
+    {
+      "id": "mc.datapack",
+      "priority": 50,
+      "severity": "error",
+      "title": "数据包加载失败",
+      "detail": "某个数据包格式不对或版本不兼容。",
+      "fix": "移除最近加入的数据包再试。",
+      "any": [
+        "Failed to load datapack",
+        "Couldn't parse data file",
+        "error while loading datapack"
+      ]
+    },
+    {
+      "id": "mc.resourcepack",
+      "priority": 49,
+      "severity": "warn",
+      "title": "资源包加载失败",
+      "detail": "资源包读不了或格式不兼容。",
+      "fix": "移除最近加入的资源包。",
+      "any": [
+        "Failed to load resource pack",
+        "Unable to parse resource pack"
+      ]
+    },
+    {
+      "id": "mc.shader-error",
+      "priority": 48,
+      "severity": "error",
+      "title": "着色器编译失败",
+      "detail": "光影包在当前驱动/版本上编译不过。",
+      "fix": "关掉光影，或换兼容版本的光影包。",
+      "any": [
+        "Failed to compile shader",
+        "shader compilation failed",
+        "Error compiling shader"
+      ]
+    },
+    {
+      "id": "mc.registry",
+      "priority": 47,
+      "severity": "error",
+      "title": "注册表同步失败",
+      "detail": "客户端与服务端的注册项对不上（模组版本不一致）。",
+      "fix": "确认客户端和服务端模组完全一致。",
+      "any": [
+        "Registry remapping failed",
+        "Missing registry entries"
+      ]
+    },
+    {
+      "id": "mod.sodium-compat",
+      "priority": 46,
+      "severity": "warn",
+      "title": "Sodium 与光影/模组冲突",
+      "detail": "Sodium 系渲染模组和别的渲染模组打架。",
+      "fix": "只保留一套渲染优化模组。",
+      "any": [
+        "sodium",
+        "embeddium"
+      ]
+    },
+    {
+      "id": "windows.long-path",
+      "priority": 45,
+      "severity": "warn",
+      "title": "路径过长",
+      "detail": "Windows 的路径长度限制挡住了文件访问。",
+      "fix": "把游戏目录挪短一些（例如 D:\\mc）。",
+      "any": [
+        "path too long",
+        "MAX_PATH",
+        "文件名或扩展名太长"
+      ]
+    },
+    {
+      "id": "windows.dll-missing",
+      "priority": 44,
+      "severity": "fatal",
+      "title": "缺少系统运行库",
+      "detail": "某个 VC++ 运行库或系统 DLL 找不到。",
+      "fix": "安装最新的 Microsoft Visual C++ 运行库。",
+      "any": [
+        "VCRUNTIME140.dll",
+        "MSVCP140.dll",
+        "ucrtbase.dll",
+        "找不到 vcruntime"
+      ]
+    },
+    {
+      "id": "launcher.pre-launch",
+      "priority": 43,
+      "severity": "warn",
+      "title": "启动前命令失败",
+      "detail": "实例设置里的「启动前执行命令」返回了非零。",
+      "fix": "检查那条命令；不需要就清空它。",
+      "any": [
+        "启动前命令"
+      ]
+    },
+    {
+      "id": "launcher.java-retry",
+      "priority": 42,
+      "severity": "warn",
+      "title": "自动换过一次 Java",
+      "detail": "首次启动失败后按错误特征换了一套 Java 重试。",
+      "fix": "如果还是失败，手动在实例设置里指定 Java。",
+      "any": [
+        "改用",
+        "Java 启动失败"
+      ]
+    }
+  ]
+}

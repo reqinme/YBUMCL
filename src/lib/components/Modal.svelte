@@ -12,11 +12,13 @@
     footer?: Snippet;
     /// 宽弹窗：大图预览、光影配置这种要横向空间的。
     wide?: boolean;
+    /// 自定义宽度，覆盖默认的 460px（例如皮肤选择这种要摆九宫格的）。
+    width?: string;
     onclose: () => void;
     children?: Snippet;
   }
 
-  let { open = false, title = "", footer, wide = false, onclose, children }: Props = $props();
+  let { open = false, title = "", footer, wide = false, width, onclose, children }: Props = $props();
 </script>
 
 <svelte:window
@@ -33,6 +35,7 @@
     <div
       class="dialog"
       class:wide
+      style={width ? `width: ${width};` : undefined}
       role="dialog"
       aria-modal="true"
       tabindex="-1"
@@ -70,6 +73,8 @@
     flex-direction: column;
     gap: 14px;
     width: min(460px, 84vw);
+    /* 内容多了就在弹窗里滚动，别撑出窗口：标题和按钮始终留在原位。 */
+    max-height: min(74vh, 760px);
     padding: 18px 20px;
     border-radius: var(--radius-md);
     border: 1px solid var(--border-strong);
@@ -83,9 +88,14 @@
   }
   .body {
     display: flex;
+    flex: 1 1 auto;
     flex-direction: column;
     gap: 10px;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 4px;
     font-size: 13px;
+    overscroll-behavior: contain;
   }
   .body :global(input[type="text"]),
   .body :global(textarea) {

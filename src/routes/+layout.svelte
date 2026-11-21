@@ -11,6 +11,7 @@
   import NavBar from "$lib/components/NavBar.svelte";
   import Splash from "$lib/components/Splash.svelte";
   import Toast from "$lib/components/Toast.svelte";
+  import InstallFlight from "$lib/components/InstallFlight.svelte";
 
   let { children } = $props();
 
@@ -66,6 +67,7 @@
   {/if}
 
   <Toast />
+  <InstallFlight />
   <Splash />
 </div>
 

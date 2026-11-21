@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let summary = install_version(InstallRequest {
                 game_dir: game_dir.clone(), version_id: version_id.clone(), fabric_loader: Some(loader.clone()),
                 quilt_loader: None,
-                strategy: launcher_core::download::DownloadStrategy::default(), threads: None,
+                strategy: launcher_core::download::DownloadStrategy::default(), threads: None, cache_roots: Vec::new(),
             }, CancellationToken::default(), |event| {
                 if event.completed_files == event.total_files || event.stage != "downloading" {
                     eprintln!("{}", serde_json::to_string(&event).expect("serializable progress"));

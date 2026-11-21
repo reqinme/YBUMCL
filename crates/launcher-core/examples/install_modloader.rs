@@ -21,11 +21,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         [command, game] if command == "list" => {
             println!("{}", serde_json::to_string_pretty(&modloader::list_modloader_versions(loader, game)?)?);
         }
-        [game_dir, game_version, loader_version, java_path] => {
+        [game_dir, game_version, loader_version, java_path, rest @ ..] => {
+            let strategy = std::env::var("YBUMCL_STRATEGY")
+                .ok()
+                .and_then(|value| launcher_core::download::DownloadStrategy::parse(&value))
+                .unwrap_or_default();
+            let cache_roots: Vec<String> = rest
+                .iter()
+                .flat_map(|value| value.split(';'))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect();
             let result = modloader::install_modloader(ModLoaderInstallRequest {
                 game_dir: game_dir.clone(), game_version: game_version.clone(), loader,
                 loader_version: loader_version.clone(), java_path: java_path.clone(),
-                strategy: launcher_core::download::DownloadStrategy::default(), threads: None,
+                strategy, threads: None, cache_roots,
             }, CancellationToken::default(), |event| {
                 if event.stage != "downloading" || event.completed_files == event.total_files {
                     eprintln!("{}", serde_json::to_string(&event).expect("progress serialization"));
@@ -33,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        _ => return Err("Usage: install_modloader forge|neoforge list <game> | <isolated-game-dir> <game> <loader-version> <java-path>".into()),
+        _ => return Err("Usage: install_modloader forge|neoforge list <game> | <isolated-game-dir> <game> <loader-version> <java-path> [cache-root;cache-root]".into()),
     }
     Ok(())
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import Dropdown from "$lib/components/Dropdown.svelte";
+  import BackButton from "$lib/components/BackButton.svelte";
   // 日志页：启动器日志（launcher.log）与游戏日志（versions/<id>/logs/latest.log）。
   // 只做只读展示：搜索、按级别过滤、自动贴底、换行开关。
   import { onMount } from "svelte";
@@ -110,6 +111,7 @@
 
 <section class="logs">
   <header class="head">
+    <BackButton />
     <div class="tabs">
       <button class="tab" class:active={tab === "launcher"} onclick={() => switchTab("launcher")}>
         启动器日志

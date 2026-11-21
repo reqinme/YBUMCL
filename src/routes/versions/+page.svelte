@@ -6,9 +6,21 @@
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import { resolveIconUrl } from "$lib/version-icon";
   import Dropdown from "$lib/components/Dropdown.svelte";
+  import { SORT_OPTIONS, parseSortMode, sortVersions } from "$lib/version-sort";
+  import { absorbOrder, orderFor, setOrder } from "$lib/view-order.svelte";
   import { announce, submitTask } from "$lib/tasks.svelte";
   import { showError } from "$lib/dialogs.svelte";
-  import { api, type CategorySnapshot, type GameFolder, type Settings, type VersionView } from "$lib/api";
+  import {
+    api,
+    onGameExit,
+    onVersionsChanged,
+    type CategorySnapshot,
+    type GameFolder,
+    type RunEntry,
+    type RunView,
+    type Settings,
+    type VersionView
+  } from "$lib/api";
   import { startVersion } from "$lib/launch";
   import { loaderLabels } from "$lib/loader-ranges";
   import {
@@ -45,7 +57,7 @@
 
   let versions = $state<VersionView[]>([]);
   let settings = $state<Settings | null>(null);
-  let categories = $state<CategorySnapshot>({ categories: [], tags: {} });
+  let categories = $state<CategorySnapshot>({ categories: [], tags: {}, order: "default" });
   let loading = $state(true);
   let busy = $state("");
   let pendingDelete = $state<VersionView | null>(null);
@@ -112,6 +124,11 @@
       if (categoryPick !== "all" && categoryPick !== "none" && !real.includes(categoryPick)) return false;
       return true;
     })
+  );
+
+  /// 过滤之后再排序：星标置顶，其余按当前排序方式排（两个页面同一套规则）。
+  const sorted = $derived(
+    sortVersions(shown, orderFor(activePath), (id) => isStarred(activePath, id))
   );
 
   function categoryName(id: string): string | null {
@@ -183,6 +200,7 @@
       versions = list;
       categories = cats;
       absorbCategories(activePath, cats.tags);
+      absorbOrder(activePath, cats.order);
       void loadIcons(list);
       if (!gameOptions.some((option) => option.value === gamePick)) gamePick = "all";
       if (!loaderOptions.some((option) => option.value === loaderPick)) loaderPick = "all";
@@ -228,10 +246,40 @@
     announce("已刷新");
   }
 
+  /** 正在跑的实例。同一个版本可以有多份，按启动编号区分。 */
+  let runs = $state<RunView[]>([]);
+  /// 最近结束的几次（读 logs/runs/index.json），浮层里跟在运行中后面。
+  let recent = $state<RunEntry[]>([]);
+  let runsOpen = $state(false);
+  let runsTimer: ReturnType<typeof setInterval> | null = null;
+  let unlistenExit: (() => void) | null = null;
+  let unlistenVersions: (() => void) | null = null;
+
+  async function refreshRecent(): Promise<void> {
+    recent = await api.runHistory(5).catch(() => [] as RunEntry[]);
+  }
+
+  async function refreshRuns(): Promise<void> {
+    runs = await api.listRuns().catch(() => [] as RunView[]);
+  }
+
+  async function stopRun(run: RunView): Promise<void> {
+    try {
+      await api.stopRun(run.runId);
+    } catch (e) {
+      showError("结束实例失败", "进程可能已经退出了。", String(e));
+    }
+    await refreshRuns();
+  }
+
   async function launch(version: VersionView) {
+    if (runs.some((run) => run.versionId === version.id)) {
+      announce(`「${version.id}」已经在运行，再开一份会共用存档和日志`);
+    }
     busy = version.id;
     try {
       await startVersion(version);
+      await refreshRuns();
     } catch (e) {
       showError("启动失败", "游戏没有起来，看日志里的最后几行。", String(e), "game");
     } finally {
@@ -281,7 +329,7 @@
         fileName: file,
         name: null,
         javaPath: null,
-        strategy: settings?.downloadStrategy ?? "race",
+        strategy: settings?.downloadStrategy ?? "sequential",
         threads: settings?.concurrentDownloads ?? 64
       });
       await loadVersions();
@@ -433,12 +481,35 @@
 
   onMount(() => {
     void boot();
+    void refreshRuns();
+    void onGameExit(() => {
+      void refreshRuns();
+    }).then((stop) => {
+      unlistenExit = stop;
+    });
+    // 安装在本页之外完成时（下载页发起），装完自动重读列表；
+    // 否则这里还停在安装前的快照，用户会以为「又装出来一份」。
+    void onVersionsChanged((event) => {
+      if (event.gameDir === activePath) void loadVersions();
+    }).then((stop) => {
+      unlistenVersions = stop;
+    });
+    runsTimer = setInterval(() => {
+      void refreshRuns();
+    }, 2000);
+  });
+
+  onDestroy(() => {
+    if (runsTimer !== null) clearInterval(runsTimer);
+    if (unlistenExit !== null) unlistenExit();
+    if (unlistenVersions !== null) unlistenVersions();
   });
 </script>
 
 <svelte:window
   onpointerdown={(event) => {
     if (!(event.target as HTMLElement).closest(".folder-menu")) closeMenu();
+    if (!(event.target as HTMLElement).closest(".running")) runsOpen = false;
   }}
   onpointerup={() => {
     if (dragIndex !== null) void endReorder();
@@ -502,8 +573,8 @@
                 <span class="lines">
                   <span class="name">
                     {folder.name}
-                    {#if folder.kind !== "custom"}
-                      <span class="badge">{folder.kind === "current" ? "当前" : "官方"}</span>
+                    {#if folder.kind === "official"}
+                      <span class="badge">官方</span>
                     {/if}
                   </span>
                   <span class="path">{folder.path}</span>
@@ -563,6 +634,68 @@
           onchange={saveFilters}
         />
         <Dropdown label="分类" bind:value={categoryPick} options={categoryOptions} />
+        <Dropdown
+          label="排序"
+          value={orderFor(activePath)}
+          options={SORT_OPTIONS}
+          onchange={(value) => void setOrder(activePath, parseSortMode(value))}
+        />
+        <div class="running">
+          <button
+            class="runs-btn"
+            class:live={runs.length > 0}
+            aria-expanded={runsOpen}
+            onclick={() => {
+              runsOpen = !runsOpen;
+              void refreshRuns();
+              void refreshRecent();
+            }}
+          >
+            {runs.length === 0 ? "现在还没有实例运行" : `${runs.length} 个实例运行中`}
+          </button>
+          {#if runsOpen}
+            <div class="runs-pop" role="menu">
+              {#if runs.length === 0}
+                <p class="runs-empty">现在还没有实例运行</p>
+                {#if recent.length > 0}
+                  <p class="runs-head">最近结束</p>
+                  {#each recent as run (run.runId)}
+                    <div class="runs-row past">
+                      <span class="runs-name" title={`${run.started} → ${run.ended ?? "?"}`}>
+                        {run.versionId}
+                      </span>
+                      <span class="runs-code" class:bad={run.crashed}>
+                        {run.crashed ? `异常 ${run.exitCode ?? "?"}` : "已退出"}
+                      </span>
+                    </div>
+                  {/each}
+                {/if}
+              {:else}
+                {#each runs as run (run.runId)}
+                  <div class="runs-row">
+                    <span class="runs-name" title={`PID ${run.pid}`}>
+                      {run.versionId}{run.index > 1 ? ` · ${run.index}` : ""}
+                    </span>
+                    <button class="runs-stop" onclick={() => void stopRun(run)}>结束实例</button>
+                  </div>
+                {/each}
+              {/if}
+              {#if runs.length > 0 && recent.length > 0}
+                <p class="runs-head">最近结束</p>
+                {#each recent as run (run.runId)}
+                  <div class="runs-row past">
+                    <span class="runs-name" title={`${run.started} → ${run.ended ?? "?"}`}>
+                      {run.versionId}
+                    </span>
+                    <span class="runs-code" class:bad={run.crashed}>
+                      {run.crashed ? `异常 ${run.exitCode ?? "?"}` : "已退出"}
+                    </span>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+        </div>
       </div>
 
       <div class="scroll">
@@ -578,7 +711,7 @@
         </section>
       {:else}
         <div class="cards">
-          {#each shown as version (version.id)}
+          {#each sorted as version (version.id)}
             <article class="card" class:unsupported={!version.supported}>
               <div class="top">
                 <img
@@ -605,8 +738,8 @@
                 <button
                   class="star"
                   class:on={isStarred(activePath, version.id)}
-                  title={isStarred(activePath, version.id) ? "已显示在主页，点一下隐藏" : "在主页显示"}
-                  aria-label={isStarred(activePath, version.id) ? "取消在主页显示" : "在主页显示"}
+                  title={isStarred(activePath, version.id) ? "取消置顶" : "置顶"}
+                  aria-label={isStarred(activePath, version.id) ? "取消置顶" : "置顶"}
                   onclick={() => toggleStar(activePath, version.id)}
                 >
                   <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -771,8 +904,10 @@
   .folder:hover {
     background: rgb(255 255 255 / 0.05);
   }
+  /* 选中只靠高亮：左边一条竖线 + 更实的底色，不再挂「当前」小标签。 */
   .folder.active {
-    background: rgb(120 200 120 / 0.16);
+    background: rgb(120 200 120 / 0.2);
+    box-shadow: inset 3px 0 0 var(--yb-green-bright);
   }
   .folder.over {
     box-shadow: inset 0 2px 0 var(--yb-green-bright);
@@ -896,15 +1031,102 @@
     overflow: hidden;
     gap: 12px;
   }
+  /* 五个下拉一行排满：等分宽度，最窄 96px，再窄就让文字省略。 */
   .filters {
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     gap: 8px;
+    /* 这一行只占自身高度，别抢走下面列表的空间。 */
+    flex: none;
+    min-width: 0;
+  }
+  .filters :global(.dropdown) {
+    flex: 1 1 0;
+    min-width: 96px;
+  }
+  /* 运行中实例：钉在筛选行最右，浮层往上盖住卡片。 */
+  .running {
+    position: relative;
+    margin-left: auto;
     flex: none;
   }
-  /* 下拉的根是 `min-width: 0`，在 flex 行里会被压成一条，这里给个下限。 */
-  .filters :global(.dropdown) {
-    min-width: 132px;
+  .runs-btn {
+    height: 34px;
+    padding: 0 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .runs-btn.live {
+    color: var(--accent);
+    border-color: var(--border-strong);
+  }
+  .runs-head {
+    margin: 10px 0 4px;
+    padding: 0 10px;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--dim);
+  }
+  .runs-row.past {
+    opacity: 0.85;
+  }
+  .runs-code {
+    font-size: 12px;
+    color: var(--dim);
+  }
+  .runs-code.bad {
+    color: #ff9d9d;
+  }
+  .runs-pop {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    width: 320px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 6px;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-strong);
+    background: var(--panel-solid);
+    box-shadow: 0 18px 40px rgb(0 0 0 / 0.35);
+    z-index: 20;
+  }
+  .runs-empty {
+    margin: 0;
+    padding: 10px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .runs-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+  }
+  .runs-row:hover {
+    background: var(--surface-hover);
+  }
+  .runs-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+  }
+  .runs-stop {
+    flex: none;
+    padding: 4px 10px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--danger);
+    font-size: 12px;
   }
   /* 右栏自己的滚动条：筛选行固定，只有这块滚。 */
   .scroll {

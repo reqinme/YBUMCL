@@ -5,6 +5,8 @@
   import Modal from "$lib/components/Modal.svelte";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
+  import BackButton from "$lib/components/BackButton.svelte";
+  import { registerDetailBack } from "$lib/page-history.svelte";
   import { page } from "$app/state";
   import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
   import { loaderLabels } from "$lib/loader-ranges";
@@ -195,7 +197,7 @@
   let memory = $state<{ totalMb: number; availableMb: number } | null>(null);
 
   /// 这个游戏目录的分类表和本版本的归属（`chosen` 只放真实分类，星标单独存）。
-  let cats = $state<CategorySnapshot>({ categories: [], tags: {} });
+  let cats = $state<CategorySnapshot>({ categories: [], tags: {}, order: "default" });
   let chosen = $state<string[]>([]);
 
   const id = $derived(decodeURIComponent(page.params.id ?? ""));
@@ -1962,6 +1964,16 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     }
   }
 
+  /// 返回键在版本设置里先退分类（Mod → 概览），再退到版本列表。
+  $effect(() => {
+    registerDetailBack(() => {
+      if (tab === "overview") return false;
+      void switchTab("overview");
+      return true;
+    });
+    return () => registerDetailBack(null);
+  });
+
   async function switchTab(next: Tab) {
     tab = next;
     if (next === "servers") await loadServers();
@@ -2157,7 +2169,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 
 <div class="route">
 <header class="head">
-  <button class="btn ghost" onclick={() => goto("/versions")}>← 返回</button>
+  <BackButton />
   <h1>{version?.id ?? id}<span class="kind">{version?.kind ?? ""}</span></h1>
   <span class="spacer"></span>
   <button class="btn primary" disabled={!version || busy !== ""} onclick={launch}>
@@ -2417,7 +2429,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
       </div>
     </section>
   {:else if tab === "mods"}
-    <section class="mods-pane">
+    <section class="panel mods-pane">
       {#if !canUseMods}
         <div class="no-loader">
           <h3>该版本不可使用 Mod</h3>
@@ -2430,16 +2442,6 @@ function loaderKey(name: string): InstanceLoader["loader"] {
             <button class="btn ghost" onclick={() => goto("/versions")}>版本选择</button>
           </div>
         </div>
-      {:else if mods.length === 0}
-        <div class="empty-card">
-          <h3>还没有模组</h3>
-          <p class="dim">把 .jar 拖进这个窗口就能装。模组要和版本、加载器匹配，否则游戏起不来。</p>
-          <div class="empty-actions">
-            <button class="btn" onclick={() => goto(downloadsModUrl())}>下载 Mod</button>
-            <button class="btn" onclick={() => void installModFiles()}>从文件安装</button>
-            <button class="btn ghost" onclick={() => openFolder("mods")}>打开文件夹</button>
-          </div>
-        </div>
       {:else}
         <div class="mods-head">
           <input class="mods-search" placeholder="搜索名称、描述或标签" bind:value={modQuery} />
@@ -2447,9 +2449,14 @@ function loaderKey(name: string): InstanceLoader["loader"] {
             <button class="btn" onclick={() => openFolder("mods")}>打开文件夹</button>
             <button class="btn" disabled={busy !== ""} onclick={() => void installModFiles()}>从文件安装</button>
             <button class="btn" onclick={() => goto(downloadsModUrl())}>下载 Mod</button>
-            <button class="btn" onclick={toggleSelectAll}>{allShownSelected ? "取消全选" : "全选"}</button>
+            <button class="btn" disabled={mods.length === 0} onclick={toggleSelectAll}
+              >{allShownSelected ? "取消全选" : "全选"}</button
+            >
           </div>
         </div>
+        {#if mods.length === 0}
+          <p class="dim">还没有模组。</p>
+        {:else}
         <div class="mods-filters">
           {#each modFilterOptions as option (option.id)}
             <button
@@ -2570,6 +2577,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
               <button class="btn ghost" onclick={() => (selectedMods = new Set())}>取消选择</button>
             </div>
           </div>
+        {/if}
         {/if}
       {/if}
     </section>
@@ -3046,7 +3054,11 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           <button class="btn" onclick={() => goto(`/downloads?kind=${tab}&mod=`)}>
             下载{tab === "shaders" ? "光影包" : "资源包"}
           </button>
-          <button class="btn" onclick={() => toggleAllPacks(tab)}>
+          <button
+            class="btn"
+            disabled={packList(tab).length === 0}
+            onclick={() => toggleAllPacks(tab)}
+          >
             {allPacksPicked(tab) ? "取消全选" : "全选"}
           </button>
           {#if pickedIn(tab).length > 0}
@@ -4334,24 +4346,6 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     flex-wrap: wrap;
   }
 
-  .empty-card {
-    padding: 26px;
-    border-radius: 14px;
-    border: 1px dashed var(--border);
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    align-items: flex-start;
-  }
-  .empty-card h3 {
-    margin: 0;
-    font-size: 15px;
-  }
-  .empty-actions {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
   .drop {
     position: fixed;
     inset: 0;

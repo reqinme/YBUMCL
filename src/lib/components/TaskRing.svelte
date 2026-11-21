@@ -19,6 +19,7 @@
 <button
   class="ring"
   class:on={show}
+  data-download-ring
   title="下载任务"
   onclick={() => void goto("/tasks")}
   aria-label="下载任务"
@@ -35,6 +36,9 @@
       stroke-dashoffset={spinning ? 0 : offset}
     />
   </svg>
+  {#if active > 1}
+    <span class="count" aria-hidden="true">{active}</span>
+  {/if}
   <span class="icon" aria-hidden="true">
     <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M12 3v12" />
@@ -103,5 +107,42 @@
   }
   .icon {
     display: inline-flex;
+  }
+  /* 并行安装时右上角挂个数字，告诉你现在同时在跑几个。 */
+  .count {
+    position: absolute;
+    top: -3px;
+    right: -3px;
+    min-width: 15px;
+    height: 15px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: var(--yb-green-bright);
+    color: #0c1207;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 15px;
+    text-align: center;
+    box-shadow: 0 0 0 2px rgba(10, 12, 17, 0.75);
+  }
+  /* 光球撞进来的一下：圆环亮一下、微微涨开。 */
+  :global(.ring.received) {
+    animation: received 0.62s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  @keyframes received {
+    0% {
+      color: #fff;
+      box-shadow: 0 0 0 0 rgba(168, 204, 132, 0.55);
+      transform: scale(1);
+    }
+    35% {
+      color: #fff;
+      box-shadow: 0 0 22px 6px rgba(168, 204, 132, 0.45);
+      transform: scale(1.18);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(168, 204, 132, 0);
+      transform: scale(1);
+    }
   }
 </style>

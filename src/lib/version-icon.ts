@@ -7,6 +7,7 @@ import fabric from "$lib/assets/blocks/Fabric.png";
 import goldBlock from "$lib/assets/blocks/GoldBlock.png";
 import grass from "$lib/assets/blocks/Grass.png";
 import grassPath from "$lib/assets/blocks/GrassPath.png";
+import labyMod from "$lib/assets/blocks/LabyMod.png";
 import neoForge from "$lib/assets/blocks/NeoForge.png";
 import redstoneBlock from "$lib/assets/blocks/RedstoneBlock.png";
 import redstoneLampOff from "$lib/assets/blocks/RedstoneLampOff.png";
@@ -22,6 +23,7 @@ export function builtinIcon(channel: string, loaders: string[]): string {
     loaders.some((loader) => loader.toLowerCase() === name.toLowerCase());
 
   if (has("optifine")) return grassPath;
+  if (has("labymod")) return labyMod;
   if (has("neoforge")) return neoForge;
   if (has("cleanroom")) return cleanroom;
   if (has("forge")) return anvil;
@@ -56,6 +58,7 @@ export const blockIcons: { key: string; label: string; src: string }[] = [
   { key: "NeoForge", label: "狐狸（NeoForge）", src: neoForge },
   { key: "Quilt", label: "方格（Quilt）", src: quilt },
   { key: "Cleanroom", label: "Cleanroom", src: cleanroom },
+  { key: "LabyMod", label: "LabyMod", src: labyMod },
 ];
 
 /// `version_icon` 可能回图片数据，也可能回 `builtin:<方块名>`；
