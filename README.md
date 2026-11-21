@@ -97,3 +97,11 @@ Back navigation follows the page hierarchy (category → overview → version li
 The design of this launcher was informed by existing launchers. The downloader, the version layout and parts of the interface draw on ideas from [PCL2](https://github.com/Meloong-Git/PCL), [PCL-CE](https://github.com/PCL-Community/PCL-CE), [HMCL](https://github.com/HMCL-dev/HMCL) and [SJMCL](https://github.com/UNIkeEN/SJMCL). Thanks to their authors for making their work available.
 
 Downloads rely on [BMCLAPI](https://bmclapi2.bangbang93.com/) and its mirror operators. Thanks to them for keeping the files reachable.
+
+## License
+
+YBUMCL is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+YBUMCL is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+A copy of the license is included in the file [LICENSE](LICENSE).

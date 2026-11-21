@@ -97,3 +97,11 @@ Mojang 自有主机始终优先，其余流量由镜像承担；BMCLAPI 按主�
 本启动器的实现参考了现有启动器的做法。下载器、版本布局与界面设计中的部分思路来自 [PCL2](https://github.com/Meloong-Git/PCL)、[PCL-CE](https://github.com/PCL-Community/PCL-CE)、[HMCL](https://github.com/HMCL-dev/HMCL) 与 [SJMCL](https://github.com/UNIkeEN/SJMCL)，感谢这些项目的作者公开其工作。
 
 下载依赖 [BMCLAPI](https://bmclapi2.bangbang93.com/) 及各镜像维护者，感谢他们保证文件的可用性。
+
+## 许可证
+
+YBUMCL 是自由软件：你可以依据自由软件基金会发布的 GNU 通用公共许可证第 3 版，或（由你选择）任何更新版本，重新发布和 / 或修改它。
+
+YBUMCL 的分发是希望它有用，但不提供任何担保，也不含适销性或特定用途适用性的默示担保。详情请参阅 GNU 通用公共许可证。
+
+许可证全文见 [LICENSE](LICENSE)。
