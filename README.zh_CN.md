@@ -4,56 +4,82 @@
 
 # YBUMCL · 延边大学我的世界启动器
 
-**一个 exe 就能用的 Windows Minecraft 启动器。**
+**面向 Windows 的便携式 Minecraft 启动器。**
 
 [English](README.md) | 简体中文
 
 </div>
 
-## 关于
+## 概述
 
-YBUMCL 是给 Windows 用的 Minecraft 启动器，用 Tauri、SvelteKit 和 Rust 写的。下载一个 `YBUMCL.exe`，放进随便哪个文件夹双击就行；设置、日志和游戏目录都建在 exe 旁边，整个文件夹拷到别的电脑上照样能玩。
+YBUMCL 是一个使用 Tauri、SvelteKit 与 Rust 开发的 Windows Minecraft 启动器，以单个可执行文件分发，无需安装。设置、日志与游戏目录均创建在可执行文件所在的文件夹内，因此整个文件夹可以直接复制到其他计算机继续使用。
 
 ## 安装
 
-需要 Windows 10 或 11（64 位），以及 WebView2 运行时——绝大多数系统已经自带。
+运行环境：Windows 10 / 11（64 位），以及 WebView2 运行时（绝大多数系统已自带）。
 
-1. 到 [Releases](https://github.com/reqinme/YBUMCL/releases) 下载最新的 `YBUMCL-*.exe`。
-2. 放进任意文件夹，双击运行。
-3. 首次启动会在旁边建这些东西：
+1. 从 [Releases](https://github.com/reqinme/YBUMCL/releases) 下载最新的 `YBUMCL-*.exe`。
+2. 将可执行文件放入任意文件夹并运行。
+3. 首次启动时，会在其旁边创建以下文件与文件夹：
 
 ```
 YBUMCL.exe
-ybumcl.cfg       # 记住数据文件夹叫什么
-YBUMCL/          # 设置、日志、缓存
-.minecraft/      # 装完游戏才出现，和 PCL 一样可以直接搬走
+ybumcl.cfg       # 记录数据文件夹名称
+YBUMCL/          # 设置、日志与缓存
+.minecraft/      # 首次安装后创建，可随文件夹一起迁移
 ```
 
-Java 会从 `JAVA_HOME`、`PATH`、各家厂商的安装目录和官方启动器的 `runtime/` 里自动找。找不到的话，在设置里指一个 `java.exe` 就行。
+Java 会从 `JAVA_HOME`、`PATH`、各厂商的安装目录以及官方启动器的 runtime 目录中自动查找；若未找到合适的运行时，可在设置中手动指定 `java.exe`。
 
 ## 功能
 
-**装版本。** 支持原版，以及 Forge、NeoForge、Fabric、Quilt、Cleanroom、LiteLoader、OptiFine，加载器的新旧版本都在列表里，正式版和测试版会标出来。Forge 1.13+、NeoForge、Fabric、Quilt 由启动器自己装：读 `install_profile.json` 和 `version.json`，合成一份库清单，再自己跑处理器，不启动官方安装器；只有 OptiFine 和 Cleanroom 还在用它们自己的安装器。安装会变成任务，可以暂停、继续、取消，也能同时装好几个，同一个版本开两份也没问题。
+### 版本安装
 
-**下载。** Modrinth 和 CurseForge 都会查。模组、资源包、光影包、数据包、世界、整合包的进度、速度、剩余时间都是真实字节。Mojang 自己的地址始终优先，其余走镜像；BMCLAPI 按主机限并发，下载失败的文件会在最后统一重试一次。整合包一键装完直接建好实例，世界包会解压到 `saves` 里。
+支持原版，以及 Forge、NeoForge、Fabric、Quilt、Cleanroom、LiteLoader 与 OptiFine。加载器版本按从新到旧排列，并区分正式版与测试版。
 
-**实例。** 一个实例就是 `versions/` 下的一个文件夹：合并后的版本 json、它的 jar，以及自己的 `mods`、`saves`、`config`。安装时用到的原版底稿会挪到 `cache/vanilla/<版本>`，所以列表里只出现你装过的东西。详情页有 13 个标签：概览、设置、修改、导出、存档、截图、模组、资源包、光影包、投影、服务器、日志、崩溃报告。
+Forge 1.13+、NeoForge、Fabric 与 Quilt 由启动器自行安装：读取 `install_profile.json` 与 `version.json`，合并为一份库清单并执行处理器，不调用官方安装器。仅 OptiFine 与 Cleanroom 仍使用其自身的安装器。
 
-- **修改** 可以原地换游戏版本或加载器，模组、存档、配置都留着。
-- **导出** 把实例打成 zip，里面带 `manifest.json`。
-- **概览** 管图标、名字、描述、分类、置顶和启动次数。
-- **高级管理** 能导出启动脚本、测试游戏、补全文件、重置、修补核心、删除实例（默认进回收站，按住 Shift 才是永久删除）。
-- **模组** 可以扫描、启用、禁用、删除，把 `.jar` 拖进窗口也能装，还会去 Modrinth 和 CurseForge 查更新。
+安装以任务形式执行，可暂停、继续或取消；多个安装可以同时进行，同一版本也可以安装两份。
 
-版本列表能按安装顺序、名称、游戏版本、加载器、最近启动排序，每个游戏目录各记自己的选择。置顶的实例一直在最前面，主页左栏用的是同一套排序。
+### 下载
 
-**游戏目录。** 左栏可以添加、移出、重命名、拖拽排序目录。每个目录有自己的版本、筛选、分类和排序方式；你选中的那个目录，版本页、左栏和下载落点都跟着它走。
+Modrinth 与 CurseForge 会同时查询。模组、资源包、光影包、数据包、世界与整合包均显示实际传输字节、速度与剩余时间。
 
-**账户。** 支持离线账户、设备码登录的微软账户，以及 authlib-injector 外置登录。皮肤可以来自 Mojang 或 LittleSkin，头像按皮肤的「脸 + 帽子层」画出来，形状跟着皮肤走。拖动把手能排序账户，再点一下已选中的账户就是退出登录；每个来源各记一份顺序。
+Mojang 自有主机始终优先，其余流量由镜像承担；BMCLAPI 按主机限制并发。下载失败的文件会在批次末尾统一重试一次。整合包安装完成后自动创建实例，世界压缩包会解压到实例的 `saves` 目录。
 
-**日志与崩溃。** `launcher.log` 保留五份。每次启动还会在 `logs/runs/` 下单独写一份日志，并维护 `index.json`，同时开几个实例也不会混在一起。崩溃会拿 60 条内置规则去对，日志页出现红条，同时弹窗提示；可以一键导出 zip，里面有本次运行日志、启动器日志、游戏日志、最新崩溃报告、版本 json、系统信息和 `LatestLaunch.bat`。
+### 实例
 
-**界面。** 点「安装」时按钮会变成一颗光球飞到顶栏的下载图标，颜色在「设置 → 外观」里改。返回按页面层级走（分类 → 概览 → 版本列表 → 主页），会恢复滚动位置，弹窗不进历史，Esc 和 Alt+← 也能用。
+一个实例对应 `versions/` 下的一个文件夹，包含合并后的版本 JSON、客户端 jar，以及它自己的 `mods`、`saves` 与 `config`。安装过程中使用的原版底稿会被移动到 `cache/vanilla/<版本>`，因此版本列表中只保留实际安装的实例。
+
+实例页面包含十三个标签：概览、设置、修改、导出、存档、截图、模组、资源包、光影包、投影、服务器、日志与崩溃报告。
+
+- **修改**：原地更换游戏版本或加载器，保留模组、存档与配置。
+- **导出**：将实例打包为 zip，内含 `manifest.json`。
+- **概览**：管理图标、名称、描述、分类、置顶状态与启动次数。
+- **高级管理**：提供启动脚本导出、测试游戏、补全文件、重置、修补核心与删除实例；删除默认移入回收站，按住 Shift 则永久删除。
+- **模组**：扫描、启用、禁用与删除模组，支持拖入 `.jar` 导入，并可向 Modrinth 与 CurseForge 检查更新。
+
+版本列表可按安装顺序、名称、游戏版本、加载器或最近启动排序，排序方式按游戏目录分别保存。置顶实例始终排在最前，主页左栏使用同一套排序。
+
+### 游戏目录
+
+左栏中的游戏目录可以添加、移除、重命名与拖动排序。每个目录维护各自的版本列表、筛选、分类与排序方式；当前选中的目录同时作用于版本页面、左栏与下载目标。
+
+### 账户
+
+支持离线账户、设备码登录的微软账户，以及 authlib-injector 外置登录。皮肤可来自 Mojang 或 LittleSkin，头像由皮肤的「脸」与「帽子层」合成，轮廓随皮肤变化。拖动把手可调整账户顺序，再次点击已选中的账户会清除选择；每个来源分别保存自己的顺序。
+
+### 日志与崩溃报告
+
+`logs/launcher.log` 会轮转，保留五份。每次启动还会在 `logs/runs/` 下单独写一份日志，并维护 `index.json`，同时运行的多个实例不会相互混淆。
+
+崩溃会与 60 条内置规则进行匹配，并在日志页与对话框中提示。错误报告可导出为 zip，包含本次运行日志、启动器日志、游戏日志、最新崩溃报告、版本 JSON、系统信息以及用于复现的 `LatestLaunch.bat`。
+
+### 界面
+
+点击安装按钮后，按钮会变为一颗光球并飞向顶栏的下载图标；颜色可在「设置 → 外观」中配置。
+
+返回导航按页面层级执行（分类 → 概览 → 版本列表 → 主页），会恢复滚动位置，弹窗不进入历史记录，并支持 Esc 与 Alt+←。
 
 ## 文件
 
@@ -61,13 +87,13 @@ Java 会从 `JAVA_HOME`、`PATH`、各家厂商的安装目录和官方启动器
 | --- | --- |
 | `YBUMCL/settings.json` | 启动器设置 |
 | `YBUMCL/accounts.json` | 账户与皮肤 |
-| `YBUMCL/logs/` | `launcher.log` 与 `runs/` 下每次启动的日志 |
+| `YBUMCL/logs/` | `launcher.log` 以及 `runs/` 下每次启动的日志 |
 | `.minecraft/versions/<实例>/` | 一个实例 |
 | `.minecraft/cache/vanilla/<版本>/` | 安装共用的原版底稿 |
 | `.minecraft/libraries/`、`assets/` | 共享的库与资源 |
 
 ## 致谢
 
-这个启动器的很多做法，是看着别的启动器怎么解决问题学来的。下载、版本布局和界面上的不少想法来自 [PCL2](https://github.com/Meloong-Git/PCL)、[PCL-CE](https://github.com/PCL-Community/PCL-CE)、[HMCL](https://github.com/HMCL-dev/HMCL) 和 [SJMCL](https://github.com/UNIkeEN/SJMCL)，谢谢他们把源码开放出来。
+本启动器的实现参考了现有启动器的做法。下载器、版本布局与界面设计中的部分思路来自 [PCL2](https://github.com/Meloong-Git/PCL)、[PCL-CE](https://github.com/PCL-Community/PCL-CE)、[HMCL](https://github.com/HMCL-dev/HMCL) 与 [SJMCL](https://github.com/UNIkeEN/SJMCL)，感谢这些项目的作者公开其工作。
 
-在这里下载能跑起来，多半要谢 [BMCLAPI](https://bmclapi2.bangbang93.com/) 和各镜像的维护者，文件能到手全靠他们。
+下载依赖 [BMCLAPI](https://bmclapi2.bangbang93.com/) 及各镜像维护者，感谢他们保证文件的可用性。
