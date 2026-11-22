@@ -1025,3 +1025,26 @@ fn first_place_strategies_only_reorder_the_same_candidates() {
     assert_eq!(official_first.first().unwrap().0, Route::Official);
     assert_eq!(mirror_first.len(), official_first.len());
 }
+
+#[test]
+fn legacy_fabric_natives_entries_only_fetch_the_classifier() {
+    // Legacy Fabric / Ornithe 的 LWJGL2 条目只有带 classifier 的 jar，基础 jar 在仓库里不存在。
+    let assets = json!({ "objects": {} });
+    let metadata = json!({
+        "id": "1.12.2",
+        "libraries": [{
+            "name": "org.lwjgl.lwjgl:lwjgl-platform:2.9.4+legacyfabric.17",
+            "url": "https://maven.legacyfabric.net/",
+            "extract": { "exclude": ["META-INF/"] },
+            "natives": { "linux": "natives-linux", "osx": "natives-osx", "windows": "natives-windows" }
+        }]
+    });
+    let jobs = plan("1.12.2", &metadata, &assets).unwrap();
+    let paths: Vec<&str> = jobs.iter().map(|job| job.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "libraries/org/lwjgl/lwjgl/lwjgl-platform/2.9.4+legacyfabric.17/lwjgl-platform-2.9.4+legacyfabric.17-natives-windows.jar"
+        ]
+    );
+}

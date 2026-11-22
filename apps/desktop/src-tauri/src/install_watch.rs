@@ -11,10 +11,30 @@ use launcher_core::download::{CancellationToken, InstallProgress};
 use launcher_core::progress::Tracker;
 use tauri::{AppHandle, Emitter};
 
-/// 多久没有任何进度就算「可疑」，写一条警告。
+/// 多久没有任何进度就算「可疑」，写一条警告（新版本）。
 const STALL_WARN: Duration = Duration::from_secs(90);
 /// 多久没进度就中止安装（比警告长，避免慢速大文件被误杀）。
 const STALL_ABORT: Duration = Duration::from_secs(300);
+/// 老版本（1.7–1.16）、带 OptiFine/LiteLoader 的组合更容易长时间没进度：
+/// 老 Forge 的处理器、OptiFine 的官网跳转都可能卡几分钟，阈值放宽一倍以上。
+const LEGACY_WARN: Duration = Duration::from_secs(240);
+const LEGACY_ABORT: Duration = Duration::from_secs(900);
+
+/// 按版本名挑看门狗阈值。
+fn stall_limits(version_id: &str) -> (Duration, Duration) {
+    let lower = version_id.to_ascii_lowercase();
+    let legacy_game = [
+        "1.7.", "1.8.", "1.9.", "1.10.", "1.11.", "1.12.", "1.13.", "1.14.", "1.15.", "1.16.",
+    ]
+    .iter()
+    .any(|prefix| lower.contains(prefix));
+    let legacy_loader = lower.contains("optifine") || lower.contains("liteloader");
+    if legacy_game || legacy_loader {
+        (LEGACY_WARN, LEGACY_ABORT)
+    } else {
+        (STALL_WARN, STALL_ABORT)
+    }
+}
 
 pub struct Reporter {
     app: AppHandle,
@@ -91,7 +111,9 @@ pub fn watch(
     token: CancellationToken,
     has_loaders: bool,
     install_id: u64,
+    version_id: &str,
 ) -> (Arc<Reporter>, impl Fn(InstallProgress) + Send + Sync + 'static) {
+    let (stall_warn, stall_abort) = stall_limits(version_id);
     let reporter = Arc::new(Reporter {
         app,
         log_dir: log_dir.clone(),
@@ -113,7 +135,7 @@ pub fn watch(
                 state.last_seen.map(|at| at.elapsed())
             };
             let Some(idle) = idle else { continue };
-            if idle >= STALL_ABORT {
+            if idle >= stall_abort {
                 append_log(
                     &log_dir,
                     &format!(
@@ -129,7 +151,7 @@ pub fn watch(
                 token.cancel();
                 return;
             }
-            if idle >= STALL_WARN && !warned {
+            if idle >= stall_warn && !warned {
                 warned = true;
                 append_log(
                     &log_dir,

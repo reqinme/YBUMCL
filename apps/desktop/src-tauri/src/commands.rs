@@ -3762,8 +3762,15 @@ pub async fn install_game_version(
     // 装完要登记产出（任务卡的「打开文件夹 / 移除并删除文件」），得先留一份游戏目录。
     let version_dir = request.game_dir.clone();
 
-    let (_watch, emit) =
-        crate::install_watch::watch(app.clone(), paths.log_dir(), token.clone(), false, install_id);
+    let watched = request.version_id.clone();
+    let (_watch, emit) = crate::install_watch::watch(
+        app.clone(),
+        paths.log_dir(),
+        token.clone(),
+        false,
+        install_id,
+        &watched,
+    );
     let result = tauri::async_runtime::spawn_blocking(move || {
         install_version(request, token, emit).map_err(|e| e.to_string())
     })
@@ -3841,8 +3848,15 @@ pub async fn install_game_modloader(
         }
     }
 
-    let (_watch, emit) =
-        crate::install_watch::watch(app.clone(), paths.log_dir(), token.clone(), true, install_id);
+    let watched = request.game_version.clone();
+    let (_watch, emit) = crate::install_watch::watch(
+        app.clone(),
+        paths.log_dir(),
+        token.clone(),
+        true,
+        install_id,
+        &watched,
+    );
     let result = tauri::async_runtime::spawn_blocking(move || {
         install_modloader(request, token, emit).map_err(|e| e.to_string())
     })
@@ -3887,13 +3901,18 @@ pub async fn install_game_instance(
     let probe = token.clone();
 
     let has_loaders = !request.loaders.is_empty();
-    let (_watch, emit) =
-        crate::install_watch::watch(
+    // 实例名里带着游戏版本和加载器（`1.12.2-Forge_…`），拿它来判断要不要放宽看门狗。
+    let watched = request
+        .instance_name
+        .clone()
+        .unwrap_or_else(|| request.game_version.clone());
+    let (_watch, emit) = crate::install_watch::watch(
         app.clone(),
         paths.log_dir(),
         token.clone(),
         has_loaders,
         install_id,
+        &watched,
     );
     let result = tauri::async_runtime::spawn_blocking(move || {
         install_instance(request, token, emit).map_err(|e| e.to_string())
@@ -5356,6 +5375,183 @@ fn part_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 /// 工具页「清理」面板要列的东西：固定几项，不让前端传任意路径。
+#[derive(serde::Serialize)]
+pub struct CacheGroup {
+    pub key: String,
+    pub title: String,
+    pub bytes: u64,
+    pub files: u64,
+    pub count: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct CacheUsage {
+    pub path: String,
+    pub total_bytes: u64,
+    pub total_files: u64,
+    pub groups: Vec<CacheGroup>,
+}
+
+#[derive(serde::Serialize)]
+pub struct CacheClear {
+    pub freed: u64,
+    pub removed: usize,
+    pub skipped: usize,
+}
+
+const CACHE_GROUPS: &[(&str, &str)] = &[
+    ("vanilla", "原版底稿"),
+    ("forge", "加载器 · Forge"),
+    ("neoforge", "加载器 · NeoForge"),
+    ("fabric", "加载器 · Fabric"),
+    ("quilt", "加载器 · Quilt"),
+    ("legacyfabric", "加载器 · LegacyFabric"),
+    ("cleanroom", "加载器 · Cleanroom"),
+    ("liteloader", "加载器 · LiteLoader"),
+    ("optifine", "加载器 · OptiFine"),
+    ("labymod", "加载器 · LabyMod"),
+];
+
+/// 外壳目录名 → 分组。LegacyFabric 的外壳 id 和 Fabric 一样，只能再看一眼库名。
+fn cache_group_of(dir: &std::path::Path, id: &str) -> &'static str {
+    let lower = id.to_lowercase();
+    if lower.starts_with("labymod-") {
+        return "labymod";
+    }
+    if lower.contains("neoforge") {
+        return "neoforge";
+    }
+    if lower.contains("cleanroom") {
+        return "cleanroom";
+    }
+    if lower.contains("liteloader") {
+        return "liteloader";
+    }
+    if lower.contains("optifine") {
+        return "optifine";
+    }
+    if lower.contains("quilt-loader") {
+        return "quilt";
+    }
+    if lower.contains("fabric-loader") {
+        let json = dir.join(format!("{id}.json"));
+        let legacy = std::fs::read(&json)
+            .map(|bytes| String::from_utf8_lossy(&bytes).contains("legacyfabric"))
+            .unwrap_or(false);
+        return if legacy { "legacyfabric" } else { "fabric" };
+    }
+    if lower.contains("forge") {
+        return "forge";
+    }
+    "other"
+}
+
+fn cache_dirs(game_dir: &std::path::Path, group: &str) -> Vec<std::path::PathBuf> {
+    let root = game_dir.join("cache");
+    if group == "vanilla" {
+        return std::fs::read_dir(root.join("vanilla"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir())
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    std::fs::read_dir(root.join("loaders"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    cache_group_of(&entry.path(), &name) == group
+                })
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn cache_usage(paths: State<'_, Paths>) -> Result<CacheUsage, String> {
+    let game_dir = crate::game_folders::current(&paths);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut groups: Vec<CacheGroup> = CACHE_GROUPS
+            .iter()
+            .map(|(key, title)| CacheGroup {
+                key: (*key).to_owned(),
+                title: (*title).to_owned(),
+                bytes: 0,
+                files: 0,
+                count: 0,
+            })
+            .collect();
+        for (index, (key, _)) in CACHE_GROUPS.iter().enumerate() {
+            for dir in cache_dirs(&game_dir, key) {
+                let (bytes, files) = dir_size(&dir);
+                groups[index].bytes += bytes;
+                groups[index].files += files;
+                groups[index].count += 1;
+            }
+        }
+        let total_bytes = groups.iter().map(|group| group.bytes).sum();
+        let total_files = groups.iter().map(|group| group.files).sum();
+        Ok(CacheUsage {
+            path: game_dir.join("cache").display().to_string(),
+            total_bytes,
+            total_files,
+            groups,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 清缓存。`group` 为 None 表示全部；正在安装的目录跳过，不打断任何人。
+#[tauri::command]
+pub async fn clear_cache(paths: State<'_, Paths>, group: Option<String>) -> Result<CacheClear, String> {
+    let game_dir = crate::game_folders::current(&paths);
+    tauri::async_runtime::spawn_blocking(move || {
+        let busy = launcher_core::busy_installs();
+        let groups: Vec<&str> = match group.as_deref() {
+            Some(key) => vec![key],
+            None => CACHE_GROUPS.iter().map(|(key, _)| *key).collect(),
+        };
+        let mut freed = 0u64;
+        let mut removed = 0usize;
+        let mut skipped = 0usize;
+        for key in groups {
+            for dir in cache_dirs(&game_dir, key) {
+                let name = dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if busy.iter().any(|live| live == &name) {
+                    skipped += 1;
+                    continue;
+                }
+                let (bytes, _) = dir_size(&dir);
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => {
+                        freed += bytes;
+                        removed += 1;
+                    }
+                    Err(_) => skipped += 1,
+                }
+            }
+        }
+        Ok(CacheClear {
+            freed,
+            removed,
+            skipped,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 pub async fn cleanup_targets(paths: State<'_, Paths>) -> Result<Vec<CleanTarget>, String> {
     let game_dir = crate::game_folders::current(&paths);
@@ -5381,12 +5577,6 @@ pub async fn cleanup_targets(paths: State<'_, Paths>) -> Result<Vec<CleanTarget>
             });
         };
 
-        push_dir(
-            "game-cache",
-            "下载缓存",
-            "游戏目录下的 cache（PCL 等启动器留下的 SHA-1 缓存），删掉下次会重新下载",
-            &game_dir.join("cache"),
-        );
         push_dir(
             "game-logs",
             "游戏日志",

@@ -4,7 +4,7 @@
   import { announce } from "$lib/tasks.svelte";
   import { showError } from "$lib/dialogs.svelte";
   import { api } from "$lib/api";
-  import type { CleanTarget, JavaInstallation, LauncherInfo, UsageEntry } from "$lib/api";
+  import type { CacheUsage, CleanTarget, JavaInstallation, LauncherInfo, UsageEntry } from "$lib/api";
   import { cachedJava } from "$lib/detect";
   
   let info = $state<LauncherInfo | null>(null);
@@ -14,6 +14,10 @@
   let javas = $state<JavaInstallation[]>([]);
   let scanning = $state(true);
   let detecting = $state(false);
+  let cache = $state<CacheUsage | null>(null);
+  let cacheScanning = $state(false);
+  /// 正在等第二次点击的清理范围：分组 key，或 "all"。
+  let cachePending = $state<string | null>(null);
 
   const totalBytes = $derived(usage.reduce((sum, entry) => sum + entry.bytes, 0));
   const maxBytes = $derived(usage.reduce((max, entry) => Math.max(max, entry.bytes), 0));
@@ -25,6 +29,7 @@
       .catch(() => {});
     void loadUsage();
     void loadTargets();
+    void loadCache();
     void loadJava();
   });
 
@@ -45,6 +50,44 @@
     } catch {
       targets = [];
     }
+  }
+
+  async function loadCache() {
+    cacheScanning = true;
+    try {
+      cache = await api.cacheUsage();
+    } catch (error) {
+      showError("读取缓存失败", "统计缓存大小时出了错。", String(error));
+    } finally {
+      cacheScanning = false;
+    }
+  }
+
+  /// 第一次点把按钮撑大、变红、改成「真的要清理吗？」；再点一次才删。
+  /// 4 秒内没点第二次就复原，和上面「清理」卡一致。
+  async function clearCacheGroup(key: string | null) {
+    const id = key ?? "all";
+    if (cachePending !== id) {
+      cachePending = id;
+      setTimeout(() => {
+        if (cachePending === id) cachePending = null;
+      }, 4000);
+      return;
+    }
+    cachePending = null;
+    try {
+      const done = await api.clearCache(key ?? undefined);
+      const tail = done.skipped > 0 ? `，跳过 ${done.skipped} 项正在使用` : "";
+      announce(`已清理 ${size(done.freed)}${tail}`);
+      await Promise.all([loadCache(), loadUsage()]);
+    } catch (error) {
+      showError("清理失败", "有文件没删掉，可能正被占用。", String(error));
+    }
+  }
+
+  function cachePercent(bytes: number): number {
+    const total = cache?.totalBytes ?? 0;
+    return total === 0 ? 0 : Math.max(0.5, (bytes / total) * 100);
   }
 
   /// 第一次点只是把按钮变成「确认」，再点一次才真删——比系统确认框稳。
@@ -191,6 +234,59 @@
         </li>
       {/each}
     </ul>
+  {/if}
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2>缓存</h2>
+      <p class="dim small">
+        安装时下载的原版底稿和加载器外壳留在这里。清掉不影响已装版本，只是重装时要重新下载。
+      </p>
+    </div>
+    <button class="btn" onclick={() => void loadCache()} disabled={cacheScanning}>
+      {cacheScanning ? "统计中…" : "重新统计"}
+    </button>
+  </header>
+
+  {#if cache === null}
+    <p class="dim">正在统计…</p>
+  {:else}
+    <ul class="cache-list">
+      {#each cache.groups as group (group.key)}
+        <li class="cache-row">
+          <span class="cache-name">{group.title}</span>
+          <span class="cache-count">{group.count} 个</span>
+          <span class="usage-bar">
+            <span class="fill" style:width={`${cachePercent(group.bytes)}%`}></span>
+          </span>
+          <span class="usage-size">{size(group.bytes)}</span>
+          <button
+            class="btn tiny"
+            class:confirm={cachePending === group.key}
+            disabled={group.count === 0}
+            onclick={() => void clearCacheGroup(group.key)}
+          >
+            {cachePending === group.key ? "真的要清理吗？" : "清理"}
+          </button>
+        </li>
+      {/each}
+    </ul>
+    <p class="dim small total">
+      合计 {size(cache.totalBytes)} · {cache.totalFiles} 个文件 · <code>{cache.path}</code>
+    </p>
+    <div class="actions">
+      <button class="btn" onclick={() => void open(cache?.path)}>打开缓存目录</button>
+      <button
+        class="btn"
+        class:confirm={cachePending === "all"}
+        disabled={cache.totalBytes === 0}
+        onclick={() => void clearCacheGroup(null)}
+      >
+        {cachePending === "all" ? "真的要清理吗？" : "全部清理"}
+      </button>
+    </div>
   {/if}
 </section>
 
@@ -451,6 +547,45 @@
     padding: 4px 10px;
     font-size: 12px;
   }
+  /* 缓存 */
+  .cache-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0 0 10px;
+    padding: 0;
+    list-style: none;
+  }
+  .cache-row {
+    display: grid;
+    grid-template-columns: 168px 64px 1fr 92px 132px;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+    padding: 5px 2px;
+  }
+  .cache-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cache-count {
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .cache-row .usage-bar {
+    height: 8px;
+  }
+  .btn.tiny.confirm,
+  .btn.confirm {
+    padding: 8px 18px;
+    font-size: 13px;
+    background: rgba(178, 58, 46, 0.92);
+    border-color: rgba(214, 84, 70, 0.95);
+    color: #fff;
+    transition: padding 0.15s ease, background 0.15s ease;
+  }
+
   /* 启动器信息 */
   .kv {
     margin: 0;

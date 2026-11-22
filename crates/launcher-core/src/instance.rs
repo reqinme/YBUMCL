@@ -197,6 +197,9 @@ pub fn install_instance(
                     merge::remove_version(&root, &game);
                 }
             }
+            // 失败/中止的安装不会走到合并那一步，它下了一半的加载器外壳得自己清掉，
+            // 否则版本页会多出 `fabric-loader-…`、`labymod-…` 这类卡片。
+            cleanup_loader_shells(&root, &game, &name, &parts);
             // 取消就把这次留下的半截文件扫干净；assets/libraries 的完整文件不动。
             // 别的安装可能正在写自己的 `.part`，只有咱一个在跑时才扫。
             if cancel.is_cancel_requested() && crate::base::installs_active() <= 1 {
@@ -309,6 +312,23 @@ fn build_instance(
         shell_leases.push(crate::base::BaseLease::new(&shell));
         let shell_lock = crate::base::base_lock(&shell);
         let _serial = crate::base::wait_lock(&shell_lock, cancel)?;
+        // 缓存里有同一组合、而且库都还在：直接搬回来复用，不再跑一遍安装。
+        // 只对「装完就是一份 json + 库」的加载器这么做；Forge/NeoForge/Cleanroom/
+        // OptiFine 还依赖处理器产物，复用有风险。
+        if matches!(
+            part.kind,
+            LoaderKind::Fabric | LoaderKind::Quilt | LoaderKind::LegacyFabric | LoaderKind::LiteLoader
+        ) && cached_shell_usable(root, &shell)
+            && merge::restore_loader_shell(root, &shell)
+        {
+            event(progress, name, "instance-loader", stage_path, 0, 0, 0);
+            produced.push(LoaderPart {
+                kind: part.kind,
+                version: part.version.clone(),
+                version_id: shell.clone(),
+            });
+            continue;
+        }
         // 同名加载器外壳是上次没清掉的中间产物，直接重写；真正的实例不碰。
         // 还有别的安装在用它（合并阶段）时不能删，否则对方读不到版本 json。
         if !crate::base::base_busy(&shell) {
@@ -502,33 +522,35 @@ fn build_instance(
         let dir = root.join("versions").join(name);
         let _ = download::prefetch_labymod(&dir, channel, &cancel.clone(), |step| progress(step));
     }
-    // 4. 中间产物清理：只删没人引用的加载器 profile 外壳。
-    //    原版目录必须留着——实例 json 靠 `inheritsFrom` 指回它，启动时由
-    //    `inheritance::resolve_version` 合并，删了就会退化成「没有游戏类」的实例。
+    // 租约只保护安装过程：清理阶段要把它们放掉，否则「我自己还占着」会让下面的
+    // `base_busy` 判断永远为真，LabyMod 的 profile 外壳就永远删不掉。
+    drop(shell_leases);
+    // 4. 中间产物清理：外壳挪进 `cache/loaders/`（工具页里能看到、能清）。
+    //    不直接删，是因为同一个加载器组合重装时还能用；LabyMod 的外壳带一份客户端
+    //    jar，而 `cache/vanilla` 里已有同一份，`archive_loader_shell` 会顺手删掉它。
     for part in &merged_parts {
         if part.version_id != name
             && part.version_id != game
             && !referenced_by_others(root, &part.version_id, name)
             && !crate::base::base_busy(&part.version_id)
+            && !merge::archive_loader_shell(root, &part.version_id)
         {
             merge::remove_version(root, &part.version_id);
         }
     }
-    // LabyMod 的 profile 就是实例的 `inheritsFrom` 目标（实例自己不写库），
-    // 删掉它实例就启动不了，所以这份外壳必须留着。
-    // 合并式下原版目录只是安装底稿，实例已经把 jar 复制走了；本次刚装出来、
-    // 又没有别的版本引用它时删掉，`versions/` 就只剩实例自己（同 PCL）。
-    for stale in [base.as_str(), game] {
-        if flat
-            && installed_base
-            && stale != name
-            && !referenced_by_others(root, stale, name)
-            && !base_busy(stale)
-        {
-            merge::remove_version(root, stale);
-        }
+    // LabyMod 的 profile 外壳同样进缓存（实例已经把它拍平了，不再需要它）。
+    if base.as_str() != name
+        && base.as_str() != game
+        && !referenced_by_others(root, &base, name)
+        && !base_busy(&base)
+        && !merge::archive_loader_shell(root, &base)
+    {
+        merge::remove_version(root, &base);
     }
-    drop(shell_leases);
+    // 原版底稿已经进了 `cache/vanilla`，`versions/<原版>` 只可能是旧版本残留。
+    if flat && installed_base && game != name && !base_busy(game) {
+        merge::remove_version(root, game);
+    }
     event(progress, name, "complete", "", 0, 0, 0);
     Ok(summary)
 }
@@ -595,6 +617,40 @@ fn profile_id(kind: LoaderKind, game: &str, version: &str) -> String {
         LoaderKind::LiteLoader => format!("{game}-LiteLoader"),
         LoaderKind::OptiFine => format!("{game}-OptiFine_{version}"),
     }
+}
+
+/// 缓存里的外壳能不能直接复用：json 读得出来、有主类、库都在本地。
+///
+/// 处理器类加载器（Forge/NeoForge/Cleanroom/OptiFine）即使库都在，也可能缺
+/// 处理器产物，所以调用方只对元数据直装的加载器用它。
+fn cached_shell_usable(root: &Path, id: &str) -> bool {
+    let json = merge::loader_cache_path(root, id).join(format!("{id}.json"));
+    let Ok(bytes) = fs::read(&json) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    if value.get("mainClass").and_then(|v| v.as_str()).is_none() {
+        return false;
+    }
+    let Some(libraries) = value.get("libraries").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if libraries.is_empty() {
+        return false;
+    }
+    libraries.iter().all(|library| {
+        let path = library
+            .get("downloads")
+            .and_then(|d| d.get("artifact"))
+            .and_then(|a| a.get("path"))
+            .and_then(|p| p.as_str());
+        match path {
+            Some(relative) => root.join("libraries").join(relative).is_file(),
+            None => true,
+        }
+    })
 }
 
 /// 只删「带 inheritsFrom 的加载器外壳」或没装完的目录，用户自己的实例不动。
@@ -680,6 +736,36 @@ fn pick_java(
 }
 
 /// 是否还有别的版本 json 依赖这个原版目录（继承或复用它的 jar）。
+/// 失败/取消后，把这次安装用过的加载器外壳清掉（只删没人引用的）。
+fn cleanup_loader_shells(root: &Path, game: &str, name: &str, parts: &[LoaderPart]) {
+    for part in parts {
+        let id = profile_id(part.kind, game, &part.version);
+        remove_shell_if_unused(root, game, name, &id);
+    }
+    // LabyMod 的外壳带 commit（`labymod-121118d1-1.12.2`），推不出来，按目录扫。
+    if parts.iter().any(|part| part.kind == LoaderKind::LabyMod) {
+        let suffix = format!("-{game}");
+        if let Ok(entries) = fs::read_dir(root.join("versions")) {
+            for entry in entries.flatten() {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if id.starts_with("labymod-") && id.ends_with(&suffix) {
+                    remove_shell_if_unused(root, game, name, &id);
+                }
+            }
+        }
+    }
+}
+
+fn remove_shell_if_unused(root: &Path, game: &str, name: &str, id: &str) {
+    if id == name || id == game || id.is_empty() {
+        return;
+    }
+    if crate::base::base_busy(id) || referenced_by_others(root, id, name) {
+        return;
+    }
+    merge::remove_version(root, id);
+}
+
 fn referenced_by_others(root: &Path, base: &str, except: &str) -> bool {
     let versions = root.join("versions");
     let Ok(entries) = fs::read_dir(versions) else {

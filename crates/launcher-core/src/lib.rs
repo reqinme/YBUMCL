@@ -26,6 +26,11 @@ pub mod crashlog;
 pub mod curseforge;
 pub mod dates;
 mod base;
+
+/// 正在安装中、不能被清掉的基础版本 / 加载器外壳名字。
+pub fn busy_installs() -> Vec<String> {
+    base::active_installs()
+}
 pub mod download;
 pub mod export;
 pub mod icons;

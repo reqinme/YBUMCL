@@ -4666,8 +4666,19 @@ impl<S: Source + Sync, F: FnMut(InstallProgress)> Installer<'_, S, F> {
             if job.hash.is_none() {
                 self.event(&format!("{}-checksum", kind.stage()), &job.path);
                 self.cancel.check()?;
-                let bytes =
-                    fetch_limited(self.source, &format!("{}.sha1", job.url), self.cancel, 1024)?;
+                // 仓库不一定发布 `.sha1`（Legacy Fabric 的 maven 就没有，且会 302 到
+                // 经常连不上的 repo.legacyfabric.net）。校验和是加分项：拿不到就跳过校验，
+                // 让文件照常下载，否则一条探针失败会把整次安装废掉。
+                let sidecar =
+                    fetch_limited(self.source, &format!("{}.sha1", job.url), self.cancel, 1024);
+                let bytes = match sidecar {
+                    Ok(bytes) => bytes,
+                    Err(error) if skippable_checksum(&error) => {
+                        self.event(&format!("{}-checksum-skipped", kind.stage()), &job.path);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 self.progress.downloaded_bytes += bytes.len() as u64;
                 self.summary.downloaded_bytes = self.progress.downloaded_bytes;
                 let text = std::str::from_utf8(&bytes)
@@ -4864,6 +4875,24 @@ fn upgrade_maven(url: &str) -> String {
     }
     url.to_owned()
 }
+/// 校验和（`.sha1`）是加分项，不是安装前提：仓库没发布、或者探针本身连不上，
+/// 都只跳过校验继续下载。但「内容明显不对」（例如超大、非法）仍然按错误处理。
+fn skippable_checksum(error: &DownloadError) -> bool {
+    match error {
+        DownloadError::Network(message) => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("404")
+                || lower.contains("error sending request")
+                || lower.contains("connection")
+                || lower.contains("dns")
+                || lower.contains("timed out")
+                || lower.contains("timeout")
+                || lower.contains("body error")
+        }
+        _ => false,
+    }
+}
+
 fn plan(id: &str, metadata: &Value, assets: &Value) -> Result<Vec<Artifact>> {
     // Cleanroom 这类自带完整 profile 的加载器不写 downloads.client，客户端 jar 由库提供。
     let mut jobs = match metadata["downloads"]["client"]["url"].as_str() {
@@ -4891,6 +4920,11 @@ fn plan(id: &str, metadata: &Value, assets: &Value) -> Result<Vec<Artifact>> {
             .as_str()
             .ok_or_else(|| DownloadError::Invalid("library name missing".into()))?;
         let fallback = maven_path(name)?;
+        // Legacy Fabric / Ornithe 的 profile 用「坐标 + natives」描述 LWJGL2，
+        // 只发布了带 classifier 的 jar（`-natives-windows` 等），基础 jar 在仓库里不存在。
+        // 这类条目只取 classifier 那份，不能再去要基础 jar，否则一定 404。
+        let natives_only =
+            library.get("natives").is_some() && library.get("downloads").is_none();
         if let Some(artifact) = library["downloads"].get("artifact") {
             jobs.push(library_artifact(library, artifact, &fallback)?);
         } else if library.get("downloads").is_none() {
@@ -4901,7 +4935,9 @@ fn plan(id: &str, metadata: &Value, assets: &Value) -> Result<Vec<Artifact>> {
                         .ok_or_else(|| DownloadError::Invalid("invalid library URL".into()))?,
                 )?;
             }
-            jobs.push(library_artifact(library, &Value::Null, &fallback)?);
+            if !natives_only {
+                jobs.push(library_artifact(library, &Value::Null, &fallback)?);
+            }
         }
         if let Some(classifier) = library["natives"]["windows"].as_str() {
             let classifier = classifier.replace(

@@ -239,6 +239,8 @@ pub fn run() {
             commands::path_exists,
             commands::open_url,
             commands::cleanup_targets,
+            commands::cache_usage,
+            commands::clear_cache,
             commands::cleanup_run,
             heartbeat,
         ])

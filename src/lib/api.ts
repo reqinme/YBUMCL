@@ -407,6 +407,28 @@ export type CleanTarget = {
   bytes: number;
   files: number;
 };
+/// 一份缓存分组：原版底稿或某一类加载器外壳。
+export type CacheGroup = {
+  key: string;
+  title: string;
+  bytes: number;
+  files: number;
+  count: number;
+};
+
+export type CacheUsage = {
+  path: string;
+  totalBytes: number;
+  totalFiles: number;
+  groups: CacheGroup[];
+};
+
+export type CacheClear = {
+  freed: number;
+  removed: number;
+  skipped: number;
+};
+
 
 /** 下载源策略：有镜像的文件按它处理；没有镜像的一律走官方。 */
 export type DownloadStrategy =
@@ -1301,6 +1323,8 @@ export const api = {
 
   cleanupTargets: () => invoke<CleanTarget[]>("cleanup_targets"),
   cleanupRun: (key: string) => invoke<number>("cleanup_run", { key }),
+  cacheUsage: () => invoke<CacheUsage>("cache_usage"),
+  clearCache: (group?: string) => invoke<CacheClear>("clear_cache", { group: group ?? null }),
 };
 
 export function onGameLog(

@@ -279,13 +279,74 @@ pub fn scaffold_dir(root: &Path, id: &str) -> PathBuf {
     root.join("cache").join("vanilla").join(id)
 }
 
+/// 加载器外壳的缓存位置：`<root>/cache/loaders/<id>/`。
+///
+/// 外壳是安装期的中间产物（加载器 json + 它自己的 jar），合并成实例后就没用了，
+/// 但下次装同一组合还用得上。放在缓存里既不会在版本列表多出一张卡，也能让用户
+/// 在工具页看到它占了多少、想清就清。
+pub fn loader_cache_dir(root: &Path) -> PathBuf {
+    root.join("cache").join("loaders")
+}
+
+/// 某个外壳在缓存里的目录。
+pub fn loader_cache_path(root: &Path, id: &str) -> PathBuf {
+    loader_cache_dir(root).join(id)
+}
+
 /// 底稿 json 的实际位置：优先缓存，其次兼容旧的 `versions/<id>` 落点。
 pub fn base_json_path(root: &Path, id: &str) -> PathBuf {
     let cached = scaffold_dir(root, id).join(format!("{id}.json"));
     if cached.is_file() {
         return cached;
     }
+    let loader = loader_cache_path(root, id).join(format!("{id}.json"));
+    if loader.is_file() {
+        return loader;
+    }
     version_json(root, id)
+}
+
+/// 把一个外壳从 `versions/<id>` 挪进 `cache/loaders/<id>`。
+///
+/// LabyMod 的外壳带一份客户端 jar，而 `cache/vanilla/<版本>` 里已经有了同一份，
+/// 所以搬过去之后顺手把 jar 删掉，只留 json。
+///
+/// 返回是否真的搬了（源目录不存在、id 不合法时返回 false）。
+pub fn archive_loader_shell(root: &Path, id: &str) -> bool {
+    if !safe_component(id) || id.is_empty() {
+        return false;
+    }
+    let from = root.join("versions").join(id);
+    if !from.is_dir() {
+        return false;
+    }
+    let to = loader_cache_path(root, id);
+    if let Some(parent) = to.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::remove_dir_all(&to);
+    if fs::rename(&from, &to).is_err() {
+        return false;
+    }
+    let _ = fs::remove_file(to.join(format!("{id}.jar")));
+    true
+}
+
+/// 把缓存里的外壳搬回 `versions/<id>`，供安装流程复用。
+pub fn restore_loader_shell(root: &Path, id: &str) -> bool {
+    if !safe_component(id) || id.is_empty() {
+        return false;
+    }
+    let from = loader_cache_path(root, id);
+    if !from.is_dir() {
+        return false;
+    }
+    let to = root.join("versions").join(id);
+    let _ = fs::remove_dir_all(&to);
+    if let Some(parent) = to.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::rename(&from, &to).is_ok()
 }
 
 /// 读取 `<root>/versions/<id>/<id>.json`。

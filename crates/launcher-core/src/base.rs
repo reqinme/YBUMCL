@@ -57,6 +57,15 @@ pub(crate) fn base_busy(game: &str) -> bool {
     active_map().get(game).copied().unwrap_or(0) > 1
 }
 
+/// 正在被安装任务占用的基础版本 / 外壳名字。工具页清缓存时据此跳过。
+pub fn active_installs() -> Vec<String> {
+    active_map()
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 pub(crate) fn installs_active() -> usize {
     INSTALLS_ACTIVE.load(Ordering::Relaxed)
 }
