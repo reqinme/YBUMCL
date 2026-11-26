@@ -109,7 +109,7 @@
     width: 32px;
     height: 32px;
     background:
-      radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0) 38%),
+      radial-gradient(circle at 34% 28%, var(--text) 0%, rgba(255, 255, 255, 0) 38%),
       radial-gradient(
         circle at 50% 56%,
         color-mix(in srgb, var(--c) 38%, #05070a 62%) 0%,
@@ -120,7 +120,7 @@
       0 0 18px 4px color-mix(in srgb, var(--c) 52%, transparent),
       0 0 46px 12px color-mix(in srgb, var(--c) 18%, transparent),
       inset 0 -4px 9px rgba(0, 0, 0, 0.38),
-      inset 0 2px 4px rgba(255, 255, 255, 0.22);
+      inset 0 2px 4px var(--glint);
   }
   .spark {
     background: radial-gradient(

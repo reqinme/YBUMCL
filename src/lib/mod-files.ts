@@ -19,6 +19,8 @@ export type FileVersion = {
   fileName: string;
   fileUrl: string;
   fileSize: number;
+  /// 这个文件声明的依赖（Modrinth `dependencies` / CurseForge `relationType` 归一化后的）。
+  dependencies?: { projectId: string | null; versionId: string | null; fileName: string | null; dependencyType: string }[];
 };
 
 export const OTHER_GROUP = "其他";
@@ -100,11 +102,14 @@ export function isSnapshot(name: string): boolean {
   return /w\d|snapshot/i.test(name);
 }
 
-/// 折进「远古版」：1.20 以前（PCL 是 `VersionToDrop < 120`）。
+/// 折进「远古版」：1.12 以前（PCL 的 `VersionToDrop < 120` 就是 1.11.x 及更早）。
+///
+/// 之前写的是 `minor < 20`，于是 1.19.4 也被当成远古版——那是把 PCL 的
+/// `Version(19, 0, 4)`（Major 取小版本号）当成了 `1.19`。
 export function isOldVersion(name: string): boolean {
   const parsed = parseGameVersion(name);
   if (!parsed) return false;
-  return parsed.major === 1 && parsed.minor < 20;
+  return parsed.major === 1 && parsed.minor < 12;
 }
 
 export type GroupFlags = { drop: boolean; foldOld: boolean };

@@ -231,13 +231,13 @@
   }
   .crash-main strong {
     font-size: 14px;
-    color: #ffb4b4;
+    color: var(--danger-text);
   }
   .crash-detail {
     color: var(--dim);
   }
   .crash-fix {
-    color: #ffd9a8;
+    color: var(--warn-text);
   }
   .crash-more,
   .crash-note {
@@ -269,8 +269,8 @@
     height: 100%;
     display: flex;
     flex-direction: column;
-    background: rgba(8, 10, 14, 0.82);
-    backdrop-filter: blur(10px);
+    background: var(--log-bg-strong, rgba(8, 10, 14, 0.82));
+    backdrop-filter: var(--glass-10);
   }
   .bar {
     flex: none;
@@ -325,7 +325,7 @@
     color: var(--text-dim);
   }
   .state.on {
-    color: var(--yb-green-bright);
+    color: var(--accent);
     background: rgba(127, 163, 94, 0.16);
   }
   .log {
@@ -344,7 +344,7 @@
     gap: 10px;
     white-space: pre-wrap;
     word-break: break-word;
-    color: rgba(255, 255, 255, 0.82);
+    color: var(--text-2);
   }
   .tag {
     flex: none;
@@ -353,10 +353,10 @@
     user-select: none;
   }
   .row.stderr .text {
-    color: #e8a3a3;
+    color: var(--danger-text);
   }
   .row.system .text {
-    color: var(--yb-green-bright);
+    color: var(--accent);
   }
   .waiting {
     color: var(--text-dim);

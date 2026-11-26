@@ -3,10 +3,12 @@
   import { page } from "$app/state";
   import { OFFICIAL_SKINS } from "$lib/official-skins";
   import { api, onGameCrash } from "$lib/api";
+  import { listen } from "@tauri-apps/api/event";
+  import { toast } from "$lib/toast";
+  import { watchLaunchEvents } from "$lib/launch-pending.svelte";
   import { showCrash } from "$lib/dialogs.svelte";
   import Logo from "./Logo.svelte";
   import HeadAvatar from "./HeadAvatar.svelte";
-  import Island from "./Island.svelte";
   import TaskRing from "./TaskRing.svelte";
   import ErrorDialog from "./ErrorDialog.svelte";
   import JavaChoiceDialog from "./JavaChoiceDialog.svelte";
@@ -157,13 +159,23 @@
     window.addEventListener("keydown", onGlobalKey);
     // 游戏非正常退出时弹诊断窗，不管用户当前在哪个页面。
     let stopCrash: (() => void) | null = null;
+    const stopMemorySkip = listen<string>("memory-skip", (event) => {
+      toast(`这次跳过了内存优化：${event.payload}`, "info", 3200);
+    });
     void onGameCrash((event) => showCrash(event.versionId, event.code, event.hits)).then((off) => {
       stopCrash = off;
+    });
+    // 启动按钮的进度线：窗口出现 / 进程退出 / 崩溃都算这次启动结束。
+    let stopLaunch: (() => void) | null = null;
+    void watchLaunchEvents().then((off) => {
+      stopLaunch = off;
     });
     return () => {
       observer.disconnect();
       window.removeEventListener("keydown", onGlobalKey);
       stopCrash?.();
+      stopLaunch?.();
+      void stopMemorySkip.then((off) => off());
     };
   });
 </script>
@@ -195,10 +207,6 @@
     </div>
   </div>
 
-  <div class="right">
-    <Island />
-  </div>
-
   <a
     class="account"
     class:signed-out={!me}
@@ -228,41 +236,46 @@
   .nav {
     height: var(--nav-h);
     flex: none;
-    display: flex;
+    display: grid;
+    /* 三块各占固定位置：品牌 268、导航占剩余、岛自动、账户 184。 */
+    grid-template-columns: auto minmax(0, 1fr) auto;
     align-items: center;
-    gap: 16px;
+    column-gap: 16px;
     padding: 0 var(--gutter);
-  }
-  /* 岛和任务按钮贴在右边，岛收起时宽度为 0，不占位置。 */
-  .right {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex: none;
   }
   .brand {
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
+    max-width: 268px;
+    overflow: hidden;
     padding: 4px 8px 4px 4px;
     border-radius: var(--radius-sm);
     transition: background 0.15s ease;
   }
   .brand:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--tint-1);
   }
   .name {
     display: flex;
     flex-direction: column;
     line-height: 1.15;
+    min-width: 0;
   }
   .name strong {
     font-size: 15px;
     letter-spacing: 0.08em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .name span {
     font-size: 11px;
     color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .links {
     position: relative;
@@ -272,25 +285,25 @@
     flex: 0 1 auto;
     padding: 4px;
     border-radius: 999px;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.045));
-    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: linear-gradient(180deg, var(--tint-3), rgba(255, 255, 255, 0.045));
+    border: 1px solid var(--tint-4);
     box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.22),
+      inset 0 1px 0 var(--glint),
       inset 0 -1px 0 rgba(0, 0, 0, 0.25),
       0 10px 28px rgba(0, 0, 0, 0.26);
-    backdrop-filter: blur(22px) saturate(1.7);
-    -webkit-backdrop-filter: blur(22px) saturate(1.7);
+    backdrop-filter: var(--glass-22);
+    -webkit-backdrop-filter: var(--glass-22);
   }
   .link {
     position: relative;
     padding: 6px 14px;
     border-radius: 999px;
-    color: rgba(255, 255, 255, 0.8);
+    color: var(--text-2);
     white-space: nowrap;
     transition: background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
   }
   .link:hover {
-    background: rgba(255, 255, 255, 0.09);
+    background: var(--line-soft);
     color: var(--text);
   }
   .link.active {
@@ -306,10 +319,10 @@
     height: var(--h);
     transform: translate(var(--x), var(--y));
     border-radius: 999px;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.26), rgba(255, 255, 255, 0.14));
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.26), var(--tint-4));
     box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.45),
-      inset 0 -1px 0 rgba(255, 255, 255, 0.08),
+      inset 0 1px 0 var(--glint-strong),
+      inset 0 -1px 0 var(--line-soft),
       0 4px 14px rgba(0, 0, 0, 0.22);
     opacity: 0;
     pointer-events: none;
@@ -331,13 +344,15 @@
     display: flex;
     align-items: center;
     gap: 9px;
+    min-width: 0;
+    max-width: 184px;
     padding: 4px 10px 4px 4px;
     border-radius: 999px;
     border: 1px solid transparent;
     transition: background 0.15s ease, border-color 0.15s ease;
   }
   .account:hover {
-    background: rgba(255, 255, 255, 0.07);
+    background: var(--tint-2);
     border-color: var(--border);
   }
   .head {
@@ -350,7 +365,7 @@
     flex: none;
   }
   .head.letter.guest {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--line-soft);
     color: var(--text-dim);
   }
   .account.signed-out .who strong {
@@ -369,7 +384,8 @@
     display: flex;
     flex-direction: column;
     line-height: 1.15;
-    max-width: 140px;
+    min-width: 0;
+    flex: 1;
   }
   .who strong {
     font-size: 13px;
@@ -381,6 +397,9 @@
   .who small {
     font-size: 11px;
     color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* 圆钮跟在导航药丸后面，面板从它下面弹出来，盖在页面上但不换页。 */
@@ -388,8 +407,6 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    flex: 0 1 auto;
-    margin-right: auto;
     min-width: 0;
   }
   .tasks {

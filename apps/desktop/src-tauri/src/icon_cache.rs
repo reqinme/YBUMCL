@@ -35,21 +35,49 @@ fn gate(url: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// 取一张图标：先看磁盘缓存，没有（或过期）才联网。
+/// 取一张图标：缓存新鲜就直接给，过期了先给旧的再后台刷，没缓存才同步下载。
 pub fn load_or_fetch(dir: &Path, url: &str) -> Result<Option<String>, String> {
     prune(dir);
     let file = path_of(dir, url);
-    if let Some(hit) = read(&file) {
-        return Ok(hit);
+    if let Some((icon, fresh)) = read_entry(&file) {
+        if fresh {
+            return Ok(icon);
+        }
+        // 和 PCL 一样：旧图先顶上，后台重新下载，下好再覆盖，界面不会闪空。
+        if let Some(icon) = icon {
+            spawn_refresh(dir.to_path_buf(), url.to_owned());
+            return Ok(Some(icon));
+        }
+        let _ = fs::remove_file(&file);
     }
+    fetch_into(dir, url)
+}
+
+/// 后台刷新一张过期图标。
+fn spawn_refresh(dir: PathBuf, url: String) {
+    let _ = std::thread::Builder::new()
+        .name("icon-refresh".into())
+        .spawn(move || {
+            let _ = fetch_into(&dir, &url);
+        });
+}
+
+fn fetch_into(dir: &Path, url: &str) -> Result<Option<String>, String> {
+    let file = path_of(dir, url);
     let gate = gate(url);
     let _guard = gate.lock().unwrap_or_else(|error| error.into_inner());
     // 等锁期间别人可能已经下好，再看一眼，别重复下载。
-    if let Some(hit) = read(&file) {
-        return Ok(hit);
+    if let Some((icon, fresh)) = read_entry(&file) {
+        if fresh {
+            return Ok(icon);
+        }
     }
     let icon = fetch(url)?;
-    write(&file, icon.as_deref());
+    // 只有真的拿到图片才落盘；失败、超时、拿到 HTML 都不写，
+    // 否则一次网络抖动就会把「没有图标」锁死七天（PCL 也是失败即删）。
+    if let Some(data) = icon.as_deref() {
+        write(&file, data);
+    }
     Ok(icon)
 }
 
@@ -57,36 +85,57 @@ fn path_of(dir: &Path, url: &str) -> PathBuf {
     dir.join(format!("{}.txt", launcher_core::icons::url_key(url)))
 }
 
-fn read(file: &Path) -> Option<Option<String>> {
+/// 读缓存：返回内容 + 是否还在有效期内。空文件（旧版本留下的「没有图标」标记）直接删掉当没缓存。
+fn read_entry(file: &Path) -> Option<(Option<String>, bool)> {
     let meta = fs::metadata(file).ok()?;
     let modified = meta.modified().ok()?;
     let age = SystemTime::now()
         .duration_since(modified)
         .unwrap_or_default();
-    if age > TTL {
+    let text = fs::read_to_string(file).ok()?;
+    if text.is_empty() {
         let _ = fs::remove_file(file);
         return None;
     }
-    let text = fs::read_to_string(file).ok()?;
-    Some(if text.is_empty() { None } else { Some(text) })
+    Some((Some(text), age <= TTL))
 }
 
-fn write(file: &Path, icon: Option<&str>) {
+fn write(file: &Path, icon: &str) {
     let Some(parent) = file.parent() else {
         return;
     };
     let _ = fs::create_dir_all(parent);
     // 先写临时文件再换名：中途退出不会留下半张图。
     let temp = file.with_extension("tmp");
-    if fs::write(&temp, icon.unwrap_or("")).is_err() {
+    if fs::write(&temp, icon).is_err() {
         return;
     }
     let _ = fs::remove_file(file);
     let _ = fs::rename(&temp, file);
 }
 
+/// MCIM 的图片镜像：CDN 主机换掉、路径不变，官方图取不到时再试一次。
+fn mirrored(url: &str) -> Option<String> {
+    const HOSTS: [(&str, &str); 3] = [
+        ("cdn.modrinth.com", "mod.mcimirror.top"),
+        ("media.forgecdn.net", "mod.mcimirror.top"),
+        ("edge.forgecdn.net", "mod.mcimirror.top"),
+    ];
+    HOSTS.iter().find_map(|(from, to)| {
+        url.contains(&format!("//{from}/"))
+            .then(|| url.replace(&format!("//{from}/"), &format!("//{to}/")))
+    })
+}
+
 fn fetch(url: &str) -> Result<Option<String>, String> {
-    let bytes = launcher_core::download::fetch_icon_bytes(url).map_err(|error| error.to_string())?;
+    let bytes = match launcher_core::download::fetch_icon_bytes(url) {
+        Ok(bytes) => bytes,
+        Err(primary) => match mirrored(url) {
+            Some(backup) => launcher_core::download::fetch_icon_bytes(&backup)
+                .map_err(|_| primary.to_string())?,
+            None => return Err(primary.to_string()),
+        },
+    };
     Ok(match launcher_core::icons::inspect(&bytes) {
         // 纯白、纯透明或根本不是图片：记成「没有图标」，界面显示项目名占位。
         None => None,
@@ -120,7 +169,10 @@ fn prune(dir: &Path) {
             .ok()
             .and_then(|at| now.duration_since(at).ok())
             .unwrap_or_default();
-        if age > TTL {
+        // 过期文件留着当「旧图」用（读的时候会先显示再后台刷新）；
+        // 空文件是旧版本留下的「没有图标」标记，直接清掉让它们重新下载。
+        let empty = meta.len() == 0;
+        if empty || age > TTL * 4 {
             let _ = fs::remove_file(entry.path());
         }
     }

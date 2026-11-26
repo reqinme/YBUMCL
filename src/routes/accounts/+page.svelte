@@ -6,6 +6,7 @@
   import BackButton from "$lib/components/BackButton.svelte";
   import Modal from "$lib/components/Modal.svelte";
   import Dropdown from "$lib/components/Dropdown.svelte";
+  import Segmented from "$lib/components/Segmented.svelte";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import { OFFICIAL_CAPES } from "$lib/official-capes";
   import { OFFICIAL_SKINS, officialSheet } from "$lib/official-skins";
@@ -118,7 +119,11 @@
     }
   }
 
+  /// 切换排列方式时内容往哪边滑：网格 → 列表往左，反之往右。
+  let layoutDir = $state(1);
+
   function writeLayout(next: Layout) {
+    layoutDir = next === "list" ? 1 : -1;
     layout = next;
     try {
       localStorage.setItem("ybumcl.accounts.layout", next);
@@ -734,23 +739,24 @@
 
     <section class="panel">
       <div class="toolbar">
-        <div class="seg" role="group" aria-label="排列方式">
-          <button class:active={layout === "grid"} onclick={() => writeLayout("grid")} aria-label="网格">
-            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-              <rect x="1" y="1" width="6" height="6" rx="1" />
-              <rect x="9" y="1" width="6" height="6" rx="1" />
-              <rect x="1" y="9" width="6" height="6" rx="1" />
-              <rect x="9" y="9" width="6" height="6" rx="1" />
-            </svg>
-          </button>
-          <button class:active={layout === "list"} onclick={() => writeLayout("list")} aria-label="列表">
-            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
-              <rect x="1" y="2" width="14" height="3" rx="1" />
-              <rect x="1" y="7" width="14" height="3" rx="1" />
-              <rect x="1" y="12" width="14" height="3" rx="1" />
-            </svg>
-          </button>
-        </div>
+        <Segmented bind:value={layout} ariaLabel="排列方式" options={[{ value: "grid", label: "网格" }, { value: "list", label: "列表" }]} onchange={(next) => writeLayout(next as Layout)}>
+          {#snippet icon(kind)}
+            {#if kind === "grid"}
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <rect x="1" y="1" width="6" height="6" rx="1" />
+                <rect x="9" y="1" width="6" height="6" rx="1" />
+                <rect x="1" y="9" width="6" height="6" rx="1" />
+                <rect x="9" y="9" width="6" height="6" rx="1" />
+              </svg>
+            {:else}
+              <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                <rect x="1" y="2" width="14" height="3" rx="1" />
+                <rect x="1" y="7" width="14" height="3" rx="1" />
+                <rect x="1" y="12" width="14" height="3" rx="1" />
+              </svg>
+            {/if}
+          {/snippet}
+        </Segmented>
         {#if filter !== "all" && filter !== "offline" && filter !== "microsoft"}
           <button class="btn ghost small" onclick={removeServer}>移除这个服务器</button>
         {/if}
@@ -765,7 +771,8 @@
           <button class="btn primary" onclick={() => (addOpen = true)}>+ 添加角色</button>
         </div>
       {:else}
-        <div class="cards" class:list={layout === "list"}>
+        {#key layout}
+      <div class="cards" class:list={layout === "list"} style="--slide-from: {layoutDir * 18}px">
           {#each visible as account (account.id)}
             <div
               class="card"
@@ -854,6 +861,7 @@
             </div>
           {/each}
         </div>
+      {/key}
       {/if}
     </section>
   </div>
@@ -1122,11 +1130,11 @@
   .add-src {
     margin-top: auto;
     justify-content: flex-start;
-    border: 1px dashed rgba(255, 255, 255, 0.16);
+    border: 1px dashed var(--line);
     color: var(--text-dim);
   }
   .add-src:hover {
-    border-color: var(--yb-green-bright);
+    border-color: var(--accent);
     color: var(--text);
   }
   .btn.small {
@@ -1139,7 +1147,7 @@
     gap: 2px;
     padding: 12px 10px;
     border-right: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--tint-1);
   }
   .src {
     display: flex;
@@ -1156,10 +1164,10 @@
     cursor: pointer;
   }
   .src:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--tint-1);
   }
   .src.active {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     font-weight: 600;
   }
   .count {
@@ -1194,33 +1202,8 @@
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
   }
-  .seg {
-    display: inline-flex;
-    padding: 3px;
-    gap: 2px;
-    border-radius: 10px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-  }
-  .seg button {
-    display: grid;
-    place-items: center;
-    width: 30px;
-    height: 26px;
-    border: none;
-    border-radius: 8px;
-    background: transparent;
-    color: var(--text-dim);
-    cursor: pointer;
-  }
-  .seg button.active {
-    background: rgba(255, 255, 255, 0.12);
-    color: var(--text);
-  }
-  .seg svg {
-    fill: currentColor;
-  }
   .cards {
+    animation: cards-in 0.22s cubic-bezier(0.2, 0.7, 0.3, 1);
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
     gap: 14px;
@@ -1230,13 +1213,24 @@
     min-height: 0;
     overflow-y: auto;
   }
+  @keyframes cards-in {
+    from {
+      opacity: 0;
+      transform: translateX(var(--slide-from, 0));
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
   .cards.list {
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
   }
   .card {
     position: relative;
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--tint-1);
     border: 1px solid var(--border);
     border-radius: 14px;
     overflow: visible;
@@ -1280,11 +1274,11 @@
     right: -6px;
   }
   .card:hover {
-    border-color: rgba(255, 255, 255, 0.22);
-    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--glint);
+    background: var(--tint-1);
   }
   .card.active {
-    border-color: var(--yb-green-bright);
+    border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--yb-green-bright) inset;
     background: rgba(126, 200, 120, 0.08);
   }
@@ -1326,7 +1320,7 @@
     display: block;
     width: 100%;
     aspect-ratio: 1;
-    background: radial-gradient(120% 90% at 50% 12%, rgba(255, 255, 255, 0.1), rgba(0, 0, 0, 0.26));
+    background: radial-gradient(120% 90% at 50% 12%, var(--tint-3), rgba(0, 0, 0, 0.26));
   }
   .card.grid .meta {
     flex-direction: row;
@@ -1367,7 +1361,7 @@
     flex: none;
     image-rendering: pixelated;
     object-fit: cover;
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--line-soft);
   }
   .advanced {
     border: 1px solid var(--border);
@@ -1407,7 +1401,7 @@
     display: grid;
     place-items: center;
     background: radial-gradient(circle at 50% 35%, rgba(120, 220, 160, 0.12), transparent 70%),
-      rgba(255, 255, 255, 0.03);
+      var(--tint-1);
     overflow: hidden;
   }
   .skin-group {
@@ -1428,7 +1422,7 @@
     padding: 4px 2px 3px;
     border-radius: 8px;
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--tint-1);
     color: var(--text-dim);
     font-size: 10px;
     cursor: pointer;
@@ -1472,7 +1466,7 @@
     padding: 4px 14px;
     border-radius: 999px;
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--tint-1);
     color: var(--text-dim);
     font-size: 12px;
     cursor: pointer;
@@ -1529,7 +1523,7 @@
     padding: 2px 8px;
     border-radius: 999px;
     font-size: 11px;
-    color: var(--yb-green-bright);
+    color: var(--accent);
     background: rgba(126, 200, 120, 0.16);
   }
   .handle {
@@ -1566,7 +1560,7 @@
     opacity: 1;
   }
   .handle:hover {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     color: var(--text);
   }
   /* 触屏没有 hover：把手常显，否则根本找不到能拖的地方。 */
@@ -1614,7 +1608,7 @@
     opacity: 1;
   }
   .more:hover {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     color: var(--text);
   }
   .menu {
@@ -1627,7 +1621,7 @@
     min-width: 132px;
     padding: 4px;
     border-radius: 10px;
-    background: #1d2320;
+    background: var(--panel-solid, #1d2320);
     border: 1px solid var(--border);
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45);
   }
@@ -1642,7 +1636,7 @@
     cursor: pointer;
   }
   .menu button:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--line-soft);
   }
   .menu button.danger {
     color: #ff9a8a;
@@ -1658,13 +1652,13 @@
     padding: 14px;
     border-radius: 12px;
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--tint-1);
     color: var(--text);
     text-align: left;
     cursor: pointer;
   }
   .kind:hover {
-    border-color: var(--yb-green-bright);
+    border-color: var(--accent);
   }
   .form {
     display: flex;
@@ -1697,7 +1691,7 @@
     margin: 4px 0;
     padding: 10px 14px;
     border-radius: 10px;
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--tint-2);
     font-family: ui-monospace, Consolas, monospace;
     font-size: 22px;
     letter-spacing: 3px;

@@ -328,7 +328,7 @@
     padding: 5px 8px;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(8, 10, 14, 0.35);
+    background: var(--wall-chip, rgba(8, 10, 14, 0.35));
   }
   .crumb {
     border: 0;
@@ -342,7 +342,7 @@
     cursor: pointer;
   }
   .crumb:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--line-soft);
   }
   .crumb:disabled {
     color: var(--text-dim);
@@ -358,7 +358,7 @@
     padding: 7px 10px;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(8, 10, 14, 0.35);
+    background: var(--wall-chip, rgba(8, 10, 14, 0.35));
     color: var(--text);
     font-size: 13px;
   }
@@ -383,7 +383,7 @@
     width: 100%;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(8, 10, 14, 0.35);
+    background: var(--wall-chip, rgba(8, 10, 14, 0.35));
     color: var(--text);
     padding: 7px 12px;
     font-size: 13px;
@@ -391,7 +391,7 @@
     cursor: pointer;
   }
   .file:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--tint-2);
   }
   .row {
     display: flex;

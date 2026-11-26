@@ -2,6 +2,24 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+export type ReleaseInfo = {
+  latest: string;
+  url: string;
+  notes: string;
+  newer: boolean;
+};
+
+export type RefDetail = {
+  id: string;
+  title: string;
+  slug: string;
+  icon: string | null;
+  description: string;
+  downloads: number;
+  updated: string;
+  source: string;
+};
+
 export type LauncherInfo = {
   version: string;
   exeDir: string;
@@ -46,6 +64,8 @@ export type VersionView = {
   pack: PackInfo | null;
   /** 内存分配方式：0 自动、1 自定义、2 跟随全局 */
   memoryType: number;
+  /** 启动前内存优化：0 跟随全局、1 开启、2 关闭 */
+  memoryOptimize: number;
   /** 自定义内存（MB），memoryType 为 1 时生效 */
   memoryCustomMb: number;
   /** 初始堆（MB），0 表示和最大堆一样 */
@@ -116,6 +136,8 @@ export type VersionSettings = {
   javaPath: string;
   /// 0 自动、1 自定义、2 跟随全局。
   memoryType: number;
+  /// 启动前内存优化：0 跟随全局、1 开启、2 关闭。
+  memoryOptimize: number;
   /// `memoryType === 1` 时生效（MB）。
   memoryCustomMb: number;
   /// 初始堆（MB），0 表示同最大堆。
@@ -370,6 +392,30 @@ export type InstanceLoader = {
 };
 
 /** 原版 + 若干加载器合并成一个自包含实例。 */
+/// Cleanroom 装完要补的核心模组（Fugue / Scalar / Scalar Legacy 里挑的那一个）。
+export type ChosenExtra = {
+  project: number;
+  file: number;
+  fileName: string;
+};
+
+/// 安装面板上的一行：能挑哪些版本、各自来自 CurseForge 的哪个项目。
+export type CleanroomExtraVersion = {
+  file: number;
+  version: string;
+  fileName: string;
+  size: number;
+  date: string;
+};
+
+export type CleanroomExtraMod = {
+  key: string;
+  label: string;
+  note: string;
+  project: number;
+  versions: CleanroomExtraVersion[];
+};
+
 export type InstanceRequest = {
   gameDir: string;
   gameVersion: string;
@@ -379,6 +425,8 @@ export type InstanceRequest = {
   strategy?: DownloadStrategy | null;
   threads?: number | null;
   overwrite?: boolean;
+  /// Cleanroom 选的附加模组；空数组表示一个都不装。
+  cleanroomMods?: ChosenExtra[];
 };
 
 export type ModLoaderInstallRequest = {
@@ -456,6 +504,22 @@ export type Settings = {
   reuseGameFolders: boolean;
   /** 「安装光球」颜色（`#rrggbb`）：点安装后飞向下载圆环的那颗球。 */
   installBallColor: string;
+  /** 界面材质：`dynamic`（毛玻璃，默认）或 `static`（不透明面板，省 GPU）。 */
+  effects: string;
+  /** 工具页里放进「便捷功能」的卡片 id。 */
+  toolboxPins: string[];
+  /** 启动游戏前做一次内存优化（清待机列表，需要管理员权限）。 */
+  memoryOptimize: boolean;
+  /** 全局默认窗口标题；实例里留空时用它 */
+  windowTitle: string;
+  /** 启动器可见性：keep / minimize */
+  launcherVisibility: "keep" | "minimize";
+  /** 进程优先级：realtime / high / above / normal / below / idle */
+  processPriority: "realtime" | "high" | "above" | "normal" | "below" | "idle";
+  /** 窗口大小：default / 1280x720 / 1600x900 / 1920x1080 */
+  windowSize: string;
+  proxyMode: "system" | "direct" | "manual";
+  proxyUrl: string;
   /** 下载协议：false = HTTP/1.1（默认），true = HTTP/2。 */
   useHttp2: boolean;
   /** 下载限速档位（0–42，PCL 同款）：42 不限速，每个任务单独一份额度。 */
@@ -678,6 +742,12 @@ export const api = {
     invoke<unknown>("pack_reinstall", { gameDir, gameDirectory, keepCustom }),
   packUpdateRestore: (gameDir: string, gameDirectory: string) =>
     invoke<void>("pack_update_restore", { gameDir, gameDirectory }),
+  checkUpdate: () => invoke<ReleaseInfo>("check_update"),
+  developerAvatar: (login: string) => invoke<string | null>("developer_avatar", { login }),
+  projectTranslation: (source: string, id: string) =>
+    invoke<string | null>("project_translation", { source, id }),
+  referenceDetails: (source: string, ids: string[]) =>
+    invoke<RefDetail[]>("reference_details", { source, ids }),
   dependencyProjects: (
     ids: string[]
   ): Promise<Record<string, { title: string; slug: string; icon: string | null }>> =>
@@ -873,6 +943,9 @@ export const api = {
     invoke<InstallSummary>("install_game_version", { request, installId }),
   installGameModloader: (request: ModLoaderInstallRequest, installId?: number) =>
     invoke<InstallSummary>("install_game_modloader", { request, installId }),
+  /// Cleanroom 可选的前置模组（Fugue / Scalar / Scalar Legacy）及其版本。
+  cleanroomExtras: (game: string) =>
+    invoke<CleanroomExtraMod[]>("cleanroom_extras", { game }),
   installGameInstance: (request: InstanceRequest, installId?: number) =>
     invoke<InstallSummary>("install_game_instance", { request, installId }),
   /** 实例实际用的根目录（隔离实例是 `versions/<id>`）。 */
@@ -931,6 +1004,8 @@ export const api = {
     invoke<boolean>("instance_name_taken", { gameDir, name }),
   /// `mode = "pause"` 只停不清（半截 `.part` 留着续传）；其它值等于取消并清理。
   /// 停某一个安装任务（按前端任务卡的 id 找），`mode = "pause"` 只停不清。
+  cancelDownload: (taskId: number, mode: "pause" | "cancel" = "cancel") =>
+    invoke<boolean>("cancel_download", { taskId, mode }),
   cancelInstall: (installId: number | null | undefined, mode: "pause" | "cancel" = "cancel") =>
     invoke<boolean>("cancel_install", { installId: installId ?? null, mode }),
   /// 安装包：把单个加载器（或原版客户端）的文件下载到指定目录。
@@ -1371,6 +1446,18 @@ export function onGameExit(
   handler: (event: GameExit) => void,
 ): Promise<UnlistenFn> {
   return listen<GameExit>("game-exit", (event) => handler(event.payload));
+}
+
+/// 游戏窗口真的画出来了（不是进程起来就算）。前端据此解锁「启动」按钮。
+export type GameReady = {
+  runId: number;
+  versionId: string;
+};
+
+export function onGameReady(
+  handler: (event: GameReady) => void,
+): Promise<UnlistenFn> {
+  return listen<GameReady>("game-ready", (event) => handler(event.payload));
 }
 
 /// 装完一个版本/加载器/整合包之后由后端广播：各页面据此重新读盘。

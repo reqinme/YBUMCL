@@ -5,6 +5,8 @@
   import { showError } from "$lib/dialogs.svelte";
   import { api, type Settings, type VersionView } from "$lib/api";
   import { startVersion } from "$lib/launch";
+  import { isLaunching } from "$lib/launch-pending.svelte";
+  import LaunchFill from "$lib/components/LaunchFill.svelte";
   import { resolveIconUrl } from "$lib/version-icon";
   import { currentVersion, pickCurrent, setCurrentVersion } from "$lib/current-version.svelte";
   import { absorbCategories, isStarred, starredIds } from "$lib/starred.svelte";
@@ -181,8 +183,13 @@
         >
           版本设置
         </button>
-        <button class="btn primary" disabled={!selected || busy} onclick={launch}>
-          {busy ? "启动中…" : "启动游戏"}
+        <button
+          class="btn primary"
+          disabled={!selected || busy || (selected ? isLaunching(selected.id) : false)}
+          onclick={launch}
+        >
+          {#if selected}<LaunchFill id={selected.id} />{/if}
+          <span>{selected && isLaunching(selected.id) ? "启动中…" : "启动游戏"}</span>
         </button>
       </div>
     </div>
@@ -190,6 +197,13 @@
 </div>
 
 <style>
+  .btn.primary {
+    position: relative;
+    overflow: hidden;
+  }
+  .btn.primary > span {
+    position: relative;
+  }
 
   .home {
     position: relative;
@@ -251,9 +265,9 @@
     padding: 10px;
     border-radius: var(--radius-lg);
     background: rgba(18, 22, 30, 0.42);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    backdrop-filter: blur(22px) saturate(1.25);
-    -webkit-backdrop-filter: blur(22px) saturate(1.25);
+    border: 1px solid var(--line-soft);
+    backdrop-filter: var(--glass-22-soft);
+    -webkit-backdrop-filter: var(--glass-22-soft);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
     overflow: hidden;
   }
@@ -290,7 +304,7 @@
     min-width: 0;
   }
   .item:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--tint-2);
     color: var(--text);
   }
   .item.active {
@@ -351,9 +365,9 @@
     padding: 14px 16px;
     border-radius: var(--radius-lg);
     background: rgba(14, 18, 24, 0.34);
-    border: 1px solid rgba(255, 255, 255, 0.07);
-    backdrop-filter: blur(18px) saturate(1.15);
-    -webkit-backdrop-filter: blur(18px) saturate(1.15);
+    border: 1px solid var(--tint-2);
+    backdrop-filter: var(--glass-18-soft);
+    -webkit-backdrop-filter: var(--glass-18-soft);
   }
   .dock-info {
     min-width: 0;
@@ -364,7 +378,7 @@
     font-size: 26px;
     font-weight: 650;
     letter-spacing: 0.01em;
-    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+    text-shadow: 0 2px 12px var(--wall-shadow, rgba(0, 0, 0, 0.5));
   }
   .sub {
     display: flex;
@@ -379,7 +393,7 @@
   .tag {
     padding: 2px 8px;
     border-radius: 6px;
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     font-size: 12px;
   }
   .dock-actions {

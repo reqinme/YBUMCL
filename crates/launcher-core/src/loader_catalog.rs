@@ -581,7 +581,7 @@ pub fn forge_recommended(game: &str, cancel: &CancellationToken) -> Option<Strin
 /// 官网在 Cloudflare 后面，慢的时候能挂上一分钟；界面默认值等不了那么久，给个硬上限。
 fn forge_recommended_uncached(game: &str, cancel: &CancellationToken) -> Option<String> {
     for url in [BMCL_FORGE_PROMOS, FORGE_PROMOS] {
-        let Ok(client) = reqwest::blocking::Client::builder()
+        let Ok(client) = crate::proxy::apply(reqwest::blocking::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
             .build()

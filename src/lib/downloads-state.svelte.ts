@@ -50,7 +50,6 @@ export type DownloadsState = {
   /// 正在看的项目；从实例页跳过来时会带全量字段。
   project: ProjectRef | null;
   /// 详情页里选中的实例版本与加载器筛选。
-  instance: string | null;
   loaderFilter: string | null;
   /// 详情页里展开了哪些分组。
   expanded: string[];

@@ -50,6 +50,9 @@ pub struct InstanceRequest {
     /// 允许覆盖同名实例（实例内追加/更换加载器的场景）。
     #[serde(default)]
     pub overwrite: bool,
+    /// Cleanroom 的附加模组（Fugue / Scalar / Scalar Legacy）：面板上挑中的文件。
+    #[serde(default)]
+    pub cleanroom_mods: Vec<crate::cleanroom::ChosenExtra>,
 }
 
 /// 合并安装的结果：`InstallSummary` 的 `version_id` 就是实例名。
@@ -510,6 +513,33 @@ fn build_instance(
     summary.downloaded_files += filled.downloaded_files;
     summary.skipped_files += filled.skipped_files;
     summary.downloaded_bytes += filled.downloaded_bytes;
+    // Cleanroom 只装加载器本身，Fugue / Scalar 要自己放进 `mods/`；
+    // 用户在安装面板上挑了哪几个就下哪几个，没挑的一个都不下。
+    if produced.iter().any(|part| part.kind == LoaderKind::Cleanroom)
+        && !request.cleanroom_mods.is_empty()
+    {
+        let dir = root.join("versions").join(name);
+        let cancel_fetch = cancel.clone();
+        let version_for_event = name.to_owned();
+        let installed = crate::cleanroom::install_extras(
+            &dir,
+            &request.cleanroom_mods,
+            &cancel_fetch,
+            |file_name, done, total| {
+                progress(InstallProgress {
+                    version_id: version_for_event.clone(),
+                    stage: "modloader-extra".into(),
+                    path: format!("下载前置模组 {file_name}"),
+                    completed_files: 0,
+                    total_files: 0,
+                    downloaded_bytes: done,
+                    total_bytes: total,
+                    percent: None,
+                });
+            },
+        );
+        summary.downloaded_files += installed.len() as u64;
+    }
     // LabyMod 首次启动会自己下约 50 MB 资源（单连接只有 60–100 KB/s，要十几分钟）。
     // 安装阶段先取到 `<实例>/labymod-neo/assets/`：它启动时按 sha1 校验，命中就跳过。
     // 失败不影响安装——最坏是回到它自己慢慢下。
@@ -550,6 +580,10 @@ fn build_instance(
     // 原版底稿已经进了 `cache/vanilla`，`versions/<原版>` 只可能是旧版本残留。
     if flat && installed_base && game != name && !base_busy(game) {
         merge::remove_version(root, game);
+    }
+    // 加载器安装时可能又落回一份底稿副本；统一收进缓存，别在版本页多一张卡。
+    if flat {
+        let _ = merge::sweep_vanilla_scaffolds(root);
     }
     event(progress, name, "complete", "", 0, 0, 0);
     Ok(summary)

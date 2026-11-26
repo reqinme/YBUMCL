@@ -5,6 +5,16 @@
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>延边大学我的世界启动器</title>
+    <script>
+      // 界面材质在首帧前就定下来：设置页会同步写一份到 localStorage，
+      // 否则启动时先按默认毛玻璃画一帧，再切成静态，会闪一下。
+      try {
+        document.documentElement.dataset.fx =
+          localStorage.getItem("ybumcl.effects") === "static" ? "static" : "dynamic";
+      } catch {
+        document.documentElement.dataset.fx = "dynamic";
+      }
+    </script>
     <style>
       html,
       body {

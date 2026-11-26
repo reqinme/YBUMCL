@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Segmented from "$lib/components/Segmented.svelte";
   import Dropdown from "$lib/components/Dropdown.svelte";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import FileBrowser from "$lib/components/FileBrowser.svelte";
@@ -13,6 +14,8 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { startVersion } from "$lib/launch";
+  import { isLaunching } from "$lib/launch-pending.svelte";
+  import LaunchFill from "$lib/components/LaunchFill.svelte";
   import { announce } from "$lib/tasks.svelte";
   import { showError } from "$lib/dialogs.svelte";
   import { cachedJava } from "$lib/detect";
@@ -178,6 +181,7 @@
     javaPath: "",
     javaAuto: false,
     memoryType: 2,
+    memoryOptimize: 0,
     memoryCustom: 4096,
     memoryInitial: 0,
     windowTitle: "",
@@ -502,7 +506,6 @@
         gameVersions: [],
         chineseTitle: null
       },
-      instance: null,
       loaderFilter: null,
       expanded: [],
       scrollTop: 0
@@ -549,6 +552,7 @@
       form.javaPath = version.javaPath;
       form.javaAuto = version.javaAuto;
       form.memoryType = version.memoryType;
+      form.memoryOptimize = version.memoryOptimize ?? 0;
       form.memoryCustom = version.memoryCustomMb || version.maxMemoryMb || 4096;
       form.memoryInitial = version.memoryInitialMb;
       form.windowTitle = version.windowTitle;
@@ -698,8 +702,22 @@
     return options;
   });
 
-  function downloadsModUrl(query = "") {
-    return query ? `/downloads?mod=${encodeURIComponent(query)}` : "/downloads?mod=";
+  /// 当前实例的加载器 id（下载页的加载器选项用的是小写 id，别传显示名）。
+  function instanceLoaderId(): string {
+    const detailed = (version?.loadersDetail ?? []).map((item) => item.loader);
+    const list = detailed.length > 0 ? detailed : (version?.loaders ?? []);
+    return list.length > 0 ? list[0].toLowerCase() : "";
+  }
+
+  /// 跳下载页：带分类、搜索词、游戏版本，模组再带上加载器（原版实例没有加载器就不带）。
+  function downloadsUrl(kind: string, query = "") {
+    const params = new URLSearchParams({ mod: query });
+    if (kind !== "mods") params.set("kind", kind);
+    const game = version?.gameVersion?.trim() ?? "";
+    if (game) params.set("mc", game);
+    const loader = instanceLoaderId();
+    if (loader && kind === "mods") params.set("loader", loader);
+    return `/downloads?${params.toString()}`;
   }
 
   /// 右键模组：照 PCL 的「信息」行为。
@@ -718,11 +736,7 @@
       await openModWikiByName(name);
       return;
     }
-    const mc = version?.gameVersion?.trim();
-    const loader = modLoader;
-    const extra =
-      (mc ? `&mc=${encodeURIComponent(mc)}` : "") + (loader ? `&loader=${encodeURIComponent(loader)}` : "");
-    goto(`${downloadsModUrl(name)}${extra}${project}`);
+    goto(`${downloadsUrl("mods", name)}${project}`);
   }
 
   /// 认不出项目时的去处：PCL 用 `https://www.mcmod.cn/s?key=<显示名>`。
@@ -1073,6 +1087,7 @@
       javaPath: form.javaPath,
       javaAuto: form.javaAuto,
       memoryType: form.memoryType,
+      memoryOptimize: form.memoryOptimize,
       memoryCustomMb: form.memoryType === 1 ? custom : 0,
       memoryInitialMb: form.memoryType === 1 ? initial : 0,
       maxMemoryMb: form.memoryType === 1 ? custom : 0,
@@ -2172,18 +2187,25 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   <BackButton />
   <h1>{version?.id ?? id}<span class="kind">{version?.kind ?? ""}</span></h1>
   <span class="spacer"></span>
-  <button class="btn primary" disabled={!version || busy !== ""} onclick={launch}>
-    {busy === "launch" ? "启动中…" : "启动"}
+  <button
+    class="btn primary"
+    disabled={!version || busy !== "" || (version ? isLaunching(version.id) : false)}
+    onclick={launch}
+  >
+    {#if version}<LaunchFill id={version.id} />{/if}
+    <span>{version && isLaunching(version.id) ? "启动中…" : "启动"}</span>
   </button>
 </header>
 
 {#if version}
   <nav class="tabs">
-    {#each TABS as item (item.id)}
-      <button class="tab" class:active={tab === item.id} onclick={() => void switchTab(item.id)}>
-        {item.label}
-      </button>
-    {/each}
+    <Segmented
+      block
+      bind:value={tab}
+      ariaLabel="版本页面"
+      options={TABS.map((item) => ({ value: item.id, label: item.label }))}
+      onchange={(next) => void switchTab(next as Tab)}
+    />
   </nav>
 
   {#if tab === "overview"}
@@ -2448,7 +2470,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
           <div class="mods-tools">
             <button class="btn" onclick={() => openFolder("mods")}>打开文件夹</button>
             <button class="btn" disabled={busy !== ""} onclick={() => void installModFiles()}>从文件安装</button>
-            <button class="btn" onclick={() => goto(downloadsModUrl())}>下载 Mod</button>
+            <button class="btn" onclick={() => goto(downloadsUrl("mods"))}>下载 Mod</button>
             <button class="btn" disabled={mods.length === 0} onclick={toggleSelectAll}
               >{allShownSelected ? "取消全选" : "全选"}</button
             >
@@ -2772,6 +2794,27 @@ function loaderKey(name: string): InstanceLoader["loader"] {
             </div>
           </div>
         {/if}
+        <label class="field wide">
+          <span>启动前内存优化</span>
+          <Dropdown
+            value={String(form.memoryOptimize)}
+            label="启动前内存优化"
+            options={[
+              { value: "0", label: "跟随全局设置" },
+              { value: "1", label: "开启" },
+              { value: "2", label: "关闭" }
+            ]}
+            onchange={(value) => {
+              form.memoryOptimize = Number(value);
+              void flush();
+            }}
+          />
+        </label>
+        {#if form.memoryOptimize === 1}
+          <p class="dim">
+            启动前会让系统把暂不用的内存页还回来，需要管理员权限；授权框点「否」就跳过这次优化，游戏照常启动，但启动要等它跑完。
+          </p>
+        {/if}
       </section>
 
       <section class="scard">
@@ -3051,7 +3094,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
             disabled={busy !== ""}
             onclick={() => void installPackFiles(tab)}>从文件安装</button
           >
-          <button class="btn" onclick={() => goto(`/downloads?kind=${tab}&mod=`)}>
+          <button class="btn" onclick={() => goto(downloadsUrl(tab))}>
             下载{tab === "shaders" ? "光影包" : "资源包"}
           </button>
           <button
@@ -3561,6 +3604,13 @@ function loaderKey(name: string): InstanceLoader["loader"] {
 </div>
 
 <style>
+  .btn.primary {
+    position: relative;
+    overflow: hidden;
+  }
+  .btn.primary > span {
+    position: relative;
+  }
   .mod-head {
     display: flex;
     align-items: center;
@@ -3602,7 +3652,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     margin-bottom: 12px;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(8, 10, 14, 0.35);
+    background: var(--wall-chip, rgba(8, 10, 14, 0.35));
     font-size: 13px;
   }
   .diag-file {
@@ -3646,7 +3696,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     width: 100%;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(8, 10, 14, 0.35);
+    background: var(--wall-chip, rgba(8, 10, 14, 0.35));
     color: var(--text);
     padding: 7px 12px;
     font-size: 13px;
@@ -3784,7 +3834,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     align-items: flex-start;
     padding: 10px 12px;
     border-radius: 10px;
-    background: var(--surface-2, rgba(255, 255, 255, 0.04));
+    background: var(--surface-2, var(--tint-1));
     cursor: pointer;
   }
 
@@ -3879,7 +3929,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     border-radius: 10px;
   }
   .head.linked:hover {
-    background: rgb(255 255 255 / 0.05);
+    background: var(--tint-1);
   }
   .head.linked:focus-visible {
     outline: 2px solid var(--accent);
@@ -3916,7 +3966,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     border-radius: 999px;
     padding: 2px 9px;
     font-size: 12px;
-    background: rgb(255 255 255 / 0.08);
+    background: var(--line-soft);
     color: var(--text-dim);
   }
   .desc {
@@ -3952,7 +4002,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     padding: 0 10px;
     border: 1px solid var(--border);
     border-radius: 999px;
-    background: rgb(255 255 255 / 0.04);
+    background: var(--tint-1);
     color: var(--text);
     font-size: 12px;
     white-space: nowrap;
@@ -4041,7 +4091,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   .chip.on {
     border-color: transparent;
     background: rgb(120 200 120 / 0.18);
-    color: var(--yb-green-bright);
+    color: var(--accent);
   }
   .check {
     display: flex;
@@ -4076,7 +4126,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     padding: 16px 18px;
-    background: rgb(255 255 255 / 0.028);
+    background: var(--tint-1);
   }
   .scard h3 {
     margin: 0 0 12px;
@@ -4109,7 +4159,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
   .slider {
     width: 100%;
     margin-top: 10px;
-    accent-color: var(--yb-green-bright);
+    accent-color: var(--accent);
   }
   .mem {
     margin-top: 14px;
@@ -4207,11 +4257,11 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     padding: 5px 10px;
     border-radius: 10px;
     border: 1px solid transparent;
-    background: rgb(255 255 255 / 0.03);
+    background: var(--tint-1);
     cursor: pointer;
   }
   .mod-row:hover {
-    background: rgb(255 255 255 / 0.07);
+    background: var(--tint-2);
   }
   .mod-row.picked {
     border-color: rgb(127 176 105 / 0.5);
@@ -4231,7 +4281,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     overflow: hidden;
     display: grid;
     place-items: center;
-    background: rgb(255 255 255 / 0.06);
+    background: var(--tint-2);
   }
   .mod-icon img {
     width: 100%;
@@ -4242,8 +4292,8 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     width: 18px;
     height: 18px;
     border-radius: 4px;
-    background: rgb(255 255 255 / 0.1);
-    color: rgb(255 255 255 / 0.55);
+    background: var(--tint-3);
+    color: var(--text-3);
     display: grid;
     place-items: center;
   }
@@ -4288,7 +4338,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     padding: 3px 8px;
     border-radius: 6px;
     border: 1px solid var(--border);
-    background: rgb(255 255 255 / 0.06);
+    background: var(--tint-2);
     color: var(--text);
     cursor: pointer;
   }
@@ -4351,7 +4401,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     inset: 0;
     display: grid;
     place-items: center;
-    background: rgba(8, 10, 14, 0.6);
+    background: var(--wall-chip-strong, rgba(8, 10, 14, 0.6));
     border: 2px dashed var(--yb-green);
     font-size: 18px;
     z-index: 40;
@@ -4403,7 +4453,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     padding: 12px 14px;
     border-radius: 10px;
     border: 1px solid var(--border);
-    background: rgb(255 255 255 / 0.04);
+    background: var(--tint-1);
   }
   .pack-icon {
     width: 40px;
@@ -4414,7 +4464,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgb(255 255 255 / 0.06);
+    background: var(--tint-2);
   }
   .pack-icon img {
     width: 100%;
@@ -4464,7 +4514,7 @@ function loaderKey(name: string): InstanceLoader["loader"] {
     overflow: hidden;
     border-radius: 12px;
     border: 1px solid var(--border);
-    background: rgb(255 255 255 / 0.04);
+    background: var(--tint-1);
   }
   .shot-image {
     padding: 0;

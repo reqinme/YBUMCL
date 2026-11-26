@@ -10,8 +10,8 @@
 //! 于是「第一次启动」也不用等。拿不到网络时不影响启动，游戏会自己想办法。
 
 use std::fs;
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +20,152 @@ const FONT_URL: &str =
 const FONT_NAME: &str = "source_han_sans_hw_vf.ttf";
 const FONT_SIZE: u64 = 35_445_188;
 const PARALLEL: u64 = 16;
+
+/// Cleanroom 装完还缺的三个模组：Fugue 必备，Scalar 与 Scalar Legacy 二选一。
+/// 用户在安装面板上自己挑版本，默认一个都不装。
+const EXTRAS: [(&str, &str, &str, &str); 3] = [
+    (
+        "fugue",
+        "Fugue",
+        "老 Forge 模组的兼容层，不装基本跑不起来",
+        "fugue",
+    ),
+    (
+        "scalar",
+        "Scalar",
+        "给用 Scala 3 写的模组，和 Scalar Legacy 只能选一个",
+        "scalar",
+    ),
+    (
+        "scalar-legacy",
+        "Scalar Legacy",
+        "给普通 Forge 包，和 Scalar 只能选一个",
+        "scalar-legacy",
+    ),
+];
+
+/// 面板上的一个可选模组：带上 CurseForge 上 1.12.2 的文件列表（新的在前）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraMod {
+    pub key: String,
+    pub label: String,
+    pub note: String,
+    pub project: u64,
+    pub versions: Vec<ExtraVersion>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraVersion {
+    /// CurseForge 的文件 id，安装时拿它换直链。
+    pub file: u64,
+    pub version: String,
+    pub file_name: String,
+    pub size: u64,
+    pub date: String,
+}
+
+/// 用户在安装面板选中的一个文件。
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ChosenExtra {
+    pub project: u64,
+    pub file: u64,
+    pub file_name: String,
+}
+
+/// 三个模组在 CurseForge 上的可选版本。某个模组查不到就跳过它，不影响另外两个。
+pub fn extra_mods(game: &str) -> Vec<ExtraMod> {
+    let mut out = Vec::new();
+    for (key, label, note, slug) in EXTRAS {
+        let Some(project) = crate::curseforge::project_id(slug).ok().flatten() else {
+            continue;
+        };
+        let Ok(list) = crate::curseforge::versions(&project.to_string(), Some(game), None) else {
+            continue;
+        };
+        let versions: Vec<ExtraVersion> = list
+            .into_iter()
+            .filter(|version| version.file_name.to_ascii_lowercase().ends_with(".jar"))
+            .take(12)
+            .map(|version| ExtraVersion {
+                file: version.id.parse().unwrap_or(0),
+                version: if version.version_number.is_empty() {
+                    version.name.clone()
+                } else {
+                    version.version_number.clone()
+                },
+                file_name: version.file_name.clone(),
+                size: version.file_size,
+                date: version.date_published.clone(),
+            })
+            .filter(|version| version.file != 0)
+            .collect();
+        if versions.is_empty() {
+            continue;
+        }
+        out.push(ExtraMod {
+            key: key.to_owned(),
+            label: label.to_owned(),
+            note: note.to_owned(),
+            project,
+            versions,
+        });
+    }
+    out
+}
+
+/// 把选中的模组下到 `<实例>/mods/`。已经存在的文件跳过，返回真正下载的文件名。
+pub fn install_extras(
+    instance_dir: &Path,
+    chosen: &[ChosenExtra],
+    cancel: &crate::download::CancellationToken,
+    mut progress: impl FnMut(&str, u64, u64),
+) -> Vec<String> {
+    if chosen.is_empty() {
+        return Vec::new();
+    }
+    let mods = instance_dir.join("mods");
+    if fs::create_dir_all(&mods).is_err() {
+        return Vec::new();
+    }
+    let mut installed = Vec::new();
+    for item in chosen {
+        // 文件名来自 CurseForge，只取最后一段，防止带路径进来。
+        let name = item
+            .file_name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if name.is_empty() || !name.to_ascii_lowercase().ends_with(".jar") {
+            continue;
+        }
+        let target = mods.join(name);
+        if target.is_file() && fs::metadata(&target).map(|m| m.len() > 0).unwrap_or(false) {
+            continue;
+        }
+        let Ok(url) = crate::curseforge::file_download_url(item.project, item.file) else {
+            continue;
+        };
+        let Ok(bytes) = crate::download::fetch_file_bytes(&url, cancel) else {
+            continue;
+        };
+        if bytes.len() < 10 * 1024 || !bytes.starts_with(b"PK") {
+            continue;
+        }
+        let temp = target.with_extension("jar.part");
+        let written = fs::File::create(&temp).and_then(|mut file| file.write_all(&bytes));
+        if written.is_err() || fs::rename(&temp, &target).is_err() {
+            let _ = fs::remove_file(&temp);
+            continue;
+        }
+        progress(name, bytes.len() as u64, bytes.len() as u64);
+        installed.push(name.to_owned());
+    }
+    installed
+}
 
 /// classpath 里出现 cleanroom 的 universal jar 就当它是 Cleanroom 实例。
 pub fn looks_like_cleanroom(args: &[String]) -> bool {
@@ -103,7 +249,7 @@ fn fetch_font() -> std::result::Result<Vec<u8>, String> {
 }
 
 fn fetch_range(start: u64, end: u64) -> std::result::Result<Vec<u8>, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::proxy::apply(reqwest::blocking::Client::builder())
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| error.to_string())?;

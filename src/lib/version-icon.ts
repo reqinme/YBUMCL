@@ -4,6 +4,7 @@ import anvil from "$lib/assets/blocks/Anvil.png";
 import commandBlock from "$lib/assets/blocks/CommandBlock.png";
 import egg from "$lib/assets/blocks/Egg.png";
 import fabric from "$lib/assets/blocks/Fabric.png";
+import legacyFabric from "$lib/assets/blocks/LegacyFabric.png";
 import goldBlock from "$lib/assets/blocks/GoldBlock.png";
 import grass from "$lib/assets/blocks/Grass.png";
 import grassPath from "$lib/assets/blocks/GrassPath.png";
@@ -19,12 +20,17 @@ import cleanroom from "$lib/assets/blocks/Cleanroom.png";
 /// 没有自定义图标时按状态取一张。OptiFine 优先于 Forge：PCL 里
 /// 「Forge + OptiFine」这种实例用的是草径，不是铁砧。
 export function builtinIcon(channel: string, loaders: string[]): string {
+  // `loaders` 里可能是 `Legacy Fabric`、`legacyfabric`、`LegacyFabric` 各种写法，
+  // 统一去掉空格和标点再比。
   const has = (name: string) =>
-    loaders.some((loader) => loader.toLowerCase() === name.toLowerCase());
+    loaders.some(
+      (loader) => loader.toLowerCase().replace(/[^a-z]/g, "") === name.toLowerCase()
+    );
 
   if (has("optifine")) return grassPath;
   if (has("labymod")) return labyMod;
   if (has("neoforge")) return neoForge;
+  if (has("legacyfabric")) return legacyFabric;
   if (has("cleanroom")) return cleanroom;
   if (has("forge")) return anvil;
   if (has("quilt")) return quilt;

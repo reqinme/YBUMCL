@@ -22,7 +22,7 @@ use launcher_core::{
     RemoteVersionManifest, VersionSummary, install_version,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::portable::Paths;
 
@@ -208,6 +208,8 @@ pub struct VersionView {
     pub memory_custom_mb: u32,
     /// 初始堆（MB），0 表示和最大堆一样。
     pub memory_initial_mb: u32,
+    /// 启动前内存优化：0 跟随全局、1 开启、2 关闭。
+    pub memory_optimize: u32,
     /// 「游戏窗口标题」，空=不改。
     pub window_title: String,
     /// 「自定义信息」：覆盖 `${version_type}`，空=用版本自己的。
@@ -262,6 +264,14 @@ fn loaders_from_libraries(json: &serde_json::Value) -> Vec<launcher_core::instan
     let Some(libraries) = json.get("libraries").and_then(|value| value.as_array()) else {
         return out;
     };
+    // Legacy Fabric 的库清单里同时有 `net.legacyfabric:*` 和 `net.fabricmc:fabric-loader`，
+    // 先扫一遍整份清单，有前者就说明这是 Legacy Fabric，Fabric 那条规则要跳过。
+    let legacy = libraries.iter().any(|library| {
+        library
+            .get("name")
+            .and_then(|value| value.as_str())
+            .is_some_and(|name| name.starts_with("net.legacyfabric"))
+    });
     for library in libraries {
         let Some(name) = library.get("name").and_then(|value| value.as_str()) else {
             continue;
@@ -275,6 +285,11 @@ fn loaders_from_libraries(json: &serde_json::Value) -> Vec<launcher_core::instan
         let loader = match (group, artifact) {
             ("net.minecraftforge", "forge") | ("net.minecraftforge", "fmlloader") => "forge",
             ("net.neoforged", "neoforge") | ("net.neoforged", "fmlloader") => "neoforge",
+            // Legacy Fabric 把 Fabric Loader 整个搬到了旧版本，库清单里同时有
+            // `net.legacyfabric:intermediary` 和 `net.fabricmc:fabric-loader`。
+            // 版本号要从 fabric-loader 那条拿（intermediary 带的是游戏版本），
+            // 所以这里只认 fabric-loader，再按 legacy 分流。
+            ("net.fabricmc", "fabric-loader") if legacy => "legacyfabric",
             ("net.fabricmc", "fabric-loader") => "fabric",
             ("org.quiltmc", "quilt-loader") => "quilt",
             ("com.mumfrey", "liteloader") => "liteloader",
@@ -410,6 +425,9 @@ pub async fn list_versions(
         for view in &mut views {
             view.last_started = latest.get(&view.id).cloned();
         }
+        // 安装中的底稿 / 外壳也是真实目录，但还不是「版本」，先别显示出来。
+        let busy = launcher_core::busy_installs();
+        views.retain(|view| !busy.iter().any(|id| *id == view.id));
         Ok(views)
     })
     .await
@@ -524,6 +542,7 @@ fn collect_views(game_dir: &Path, data_dir: &Path) -> Result<Vec<VersionView>, S
                 memory_type: settings.memory_type,
                 memory_custom_mb: settings.memory_custom_mb,
                 memory_initial_mb: settings.memory_initial_mb,
+                memory_optimize: settings.memory_optimize,
                 window_title: settings.window_title.clone(),
                 version_type: settings.version_type.clone(),
                 jvm_args: settings.jvm_args.clone(),
@@ -860,6 +879,146 @@ fn set_game_window_title(pid: u32, title: String) {
 
 #[cfg(not(windows))]
 fn set_game_window_title(_pid: u32, _title: String) {}
+
+/// 窗口大小设置转成 `--width` / `--height`；`default` 返回 None，不动游戏自己的设置。
+fn window_size_args(size: &str) -> Option<(String, String)> {
+    let (width, height) = size.split_once('x')?;
+    let width: u32 = width.parse().ok()?;
+    let height: u32 = height.parse().ok()?;
+    if width < 320 || height < 240 {
+        return None;
+    }
+    Some((width.to_string(), height.to_string()))
+}
+
+/// 游戏进程起来之后改优先级。失败就算了，不影响玩。
+#[cfg(windows)]
+fn apply_process_priority(pid: u32, priority: &str) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+        IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_SET_INFORMATION,
+        REALTIME_PRIORITY_CLASS,
+    };
+
+    let class = match priority {
+        "realtime" => REALTIME_PRIORITY_CLASS,
+        "high" => HIGH_PRIORITY_CLASS,
+        "above" => 0x0000_8000, // ABOVE_NORMAL_PRIORITY_CLASS
+        "below" => BELOW_NORMAL_PRIORITY_CLASS,
+        "idle" => IDLE_PRIORITY_CLASS,
+        _ => NORMAL_PRIORITY_CLASS,
+    };
+    // SAFETY: pid 来自我们自己刚 spawn 的子进程，句柄用完立刻关。
+    unsafe {
+        let handle = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        SetPriorityClass(handle, class);
+        CloseHandle(handle);
+    }
+}
+
+#[cfg(not(windows))]
+fn apply_process_priority(_pid: u32, _priority: &str) {}
+
+/// 进程还在不在：用来给「等游戏窗口」的循环收尾，进程没了就别再等了。
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    wait == WAIT_TIMEOUT
+}
+
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// 游戏窗口是不是已经出来了。Minecraft 的窗口类在 1.12 及更早是 `LWJGL`，
+/// 1.13 以后是 `GLFW30`；控制台窗口（CREATE_NO_WINDOW 下本来也没有）和其它
+/// 辅助窗口都不算。
+#[cfg(windows)]
+fn game_window_appeared(pids: &[u32]) -> bool {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowThreadProcessId,
+        IsWindowVisible,
+    };
+
+    struct Probe {
+        pids: Vec<u32>,
+        found: bool,
+    }
+
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: isize) -> i32 {
+        // SAFETY: lparam 是上层传进来的 `&mut Probe`，枚举期间一直活着。
+        let probe = unsafe { &mut *(lparam as *mut Probe) };
+        let mut owner = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut owner) };
+        if !probe.pids.contains(&owner) {
+            return 1;
+        }
+        if unsafe { IsWindowVisible(hwnd) } == 0 || unsafe { GetWindowTextLengthW(hwnd) } == 0 {
+            return 1;
+        }
+        let mut class = [0u16; 64];
+        let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+        if len <= 0 {
+            return 1;
+        }
+        let class = String::from_utf16_lossy(&class[..len as usize]);
+        if class.starts_with("LWJGL") || class.starts_with("GLFW") {
+            probe.found = true;
+            return 0;
+        }
+        1
+    }
+
+    let mut probe = Probe {
+        pids: pids.to_vec(),
+        found: false,
+    };
+    unsafe { EnumWindows(Some(visit), &mut probe as *mut Probe as isize) };
+    probe.found
+}
+
+#[cfg(not(windows))]
+fn game_window_appeared(_pids: &[u32]) -> bool {
+    false
+}
+
+/// 盯着游戏进程，等它真的把窗口画出来，然后广播 `game-ready`。
+/// 前端拿这个事件把「启动中」的按钮解锁——窗口出现之前按钮一直锁着。
+const READY_TIMEOUT: Duration = Duration::from_secs(900);
+
+fn watch_game_window(app: tauri::AppHandle, pid: u32, run_id: u64, version_id: String) {
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if game_window_appeared(&process_tree(pid)) {
+            let _ = app.emit(
+                "game-ready",
+                serde_json::json!({ "runId": run_id, "versionId": version_id }),
+            );
+            return;
+        }
+        if !process_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
 
 /// 物理内存（MB）：自动配置内存和内存条都要用。
 #[derive(Clone, Copy, serde::Serialize)]
@@ -1304,6 +1463,14 @@ pub fn export_launch_script(paths: State<'_, Paths>, id: String) -> Result<Strin
     text.push_str("\r\npause\r\n");
     std::fs::write(&target, text).map_err(|e| format!("写不了启动脚本：{e}"))?;
     Ok(target.to_string_lossy().into_owned())
+}
+
+/// Cleanroom 装完还缺的三个可选模组（Fugue / Scalar / Scalar Legacy）以及各自的版本。
+#[tauri::command]
+pub async fn cleanroom_extras(game: String) -> Result<Vec<launcher_core::cleanroom::ExtraMod>, String> {
+    tauri::async_runtime::spawn_blocking(move || launcher_core::cleanroom::extra_mods(&game))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 测试游戏：照启动计划跑一次，盯着看它会不会立刻崩。
@@ -2079,6 +2246,7 @@ pub fn sync_global_strategy(paths: &crate::portable::Paths) -> launcher_core::do
     launcher_core::download::set_speed_limit(launcher_core::download::tier_limit(
         global.download_speed,
     ));
+    launcher_core::proxy::configure(&global.proxy_mode, &global.proxy_url);
     crate::versions::set_isolation_mode(&global.isolation_mode);
     strategy
 }
@@ -2234,6 +2402,15 @@ fn java_retry_candidate(
     }
 }
 
+/// 内存优化：已经是管理员就直接清；否则拉一个带 `--memory-optimize` 的自身进程并等它结束。
+fn optimize_memory_now() -> Result<(), String> {
+    if launcher_core::memory::is_elevated() {
+        return launcher_core::memory::optimize();
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("找不到启动器自身路径：{e}"))?;
+    launcher_core::memory::optimize_elevated(&exe)
+}
+
 /// 启动一个版本。配置来自 `version-settings.json`，缺省字段用全局设置补。
 #[tauri::command]
 pub async fn launch_version(
@@ -2267,11 +2444,8 @@ pub async fn launch_version(
             true,
             quick_play,
         )?;
-        let strategy = strategy_of(
-            crate::settings::load(&paths_for_request)
-                .download_strategy
-                .as_deref(),
-        );
+        let app_settings = crate::settings::load(&paths_for_request);
+        let strategy = strategy_of(app_settings.download_strategy.as_deref());
         let version_id = request.version_id.clone();
         let repair_request = request.clone();
         let plan = match launcher_core::build_launch_plan(request) {
@@ -2326,6 +2500,22 @@ pub async fn launch_version(
 
         // 实例的「启动前执行命令」：在游戏目录里跑；失败就不启动。
         let settings = crate::versions::load_instance(&pre_dir, &version_id);
+        // 内存优化（PCL 的「启动游戏前进行内存优化」）：开了才跑，而且要等它跑完
+        // 才继续启动。没拿到管理员权限就跳过，只提示一次，不阻断启动。
+        let optimize = match settings.memory_optimize {
+            1 => true,
+            2 => false,
+            _ => crate::settings::load(&paths_for_request).memory_optimize,
+        };
+        if optimize {
+            match optimize_memory_now() {
+                Ok(()) => append_error(&log_dir, "内存优化完成"),
+                Err(message) => {
+                    append_error(&log_dir, &format!("跳过内存优化：{message}"));
+                    let _ = app.emit("memory-skip", message);
+                }
+            }
+        }
         // 自动档（没手动指定 Java）才允许失败后自动换一个重试。
         let auto_mode =
             java.is_none() && (settings.java_auto || settings.java_path.trim().is_empty());
@@ -2345,9 +2535,16 @@ pub async fn launch_version(
                 }
             }
         }
+        let mut launch_args = plan.args.clone();
+        if let Some((width, height)) = window_size_args(&app_settings.window_size) {
+            launch_args.push("--width".into());
+            launch_args.push(width);
+            launch_args.push("--height".into());
+            launch_args.push(height);
+        }
         let mut command = Command::new(&plan.java_path);
         command
-            .args(&plan.args)
+            .args(&launch_args)
             .current_dir(&plan.working_directory)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2368,14 +2565,14 @@ pub async fn launch_version(
         );
         // 落盘：这次的运行日志 + 可双击复现的启动脚本。
         let command_line = std::iter::once(plan.java_path.clone())
-            .chain(plan.args.iter().cloned())
+            .chain(launch_args.iter().cloned())
             .collect::<Vec<_>>()
             .join(" ");
         if let Err(error) = crate::runlog::write_latest_batch(
             &log_dir,
             &plan.working_directory,
             &plan.java_path,
-            &plan.args,
+            &launch_args,
         ) {
             append_error(&log_dir, &format!("写 LatestLaunch.bat 失败：{error}"));
         }
@@ -2411,9 +2608,24 @@ pub async fn launch_version(
         };
         let pid = child.id();
         append_error(&log_dir, &format!("已启动 {}，pid {pid}", version_id));
-        if !settings.window_title.trim().is_empty() {
-            let title = settings.window_title.clone();
+        let title = if settings.window_title.trim().is_empty() {
+            app_settings.window_title.clone()
+        } else {
+            settings.window_title.clone()
+        };
+        if !title.trim().is_empty() {
             std::thread::spawn(move || set_game_window_title(pid, title));
+        }
+        apply_process_priority(pid, &app_settings.process_priority);
+        if app_settings.launcher_visibility == "minimize" {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.minimize();
+            }
+        }
+        {
+            let ready_app = app.clone();
+            let ready_version = version_id.clone();
+            std::thread::spawn(move || watch_game_window(ready_app, pid, run_id, ready_version));
         }
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -3193,7 +3405,9 @@ pub async fn content_search(
     let sort = sort.unwrap_or_else(|| "relevance".into());
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(40);
-    tauri::async_runtime::spawn_blocking(move || {
+    let started = std::time::Instant::now();
+    let tag = format!("{source}/{kind} q={query} offset={offset}");
+    let page = tauri::async_runtime::spawn_blocking(move || {
         // 中文关键词：先在本地的「中文名 → 英文名」表里换一手，换不出来就当没结果。
         let mut query = query;
         if translate.unwrap_or(false) && launcher_core::zhsearch::has_chinese(&query) {
@@ -3239,7 +3453,19 @@ pub async fn content_search(
     })
     .await
     .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // 列表快慢全看这两个上游，把每次请求的耗时写进 launcher.log，方便对账。
+    if let Ok(paths) = crate::portable::Paths::resolve() {
+        append_error(
+            &paths.log_dir(),
+            &format!(
+                "[搜索] {tag} 用时 {}ms {} 条",
+                started.elapsed().as_millis(),
+                page.items.len()
+            ),
+        );
+    }
+    Ok(page)
 }
 
 /// 某个内容分类下、某个来源的全部分类标签。
@@ -3622,18 +3848,55 @@ fn world_file_name(file_name: &str, url: &str) -> String {
 }
 
 /// 把一个文件写到 `path`，边写边把进度推给界面（`download-progress` 事件）。
+/// 正在下载的单个文件：任务号 → 取消令牌。
+///
+/// 以前这里每次都新建一个 `CancellationToken::default()`，任务面板上的
+/// 「取消 / 暂停」对这种单文件下载完全没作用，进度会一直跑到结束。
+static DOWNLOAD_TOKENS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, launcher_core::download::CancellationToken>>,
+> = std::sync::OnceLock::new();
+
+fn download_token(task_id: u32) -> launcher_core::download::CancellationToken {
+    let map =
+        DOWNLOAD_TOKENS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().expect("download token map poisoned");
+    guard.entry(task_id).or_default().clone()
+}
+
+/// 任务面板的「暂停 / 取消」，针对单文件下载（模组、资源包、世界包）。
+#[tauri::command]
+pub fn cancel_download(task_id: u32, mode: Option<String>) -> bool {
+    let token = download_token(task_id);
+    if mode.as_deref() == Some("pause") {
+        token.pause();
+    } else {
+        token.cancel();
+    }
+    true
+}
+
+fn forget_download(task_id: u32) {
+    if let Some(map) = DOWNLOAD_TOKENS.get() {
+        if let Ok(mut guard) = map.lock() {
+            guard.remove(&task_id);
+        }
+    }
+}
+
 async fn write_with_progress(
     app: AppHandle,
     url: String,
     path: String,
     task_id: Option<u32>,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let token = task_id.map(download_token).unwrap_or_default();
+    let cleanup = task_id;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let emitter = app.clone();
         launcher_core::packages::download_file_to_progress(
             &url,
             std::path::Path::new(&path),
-            &launcher_core::download::CancellationToken::default(),
+            &token,
             |received, total| {
                 if let Some(id) = task_id {
                     let _ = emitter.emit(
@@ -3646,7 +3909,11 @@ async fn write_with_progress(
         .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    if let Some(id) = cleanup {
+        forget_download(id);
+    }
+    result
 }
 
 #[tauri::command]
@@ -4346,6 +4613,7 @@ pub fn save_settings(
     launcher_core::download::set_speed_limit(launcher_core::download::tier_limit(
         saved.download_speed,
     ));
+    launcher_core::proxy::configure(&saved.proxy_mode, &saved.proxy_url);
     crate::versions::set_isolation_mode(&saved.isolation_mode);
     Ok(saved)
 }
@@ -6712,6 +6980,86 @@ pub async fn installed_mod_ids(
 }
 
 /// 按 Modrinth 项目 id 批量取项目名/图标（前置列表用）。
+/// 前置条目里要显示的信息：名字、简介、下载量、更新时间、来源。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefDetail {
+    pub id: String,
+    pub title: String,
+    pub slug: String,
+    pub icon: Option<String>,
+    pub description: String,
+    pub downloads: u64,
+    pub updated: String,
+    pub source: String,
+}
+
+/// 按来源批量取「前置项目」的展示信息。Modrinth 用字符串 id，CurseForge 用数字 modId。
+/// 开发者头像：编译进程序里，不联网。
+#[tauri::command]
+pub fn developer_avatar(login: String) -> Option<String> {
+    launcher_core::update::avatar_data(&login)
+}
+
+/// 检查更新：返回最新版本号、Release 地址与说明。
+#[tauri::command]
+pub async fn check_update(app: tauri::AppHandle) -> Result<launcher_core::update::ReleaseInfo, String> {
+    let current = app.package_info().version.to_string();
+    tauri::async_runtime::spawn_blocking(move || launcher_core::update::latest_release(&current))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn reference_details(source: String, ids: Vec<String>) -> Result<Vec<RefDetail>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        if source == "curseforge" {
+            let nums: Vec<u64> = ids.iter().filter_map(|id| id.parse::<u64>().ok()).collect();
+            let map = launcher_core::curseforge::project_meta(&nums).map_err(|e| e.to_string())?;
+            for (id, meta) in map {
+                out.push(RefDetail {
+                    id: id.to_string(),
+                    title: meta.name,
+                    slug: meta.slug,
+                    icon: meta.icon,
+                    description: meta.summary,
+                    downloads: meta.downloads,
+                    updated: meta.updated,
+                    source: "CurseForge".into(),
+                });
+            }
+        } else {
+            let map = launcher_core::modrinth::project_meta(&ids).map_err(|e| e.to_string())?;
+            for (id, meta) in map {
+                out.push(RefDetail {
+                    id,
+                    title: meta.title,
+                    slug: meta.slug,
+                    icon: meta.icon,
+                    description: meta.description,
+                    downloads: meta.downloads,
+                    updated: meta.updated,
+                    source: "Modrinth".into(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        Ok(out)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 项目简介的中文翻译（MCIM 翻译库），没有就返回 null。
+#[tauri::command]
+pub async fn project_translation(source: String, id: String) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || launcher_core::modrinth::translation(&source, &id))
+        .await
+        .ok()
+        .flatten()
+}
+
 #[tauri::command]
 pub async fn dependency_projects(
     ids: Vec<String>,
@@ -6854,5 +7202,33 @@ mod java_fix_tests {
             line("Error: Could not find or load main class net.minecraft.client.main.Main"),
         ];
         assert!(java_fix(&logs).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loaders_from_libraries;
+
+    #[test]
+    fn legacy_fabric_is_not_reported_as_fabric() {
+        let json = serde_json::json!({
+            "libraries": [
+                { "name": "net.legacyfabric:intermediary:1.12.2" },
+                { "name": "net.fabricmc:fabric-loader:0.20.1" }
+            ]
+        });
+        let loaders = loaders_from_libraries(&json);
+        assert_eq!(loaders.len(), 1);
+        assert_eq!(loaders[0].loader, "legacyfabric");
+        assert_eq!(loaders[0].version, "0.20.1");
+    }
+
+    #[test]
+    fn plain_fabric_still_reports_as_fabric() {
+        let json = serde_json::json!({
+            "libraries": [{ "name": "net.fabricmc:fabric-loader:0.20.1" }]
+        });
+        let loaders = loaders_from_libraries(&json);
+        assert_eq!(loaders[0].loader, "fabric");
     }
 }

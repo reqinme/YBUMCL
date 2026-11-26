@@ -73,6 +73,7 @@ fn main() {
                 threads: Some(64),
                 cache_roots,
                 overwrite: true,
+                cleanroom_mods: Vec::new(),
             },
             CancellationToken::default(),
             |_| {},

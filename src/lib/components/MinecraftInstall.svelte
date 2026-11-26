@@ -575,7 +575,7 @@
   .detail {
     border: 1px solid var(--border);
     border-radius: 14px;
-    background: rgba(16, 19, 26, 0.45);
+    background: var(--shell-card, rgba(16, 19, 26, 0.45));
     padding: 14px;
     display: flex;
     flex-direction: column;
@@ -641,7 +641,7 @@
     text-align: left;
   }
   .ver-item:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--tint-1);
   }
   .ver-item.active {
     background: rgba(168, 204, 132, 0.16);

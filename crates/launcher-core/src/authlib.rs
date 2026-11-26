@@ -60,9 +60,9 @@ fn now() -> u64 {
 fn http() -> &'static reqwest::blocking::Client {
     static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
+        crate::proxy::apply(reqwest::blocking::Client::builder())
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("YBUMCL/", env!("CARGO_PKG_VERSION")))
+            .user_agent(crate::user_agent())
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new())
     })

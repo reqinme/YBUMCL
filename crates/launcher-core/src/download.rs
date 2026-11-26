@@ -46,9 +46,9 @@ const MAX_PARALLEL_DOWNLOADS: u32 = 256;
 /// 小于这个体积的文件不分段：256 KiB 一段的话，握手加慢启动就吃掉大半时间。
 const CHUNK_MIN_FILE: u64 = 4 * 1024 * 1024;
 /// 每段至少这么大，一条连接才有足够的连续传输窗口。
-const CHUNK_MIN_PART: u64 = 2 * 1024 * 1024;
+const CHUNK_MIN_PART: u64 = 3 * 512 * 1024;
 const CHUNK_MIN_PARTS: usize = 2;
-const CHUNK_MAX_PARTS: usize = 8;
+const CHUNK_MAX_PARTS: usize = 16;
 /// 同时活着的下载连接上限。PCL 用「线程数」（默认 9）收敛并发；我们把线程当
 /// 「同时处理的文件数」，再用这个预算管住真正在跑的连接，避免每个文件都切段失控。
 const MAX_LIVE_CONNECTIONS: usize = 64;
@@ -865,6 +865,9 @@ impl Http {
             };
             let response = sent?;
             // BMCLAPI 短窗口限流 10 次，分段并发容易撞上 429；它给了 Retry-After，等够再来一次。
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                host_throttled(target.as_str());
+            }
             if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
                 let seconds = response
                     .headers()
@@ -918,7 +921,7 @@ impl Http {
 
 /// 建一个 reqwest 客户端：TLS 版本、IPv4 优先、连接池这些参数所有链路共用。
 fn build_client(timeout: Option<Duration>, http1: bool) -> Result<Client> {
-    let mut builder = Client::builder()
+    let mut builder = crate::proxy::apply(Client::builder())
         .https_only(true)
         // 部分 Cloudflare 边缘（legacyfabric 那几家）在 TLS 1.3 上会握手卡死，
         // 降到 1.2 一切正常；1.2 是我们的全部下载源都支持的版本。
@@ -945,7 +948,7 @@ fn build_client(timeout: Option<Duration>, http1: bool) -> Result<Client> {
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(MAX_PARALLEL_DOWNLOADS as usize)
         .tcp_nodelay(true)
-        .user_agent("YBUMCL/0.1");
+        .user_agent(crate::user_agent());
     // 默认放开 HTTP/2：一条连接能并行多条流，省掉大量握手。只有被记成
     // 「h2 不稳」的站点（见 `Http::get` 的自动回退）才用 http1 客户端。
     if http1 {
@@ -2465,64 +2468,141 @@ fn chunk_temp(part: &Path, index: usize, racer: usize) -> PathBuf {
 }
 
 /// 把一个闭区间读进内存（打包这类「不落盘」的调用用）。
-/// 镜像站（BMCLAPI 与它的随机子镜像）对短窗口内的请求数有硬上限，超了直接 429。
-/// 文件多、线程多的时候很容易自己把自己限死，所以按主机在进程内排队。
-const MIRROR_HOST_LIMIT: usize = 8;
+/// 每台主机允许的同时连接数由「慢启动 + 撞 429 折半」自己找出来：
+///
+/// - 起手 4 条，每传满 4 MiB 加 1 条，冷却是 30 秒——涨得慢一点，别一上来
+///   就把镜像的短窗口配额打满（实测 BMCLAPI 超过十来条就 429）；
+/// - 撞到 429 或连续超时立刻折半，30 秒内不再上调；
+/// - 官方 CDN 上限 32，镜像系列上限 12：镜像确实按请求数限流，官方不是。
+const HOST_MIN_CONNECTIONS: usize = 2;
+const HOST_START_CONNECTIONS: usize = 12;
+const HOST_MAX_OFFICIAL: usize = 32;
+const HOST_MAX_MIRROR: usize = 12;
+/// 每传满这么多字节，才允许这台主机多开一条连接。
+const HOST_GROW_BYTES: u64 = 512 * 1024;
+const HOST_COOLDOWN: Duration = Duration::from_secs(30);
 
-type HostSlot = Arc<(Mutex<usize>, Condvar)>;
+struct HostLimit {
+    /// 当前允许的同时连接数。
+    limit: AtomicUsize,
+    /// 上限（官方 / 镜像不同）。
+    max: usize,
+    /// 正在跑的连接数。
+    live: Mutex<usize>,
+    /// 连接数变化时唤醒排队的人。
+    cv: Condvar,
+    /// 距离上次涨连接累计的字节数。
+    credit: AtomicU64,
+    /// 在这之前不许上调（撞过 429）。
+    cooldown: Mutex<Instant>,
+}
 
-static HOST_GATES: Mutex<Vec<(String, HostSlot)>> = Mutex::new(Vec::new());
+impl HostLimit {
+    fn acquire(self: &Arc<Self>) -> HostPermit {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while *live >= self.limit.load(Ordering::Relaxed) {
+            live = self
+                .cv
+                .wait(live)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        *live += 1;
+        drop(live);
+        HostPermit {
+            limit: self.clone(),
+        }
+    }
 
-/// 排队令牌；离开作用域时归还槽位。
+    /// 记下这条连接传了多少字节；够了就试着多开一条。
+    fn note(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let before = self.credit.fetch_add(bytes, Ordering::Relaxed);
+        if (before + bytes) / HOST_GROW_BYTES == before / HOST_GROW_BYTES {
+            return;
+        }
+        if Instant::now() < *self.cooldown.lock().unwrap_or_else(|p| p.into_inner()) {
+            return;
+        }
+        let current = self.limit.load(Ordering::Relaxed);
+        if current < self.max {
+            self.limit.store((current + 1).min(self.max), Ordering::Relaxed);
+            self.cv.notify_one();
+        }
+    }
+
+    /// 撞到 429 / 连续超时：连接数折半，30 秒内不许再加。
+    fn throttle(&self) {
+        let current = self.limit.load(Ordering::Relaxed);
+        self.limit.store(
+            (current / 2).max(HOST_MIN_CONNECTIONS),
+            Ordering::Relaxed,
+        );
+        if let Ok(mut cooldown) = self.cooldown.lock() {
+            *cooldown = Instant::now() + HOST_COOLDOWN;
+        }
+    }
+}
+
+/// 排队令牌；离开作用域时归还连接数。
 struct HostPermit {
-    slot: HostSlot,
+    limit: Arc<HostLimit>,
 }
 
 impl Drop for HostPermit {
     fn drop(&mut self) {
-        if let Ok(mut live) = self.slot.0.lock() {
+        if let Ok(mut live) = self.limit.live.lock() {
             *live = live.saturating_sub(1);
-            self.slot.1.notify_one();
+            self.limit.cv.notify_one();
         }
     }
 }
 
-fn mirror_host_limit(host: &str) -> usize {
-    let mirrored = host.ends_with("bangbang93.com")
+static HOST_LIMITS: Mutex<Vec<(String, Arc<HostLimit>)>> = Mutex::new(Vec::new());
+
+fn is_mirror_host(host: &str) -> bool {
+    host.ends_with("bangbang93.com")
         || host.ends_with("sakura.sld.tw")
-        || host.ends_with("mangofanfan.cn");
-    if mirrored {
-        MIRROR_HOST_LIMIT
-    } else {
-        0
-    }
+        || host.ends_with("mangofanfan.cn")
 }
 
-/// 镜像主机返回排队令牌；官方源不排队（官方不存在这种限流，排队只会白等）。
-fn host_gate(url: &str) -> Option<HostPermit> {
+fn host_limit_for(url: &str) -> Option<Arc<HostLimit>> {
     let host = Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
-    let limit = mirror_host_limit(&host);
-    if limit == 0 {
-        return None;
-    }
-    let slot = {
-        let mut gates = HOST_GATES.lock().ok()?;
-        match gates.iter().find(|(key, _)| key == &host) {
-            Some((_, slot)) => slot.clone(),
-            None => {
-                let slot: HostSlot = Arc::new((Mutex::new(0), Condvar::new()));
-                gates.push((host, slot.clone()));
-                slot
-            }
-        }
+    let max = if is_mirror_host(&host) {
+        HOST_MAX_MIRROR
+    } else {
+        HOST_MAX_OFFICIAL
     };
-    let mut live = slot.0.lock().ok()?;
-    while *live >= limit {
-        live = slot.1.wait(live).ok()?;
+    let mut limits = HOST_LIMITS.lock().ok()?;
+    if let Some((_, limit)) = limits.iter().find(|(key, _)| key == &host) {
+        return Some(limit.clone());
     }
-    *live += 1;
-    drop(live);
-    Some(HostPermit { slot })
+    let limit = Arc::new(HostLimit {
+        limit: AtomicUsize::new(HOST_START_CONNECTIONS.min(max)),
+        max,
+        live: Mutex::new(0),
+        cv: Condvar::new(),
+        credit: AtomicU64::new(0),
+        cooldown: Mutex::new(Instant::now()),
+    });
+    limits.push((host, limit.clone()));
+    Some(limit)
+}
+
+/// 每条连接开始前拿一个该主机的令牌，连接数由 `HostLimit` 自己控制。
+fn host_gate(url: &str) -> Option<HostPermit> {
+    Some(host_limit_for(url)?.acquire())
+}
+
+/// 撞到限流时把该主机的连接数砍半。
+fn host_throttled(url: &str) {
+    if let Some(limit) = host_limit_for(url) {
+        limit.throttle();
+    }
 }
 
 /// 进程级同时下载的文件数：同时开两个安装时两边共享这些槽位，
@@ -3941,7 +4021,7 @@ fn stream_once<S: Source>(
     on_downloaded: &(dyn Fn(u64) + Sync),
     tolerate_slow: bool,
 ) -> Result<()> {
-    let _gate = host_gate(&a.url);
+    let gate = host_gate(&a.url);
     let existing = fs::metadata(part).map(|meta| meta.len()).unwrap_or(0);
     let resume = existing > 0 && !a.size.is_some_and(|size| existing >= size);
     let mut file = if resume {
@@ -4011,6 +4091,9 @@ fn stream_once<S: Source>(
         }
         hash.update(&chunk[..n]);
         file.write_all(&chunk[..n]).map_err(|e| io_error(part, e))?;
+        if let Some(gate) = &gate {
+            gate.limit.note(n as u64);
+        }
         on_downloaded(n as u64);
         if !tolerate_slow && a.size.is_none_or(|expected| expected > 1024 * 1024) {
             window_bytes += n as u64;
@@ -4155,6 +4238,8 @@ fn write_segment<S: Source>(
     cancel: &CancellationToken,
     on_downloaded: &(dyn Fn(u64) + Sync),
 ) -> Result<bool> {
+    // 每段都要占一台主机的一个连接名额：段数再多，总连接仍由 `HostLimit` 管。
+    let gate = host_gate(&a.url);
     let (mut reader, appended) = source.open_from(&a.url, start)?;
     // 第一段从 0 开始，服务器不会回 206，此时整包读取也是对的。
     if !appended && start > 0 {
@@ -4175,6 +4260,9 @@ fn write_segment<S: Source>(
         source.throttle(n as u64);
         file.write_all(&chunk[..n])
             .map_err(|e| io_error(target, e))?;
+        if let Some(gate) = &gate {
+            gate.limit.note(n as u64);
+        }
         read += n as u64;
         on_downloaded(n as u64);
     }
@@ -4287,7 +4375,9 @@ fn transfer<S: Source + Sync>(
                 }
             };
             // 速度已到下限就不再分块（PCL 只在 Speed < Low 时加连接）。
-            let chunked = !source.saturated() && fetch_chunked(source, a, &part, cancel, &notify)?;
+            // 分段只看「服务器支不支持 Range」，不再看「当前是不是已经跑满」：
+            // 跑满的判断会把速度锁死在第一次测量的水平（见 `Rate::raise_low`）。
+            let chunked = fetch_chunked(source, a, &part, cancel, &notify)?;
             if !chunked {
                 fetch_into_part(source, a, &part, cancel, &notify)?;
             }

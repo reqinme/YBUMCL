@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import Island from "./Island.svelte";
 
   // 自绘标题栏（窗口 decorations 为 false）。
   let maximized = $state(false);
@@ -20,6 +21,9 @@
 
 <header class="titlebar" data-tauri-drag-region>
   <div class="drag" data-tauri-drag-region></div>
+  <div class="island-slot">
+    <Island />
+  </div>
   <div class="controls">
     <button class="ctl" title="最小化" onclick={() => win().minimize()}>
       <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 5h6" stroke="currentColor" stroke-width="1.2" /></svg>
@@ -51,10 +55,16 @@
     align-items: stretch;
     flex: none;
     /* 顶部压一层浅色遮罩：壁纸亮的时候窗口按钮也要看得清 */
-    background: linear-gradient(180deg, rgba(0, 0, 0, 0.42), rgba(0, 0, 0, 0));
+    background: linear-gradient(180deg, var(--titlebar-scrim, rgba(0, 0, 0, 0.42)), transparent);
   }
   .drag {
     flex: 1;
+  }
+  .island-slot {
+    display: flex;
+    align-items: center;
+    padding-right: 6px;
+    flex: none;
   }
   .controls {
     display: flex;
@@ -67,7 +77,7 @@
     transition: background 0.12s ease, color 0.12s ease;
   }
   .ctl:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--line-soft);
     color: var(--text);
   }
   .ctl.close:hover {

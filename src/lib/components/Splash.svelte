@@ -109,7 +109,7 @@
     width: 168px;
     height: 3px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     overflow: hidden;
     opacity: 0;
     animation: fade-up 0.4s ease-out 1.6s forwards;
@@ -126,7 +126,7 @@
     position: absolute;
     bottom: 24px;
     font-size: 11px;
-    color: rgba(255, 255, 255, 0.34);
+    color: var(--text-3);
     opacity: 0;
     animation: fade-up 0.6s ease-out 1.9s forwards;
   }

@@ -195,7 +195,7 @@ fn host_trusted(host: Option<&str>) -> bool {
 }
 
 fn client() -> Result<Client> {
-    Client::builder()
+    crate::proxy::apply(Client::builder())
         .https_only(true)
         .redirect(Policy::custom(|attempt| {
             // BMCLAPI 会 302 到各家高校镜像（hit / cernet / ...），路径里保留了 /bmclapi/。
@@ -217,7 +217,7 @@ fn client() -> Result<Client> {
         } else {
             None
         })
-        .user_agent("YBUMCL/0.1")
+        .user_agent(crate::user_agent())
         .build()
         .map_err(|e| DownloadError::Network(e.to_string()))
 }

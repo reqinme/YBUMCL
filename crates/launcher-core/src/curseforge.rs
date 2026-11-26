@@ -47,8 +47,8 @@ fn client() -> Result<&'static Client> {
     static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            Client::builder()
-                .user_agent("YBUMCL/0.1 (Minecraft launcher; https://github.com/ybumcl)")
+            crate::proxy::apply(Client::builder())
+                .user_agent(crate::user_agent())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(40))
                 .build()
@@ -207,6 +207,10 @@ pub struct CfProjectMeta {
     pub name: String,
     pub slug: String,
     pub icon: Option<String>,
+    pub summary: String,
+    pub downloads: u64,
+    /// ISO 时间串，界面只取前 10 位。
+    pub updated: String,
 }
 
 /// 批量取项目元信息（每批 100 个）。
@@ -234,6 +238,9 @@ pub fn project_meta(mod_ids: &[u64]) -> Result<std::collections::HashMap<u64, Cf
                     name: item["name"].as_str().unwrap_or_default().to_owned(),
                     slug: item["slug"].as_str().unwrap_or_default().to_owned(),
                     icon: logo_icon(&item["logo"]),
+                    summary: item["summary"].as_str().unwrap_or_default().to_owned(),
+                    downloads: item["downloadCount"].as_u64().unwrap_or(0),
+                    updated: item["dateModified"].as_str().unwrap_or_default().to_owned(),
                 },
             );
         }
@@ -533,6 +540,18 @@ pub fn file_download_url(project_id: u64, file_id: u64) -> Result<String> {
         )));
     }
     Ok(edge_url(file_id, &file_name))
+}
+
+/// 按 slug 找项目 id：`/mods/search?slug=` 是精确匹配，最多返回一条。
+pub fn project_id(slug: &str) -> Result<Option<u64>> {
+    let value = get(&format!(
+        "/mods/search?gameId=432&slug={}&pageSize=1",
+        urlencode(slug)
+    ))?;
+    Ok(value["data"]
+        .as_array()
+        .and_then(|list| list.first())
+        .and_then(|item| item["id"].as_u64()))
 }
 
 /// 整合包清单里的一个文件：`POST /mods/files` 批量返回的详情。

@@ -26,8 +26,8 @@ fn client() -> Option<&'static reqwest::blocking::Client> {
     static CLIENT: OnceLock<Option<reqwest::blocking::Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .user_agent("YBUMCL/0.1")
+            crate::proxy::apply(reqwest::blocking::Client::builder())
+                .user_agent(crate::user_agent())
                 .connect_timeout(Duration::from_secs(8))
                 .timeout(Duration::from_secs(30))
                 .build()

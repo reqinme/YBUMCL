@@ -371,7 +371,7 @@
   .list,
   .side {
     background: var(--surface-2, rgb(0 0 0 / 0.22));
-    border: 1px solid var(--border, rgb(255 255 255 / 0.08));
+    border: 1px solid var(--border, var(--line-soft));
     border-radius: var(--radius-lg, 16px);
     padding: 14px 16px;
     min-height: 0;
@@ -463,7 +463,7 @@
     height: 34px;
     padding: 0 10px;
     border-radius: var(--radius-sm, 8px);
-    border: 1px solid var(--border, rgb(255 255 255 / 0.1));
+    border: 1px solid var(--border, var(--tint-3));
     background: rgb(0 0 0 / 0.25);
     color: var(--text, #e6e8ec);
     font-size: 13px;
@@ -487,7 +487,7 @@
   .warn {
     margin: 0;
     font-size: 12px;
-    color: #f0c674;
+    color: var(--warn-text);
   }
 
   .row-buttons {
@@ -509,8 +509,8 @@
     height: 32px;
     padding: 0 12px;
     border-radius: var(--radius-sm, 8px);
-    border: 1px solid var(--border, rgb(255 255 255 / 0.12));
-    background: rgb(255 255 255 / 0.06);
+    border: 1px solid var(--border, var(--tint-3));
+    background: var(--tint-2);
     color: var(--text, #e6e8ec);
     font-size: 12px;
     cursor: pointer;

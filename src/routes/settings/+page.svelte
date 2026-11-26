@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { announce } from "$lib/tasks.svelte";
   import { showError } from "$lib/dialogs.svelte";
   import Dropdown from "$lib/components/Dropdown.svelte";
+  import Switch from "$lib/components/Switch.svelte";
   /// 装了多套同版本 JDK 时，光看版本号分不清，补上发行目录名（Zulu / jdk-17.0.20 …）。
   function javaLabel(java: { major: number; version: string; path: string }): string {
     const parts = java.path.replaceAll("\\", "/").split("/").filter(Boolean);
@@ -11,10 +11,11 @@
 
   import { onMount } from "svelte";
     import { cachedJava } from "$lib/detect";
-  import { api, type JavaInstallation, type LauncherInfo, type Settings } from "$lib/api";
+  import { api, type JavaInstallation, type Settings } from "$lib/api";
   import { notifySettingsSaved } from "$lib/settings-live.svelte";
   import { speedTierOptions } from "$lib/speed";
   import { setBallColor } from "$lib/install-flight.svelte";
+  import { applyEffects, EFFECTS_OPTIONS } from "$lib/fx";
 
   /// 安装光球的预设配色，第一个就是主题绿。
   const ballPresets = [
@@ -26,37 +27,68 @@
     { value: "#ff7a6a", label: "红" }
   ];
 
+  /// 设置页的分类，和工具页一样走左侧栏。
+  const CATEGORIES = [
+    { id: "game", title: "游戏" },
+    { id: "download", title: "下载" },
+    { id: "appearance", title: "外观" }
+  ] as const;
+  type CategoryId = (typeof CATEGORIES)[number]["id"];
+
+  let view = $state<CategoryId>("game");
   let settings = $state<Settings | null>(null);
-  let info = $state<LauncherInfo | null>(null);
   let javas = $state<JavaInstallation[]>([]);
-  let busy = $state("");
+  /// 自动保存：改完停手 400 ms 落盘，成功后不打扰，失败才弹错误。
+  const SAVE_DELAY = 400;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let loaded = false;
+  let saved = "";
 
   async function load() {
     try {
-      [settings, info, javas] = await Promise.all([
+      [settings, javas] = await Promise.all([
         api.loadSettings(),
-        api.info(),
         cachedJava().then((cached) => cached.value)
       ]);
       setBallColor(settings?.installBallColor);
+      if (settings) applyEffects(settings.effects);
     } catch (e) {
       showError("读取设置失败", "设置文件或者环境信息没有读出来。", String(e));
     }
   }
 
-  async function save() {
+  async function persist(payload: string) {
     if (!settings) return;
-    busy = "save";
     try {
       settings = await api.saveSettings(settings);
+      saved = payload;
       notifySettingsSaved();
-      announce("设置已保存");
     } catch (e) {
       showError("保存设置失败", "设置没有写进配置文件。", String(e));
-    } finally {
-      busy = "";
     }
   }
+
+  /// 任何一项改了都会触发：停顿 400 ms 后写盘，连续输入只写最后一次。
+  $effect(() => {
+    if (!settings) return;
+    const payload = JSON.stringify(settings);
+    if (!loaded) {
+      loaded = true;
+      saved = payload;
+      return;
+    }
+    if (payload === saved) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => void persist(payload), SAVE_DELAY);
+  });
+
+  // 离开页面时把还没落盘的补上。
+  $effect(() => () => {
+    if (timer) clearTimeout(timer);
+    if (!settings || !loaded) return;
+    const payload = JSON.stringify(settings);
+    if (payload !== saved) void persist(payload);
+  });
 
   onMount(load);
   import BackButton from "$lib/components/BackButton.svelte";
@@ -66,13 +98,20 @@
   <header class="head">
     <BackButton />
 <h1>设置</h1>
-    <div class="spacer"></div>
-    <button class="btn primary" onclick={save} disabled={!settings || busy === "save"}>
-      {busy === "save" ? "保存中…" : "保存"}
-    </button>
   </header>
 
   {#if settings}
+  <div class="layout">
+    <aside class="rail">
+      {#each CATEGORIES as category (category.id)}
+        <button
+          class="rail-item"
+          class:active={view === category.id}
+          onclick={() => (view = category.id)}>{category.title}</button>
+      {/each}
+    </aside>
+    <div class="cards">
+      {#if view === "game"}
     <section class="panel block">
       <h2>游戏</h2>
       <div class="grid">
@@ -91,9 +130,63 @@
             ]}
           />
         </label>
+        <label>
+          <span>游戏窗口标题</span>
+          <input type="text" placeholder="默认" maxlength="128" bind:value={settings.windowTitle} />
+        </label>
+        <label>
+          <span>启动器可见性</span>
+          <Dropdown
+            bind:value={settings.launcherVisibility}
+            label="启动器可见性"
+            options={[
+              { value: "keep", label: "游戏启动后仍保持不变" },
+              { value: "minimize", label: "游戏启动后最小化" }
+            ]}
+          />
+        </label>
+        <label>
+          <span>进程优先级</span>
+          <Dropdown
+            bind:value={settings.processPriority}
+            label="进程优先级"
+            options={[
+              { value: "realtime", label: "实时" },
+              { value: "high", label: "高" },
+              { value: "above", label: "高于正常" },
+              { value: "normal", label: "正常" },
+              { value: "below", label: "低于正常" },
+              { value: "idle", label: "低" }
+            ]}
+          />
+        </label>
+        <label>
+          <span>窗口大小</span>
+          <Dropdown
+            bind:value={settings.windowSize}
+            label="窗口大小"
+            options={[
+              { value: "default", label: "默认" },
+              { value: "1280x720", label: "1280 × 720" },
+              { value: "1600x900", label: "1600 × 900" },
+              { value: "1920x1080", label: "1920 × 1080" }
+            ]}
+          />
+        </label>
+        <label class="switch-row">
+          <span>启动游戏前进行内存优化</span>
+          <Switch
+            checked={settings?.memoryOptimize ?? false}
+            label="启动游戏前进行内存优化"
+            onchange={(value) => {
+              if (settings) settings.memoryOptimize = value;
+            }}
+          />
+        </label>
       </div>
     </section>
-
+      {/if}
+      {#if view === "download"}
     <section class="panel block">
       <h2>下载</h2>
       <div class="grid">
@@ -112,6 +205,29 @@
             ]}
           />
         </label>
+        <label>
+          <span>代理</span>
+          <Dropdown
+            bind:value={settings.proxyMode}
+            label="代理"
+            options={[
+              { value: "system", label: "跟随系统" },
+              { value: "direct", label: "直连" },
+              { value: "manual", label: "手动" }
+            ]}
+          />
+        </label>
+        {#if settings.proxyMode === "manual"}
+          <label>
+            <span>代理地址</span>
+            <input
+              type="text"
+              placeholder="http://127.0.0.1:12450"
+              maxlength="256"
+              bind:value={settings.proxyUrl}
+            />
+          </label>
+        {/if}
         <label>
           <span>同时下载的文件数（1–256）</span>
           <input type="number" min="1" max="256" bind:value={settings.concurrentDownloads} />
@@ -160,11 +276,7 @@
         <input type="checkbox" bind:checked={settings.reuseGameFolders} />
         <span>复用其它游戏目录里下过的资源</span>
       </label>
-      <p class="dim">
-        官方源在校园网里可能很慢；镜像由社区维护，与官方内容一致（按 SHA1 校验）。只有存在镜像的文件才按这里的策略走，没有镜像的条目（比如原版清单）一律直接连官方。同时下载的文件数调大通常更快。
-      </p>
     </section>
-
     <section class="panel block">
       <h2>内容下载</h2>
       <div class="grid">
@@ -247,12 +359,9 @@
         <input type="checkbox" bind:checked={settings.worldExtract} />
         <span>世界包下载后自动解压到 saves</span>
       </label>
-      <p class="dim">
-        建议 3：同一时间跑三个下载足够快；开太多会被镜像限速，反而整体更慢。
-        文件名格式与 PCL 一致；中文名取自社区整理的名字表（11,603 条），没有译名的模组仍用原文件名。
-      </p>
     </section>
-
+      {/if}
+      {#if view === "appearance"}
     <section class="panel block">
       <h2>外观</h2>
       <label class="row">
@@ -260,6 +369,26 @@
         <span>启动时播放开场动画（也可以点任意处跳过）</span>
       </label>
 
+      <div class="grid">
+        <label>
+          <span>界面效果</span>
+          <Dropdown
+            value={settings.effects}
+            label="界面效果"
+            options={EFFECTS_OPTIONS}
+            onchange={(value) => {
+              if (!settings) return;
+              settings.effects = value;
+              applyEffects(value);
+            }}
+          />
+        </label>
+      </div>
+
+    </section>
+
+    <section class="panel block">
+      <h2>下载光球</h2>
       <div class="ball-pick">
         <span class="ball-preview" style="--c: {settings.installBallColor}" aria-hidden="true"></span>
         <div class="ball-copy">
@@ -293,30 +422,32 @@
         </div>
       </div>
     </section>
-  {/if}
 
-  {#if info}
-    <section class="panel block about">
-      <h2>关于</h2>
-      <dl>
-        <div><dt>版本</dt><dd>v{info.version}</dd></div>
-        <div><dt>模式</dt><dd>{info.portable ? "便携（数据在 exe 旁）" : "独立数据目录"}</dd></div>
-        <div><dt>数据目录</dt><dd class="mono">{info.dataDir}</dd></div>
-        <div><dt>游戏目录</dt><dd class="mono">{info.gameDir}</dd></div>
-      </dl>
-      <p class="dim">
-        延边大学我的世界启动器 · Yanbian University Minecraft Launcher（YBUMCL）。
-        本启动器不分发游戏本体，所有文件均从官方或镜像源下载。
-      </p>
-    </section>
+
+
+
+      {/if}
+    </div>
+  </div>
   {/if}
 </div>
 
 <style>
+  .switch-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    grid-column: 1 / -1;
+  }
   .page {
     display: flex;
     flex-direction: column;
     gap: 14px;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
   }
   .head {
     display: flex;
@@ -347,7 +478,7 @@
     height: 38px;
     border-radius: 50%;
     background:
-      radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0) 38%),
+      radial-gradient(circle at 34% 28%, var(--text) 0%, rgba(255, 255, 255, 0) 38%),
       radial-gradient(
         circle at 50% 56%,
         color-mix(in srgb, var(--c) 38%, #05070a 62%) 0%,
@@ -399,28 +530,73 @@
     transform: translateY(-1px);
   }
   .swatch.on {
-    outline-color: rgba(255, 255, 255, 0.75);
+    outline-color: var(--line-strong);
   }
   .custom {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     font-size: 12px;
-    color: rgba(255, 255, 255, 0.6);
+    color: var(--text-4);
     cursor: pointer;
   }
   .custom input {
     width: 26px;
     height: 22px;
     padding: 0;
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    border: 1px solid var(--line);
     border-radius: 6px;
     background: transparent;
     cursor: pointer;
   }
 
-  .spacer {
+  .layout {
+    display: flex;
+    align-items: stretch;
+    gap: 16px;
+    min-width: 0;
     flex: 1;
+    min-height: 0;
+  }
+  .rail {
+    flex: none;
+    width: 168px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+  }
+  .rail-item {
+    display: block;
+    width: 100%;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-dim);
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .rail-item:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+  .rail-item.active {
+    background: rgb(120 200 120 / 0.2);
+    box-shadow: inset 3px 0 0 var(--yb-green-bright);
+    color: var(--text);
+  }
+  .cards {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-right: 4px;
   }
   .block {
     padding: 16px;
@@ -471,37 +647,10 @@
   input:focus {
     border-color: var(--border-strong);
   }
-  dl {
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    font-size: 13px;
-  }
-  dl div {
-    display: flex;
-    gap: 12px;
-  }
-  dt {
-    color: var(--text-dim);
-    min-width: 64px;
-  }
-  dd {
-    margin: 0;
-    -webkit-user-select: text;
-    user-select: text;
-  }
-  .mono {
-    font-family: "Cascadia Mono", ui-monospace, monospace;
-    font-size: 12px;
-  }
   .dim {
     color: var(--text-dim);
     font-size: 12px;
     margin: 0;
     line-height: 1.7;
-  }
-  .about .dim {
-    margin-top: 12px;
   }
 </style>

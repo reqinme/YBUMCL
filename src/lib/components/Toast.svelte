@@ -47,14 +47,14 @@
     background: rgba(24, 30, 22, 0.86);
     border: 1px solid rgba(168, 204, 132, 0.45);
     box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: var(--glass-14);
+    -webkit-backdrop-filter: var(--glass-14);
     animation: toast-in 0.18s ease-out, toast-out 0.35s ease-in 1.25s forwards;
   }
   .toast.info {
     color: #e8eefb;
     background: rgba(22, 26, 34, 0.86);
-    border-color: rgba(255, 255, 255, 0.18);
+    border-color: var(--line);
   }
   .dot {
     width: 6px;

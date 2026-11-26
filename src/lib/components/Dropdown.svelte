@@ -21,6 +21,7 @@
     label = "",
     disabled = false,
     editable = false,
+    full = false,
     onchange
   }: {
     value?: string;
@@ -30,6 +31,8 @@
     disabled?: boolean;
     /// 可编辑模式：触发区是输入框，可以随便打字，下拉只是建议（PCL 的游戏版本就是这种）。
     editable?: boolean;
+    /// 按钮上完整显示当前值，长文本换行而不是省略号。
+    full?: boolean;
     onchange?: (value: string) => void;
   } = $props();
 
@@ -37,11 +40,35 @@
   let root = $state<HTMLDivElement | null>(null);
   /// 下方空间不够时把菜单翻到触发区上方（收藏夹底部的「转移到」就在窗口底边）。
   let dropUp = $state(false);
+  /// 菜单最多这么高：窗口该方向上的剩余空间和 320px 取小的那个。
+  let menuMax = $state(320);
+  /// 菜单用 fixed 定位挂到 body 上：面板本身 overflow 裁剪，absolute 往上弹会被切掉半截。
+  let menuEl = $state<HTMLUListElement | null>(null);
+  let menuStyle = $state("");
 
   function place() {
     if (!root) return;
     const rect = root.getBoundingClientRect();
     dropUp = window.innerHeight - rect.bottom < 300;
+    const space = dropUp ? rect.top - 16 : window.innerHeight - rect.bottom - 16;
+    menuMax = Math.max(96, Math.min(320, space));
+    const width = rect.width;
+    const left = rect.left;
+    if (dropUp) {
+      menuStyle = `position:fixed;left:${left}px;width:${width}px;bottom:${window.innerHeight - rect.top + 6}px;max-height:${menuMax}px`;
+    } else {
+      menuStyle = `position:fixed;left:${left}px;width:${width}px;top:${rect.bottom + 6}px;max-height:${menuMax}px`;
+    }
+  }
+
+  /// 把菜单节点挪到 body 下，避免被面板的 overflow 裁掉。
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      }
+    };
   }
 
   const current = $derived(options.find((option) => option.value === value) ?? null);
@@ -119,20 +146,28 @@
     }
   }
 
-  // 点面板外面收起。
+  // 点面板外面收起（菜单挂到 body 上了，也要算进来）。
   $effect(() => {
     if (!open) return;
     const away = (event: PointerEvent) => {
-      if (root && !root.contains(event.target as Node)) open = false;
+      const node = event.target as Node;
+      if (root && !root.contains(node) && !(menuEl && menuEl.contains(node))) open = false;
     };
+    const follow = () => place();
     window.addEventListener("pointerdown", away);
-    return () => window.removeEventListener("pointerdown", away);
+    window.addEventListener("scroll", follow, true);
+    window.addEventListener("resize", follow);
+    return () => {
+      window.removeEventListener("pointerdown", away);
+      window.removeEventListener("scroll", follow, true);
+      window.removeEventListener("resize", follow);
+    };
   });
 </script>
 
 <div class="dropdown" bind:this={root} class:open>
   {#if editable}
-    <div class="trigger wrap" class:open>
+    <div class="trigger wrap" class:open class:full>
       <input
         class="input"
         bind:this={inputEl}
@@ -167,7 +202,15 @@
   {/if}
 
   {#if open}
-    <ul class="menu" class:up={dropUp} role="listbox" tabindex="-1">
+    <ul
+      class="menu"
+      class:up={dropUp}
+      role="listbox"
+      tabindex="-1"
+      bind:this={menuEl}
+      use:portal
+      style={menuStyle}
+    >
       {#each filtered as option (option.value)}
         <li>
           <button
@@ -203,8 +246,8 @@
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.04);
-    backdrop-filter: blur(14px) saturate(1.4);
+    background: var(--surface);
+    backdrop-filter: var(--glass-14-plus);
     color: var(--text);
     font: inherit;
     text-align: left;
@@ -214,7 +257,7 @@
       background 0.15s ease;
   }
   .trigger:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.07);
+    background: var(--surface-2);
   }
   .dropdown.open .trigger {
     border-color: color-mix(in srgb, var(--yb-green) 55%, transparent);
@@ -230,6 +273,12 @@
   }
   .trigger.wrap {
     cursor: text;
+  }
+  /* 完整显示当前值：不省略，放不下就换行 */
+  .trigger.full .value {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
   }
   .input {
     flex: 1;
@@ -273,13 +322,13 @@
     margin: 0;
     list-style: none;
     border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.16);
+    border: 1px solid var(--line);
     background: rgba(24, 30, 22, 0.78);
     box-shadow:
       0 18px 40px rgba(0, 0, 0, 0.42),
-      inset 0 1px 0 rgba(255, 255, 255, 0.16);
-    backdrop-filter: blur(22px) saturate(1.7);
-    -webkit-backdrop-filter: blur(22px) saturate(1.7);
+      inset 0 1px 0 var(--line);
+    backdrop-filter: var(--glass-22);
+    -webkit-backdrop-filter: var(--glass-22);
     animation: menu-in 0.14s ease;
   }
   .menu.up {
@@ -322,7 +371,7 @@
     cursor: pointer;
   }
   .item:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--surface-2);
   }
   .item.on {
     background: color-mix(in srgb, var(--yb-green) 26%, transparent);

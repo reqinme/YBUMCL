@@ -28,10 +28,10 @@
     max-width: 300px;
     padding: 0 12px;
     border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    background: color-mix(in srgb, #10160d 78%, transparent);
+    border: 1px solid var(--line);
+    background: color-mix(in srgb, var(--card-solid, #10160d) 78%, transparent);
     box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
-    backdrop-filter: blur(18px) saturate(1.5);
+    backdrop-filter: var(--glass-18);
     color: #f4f8ee;
     font-size: 12px;
     white-space: nowrap;
@@ -59,7 +59,7 @@
   }
   .tick {
     display: inline-flex;
-    color: var(--yb-green-bright);
+    color: var(--accent);
     flex: none;
   }
   .text {

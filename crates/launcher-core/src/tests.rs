@@ -1754,6 +1754,41 @@ fn scaffolds_move_into_the_cache_and_disappear_from_versions() {
 }
 
 #[test]
+fn leftover_vanilla_scaffolds_are_swept_out_of_versions() {
+    let f = Fixture::new();
+    let vanilla = json!({
+        "id": "1.12.2",
+        "type": "release",
+        "mainClass": "net.minecraft.client.main.Main",
+        "libraries": [],
+        "downloads": {"client": {"url": "https://piston-data.mojang.com/v1/objects/x/client.jar"}}
+    });
+    // 缓存里已经有一份（昨天装的），版本目录里又落了一份（今天装加载器时落的）。
+    f.file("cache/vanilla/1.12.2/1.12.2.json", vanilla.to_string().as_bytes());
+    f.file("cache/vanilla/1.12.2/1.12.2.jar", b"cached-jar");
+    f.version("1.12.2", vanilla.clone());
+    f.file("versions/1.12.2/1.12.2.jar", b"duplicate-jar");
+    // 玩家自己在玩的纯原版（有存档）不能动。
+    f.version("1.20.1", json!({
+        "id": "1.20.1",
+        "downloads": {"client": {"url": "https://piston-data.mojang.com/v1/objects/y/client.jar"}}
+    }));
+    f.file("versions/1.20.1/saves/world/level.dat", b"world");
+
+    let swept = crate::merge::sweep_vanilla_scaffolds(&f.root);
+    // Fixture 本身还建了个 `test` 版本，一起被收走；这里只关心 1.12.2。
+    assert!(swept.contains(&"1.12.2".to_string()));
+    // 缓存里那份没被覆盖，版本目录里的重复副本删掉了。
+    assert!(!f.root.join("versions/1.12.2").exists());
+    assert!(f
+        .root
+        .join("cache/vanilla/1.12.2/1.12.2.jar")
+        .is_file());
+    // 有存档的纯原版留着。
+    assert!(f.root.join("versions/1.20.1/1.20.1.json").is_file());
+}
+
+#[test]
 fn plan_chunks_covers_the_file_without_gaps() {
     // 小于阈值不分块（阈值 4 MiB，小文件单流反而更快）
     assert!(download::plan_chunks(4 * 1024 * 1024 - 1).is_empty());
@@ -1775,10 +1810,10 @@ fn plan_chunks_covers_the_file_without_gaps() {
         assert_eq!(pair[0].1 + 1, pair[1].0, "块之间不能有空隙");
     }
 
-    // 大文件块数封顶，且总量仍然对齐
+    // 大文件块数封顶（每段约 1.5 MiB，最多 16 段），且总量仍然对齐
     let big = 256 * 1024 * 1024;
     let big_chunks = download::plan_chunks(big);
-    assert_eq!(big_chunks.len(), 8);
+    assert_eq!(big_chunks.len(), 16);
     assert_eq!(big_chunks[0].0, 0);
     assert_eq!(big_chunks.last().unwrap().1, big - 1);
     for pair in big_chunks.windows(2) {
@@ -1852,6 +1887,7 @@ fn unchanged_instance_reinstall_is_a_no_op() {
         threads: None,
         cache_roots: Vec::new(),
         overwrite: true,
+        cleanroom_mods: Vec::new(),
     };
     let summary = crate::instance::install_instance(
         request,

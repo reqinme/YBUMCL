@@ -142,6 +142,17 @@ impl Paths {
         }
     }
 
+    /// 往 launcher.log 追加一行普通日志（不带时间戳前缀，调用方自己带）。
+    pub fn write_log_line(&self, line: &str) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.log_dir().join("launcher.log"))
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
     pub fn exe_dir(&self) -> &Path {
         &self.exe_dir
     }

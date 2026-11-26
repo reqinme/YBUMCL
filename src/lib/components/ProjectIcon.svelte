@@ -106,7 +106,7 @@
   }
   /* 确实没有图标：白板 + 项目名，最多两行 */
   .missing {
-    background: rgba(255, 255, 255, 0.92);
+    background: var(--text);
     padding: 4px;
   }
   .name {

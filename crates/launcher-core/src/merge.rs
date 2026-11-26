@@ -372,6 +372,89 @@ pub fn version_json_path(root: &Path, id: &str) -> PathBuf {
     version_json(root, id)
 }
 
+
+/// 收尾：把安装过程中又落回 `versions/` 的原版底稿挪进缓存。
+///
+/// 加载器安装时会在 `versions/<原版>` 里找 json 和 jar，找不到就重新落一份；
+/// 这份副本没有 `_ybmcl`、也没人继承它，留在版本页就是一张多余的原版卡。
+/// 缓存里已有同名副本时直接删掉这份，否则整体搬进缓存（保留复用价值）。
+///
+/// 玩家自己在用的纯原版不会被动：目录里有 `logs/`、`saves/`、`mods/` 等
+/// 玩家数据就跳过，只搬「干净的原版底稿」。
+pub fn sweep_vanilla_scaffolds(root: &Path) -> Vec<String> {
+    let versions = root.join("versions");
+    if !versions.is_dir() {
+        return Vec::new();
+    }
+    let mut keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut candidates: Vec<(String, PathBuf, serde_json::Value)> = Vec::new();
+    let Ok(entries) = fs::read_dir(&versions) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let Ok(text) = fs::read_to_string(path.join(format!("{id}.json"))) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if value.get("_ybmcl").is_some() {
+            // 实例本身，谁都别动。
+            keep.insert(id);
+            continue;
+        }
+        if let Some(parent) = value.get("inheritsFrom").and_then(|item| item.as_str()) {
+            // 旧式继承链目标，删了会把别人的启动弄坏。
+            keep.insert(parent.to_owned());
+            continue;
+        }
+        candidates.push((id, path, value));
+    }
+    let mut moved = Vec::new();
+    for (id, path, value) in candidates {
+        if keep.contains(&id) {
+            continue;
+        }
+        // 只认「原版清单」：带 `downloads.client`。加载器外壳另有下载结构。
+        if value.get("downloads").and_then(|down| down.get("client")).is_none() {
+            continue;
+        }
+        if ["saves", "mods", "logs", "screenshots", "resourcepacks", "shaderpacks"]
+            .iter()
+            .any(|sub| dir_has_entries(&path.join(sub)))
+        {
+            continue;
+        }
+        let target = scaffold_dir(root, &id);
+        if target.join(format!("{id}.json")).is_file() {
+            // 缓存里已经有一份，这份纯属重复。
+            if fs::remove_dir_all(&path).is_ok() {
+                moved.push(id);
+            }
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::remove_dir_all(&target);
+        if fs::rename(&path, &target).is_ok() {
+            moved.push(id);
+        }
+    }
+    moved
+}
+
+fn dir_has_entries(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
 /// 把旧版本落在 `versions/` 里的原版底稿搬进缓存。
 ///
 /// 只搬「被别的实例当作 `clientVersion` 引用、自己又不是用户建的实例（无 `_ybmcl`）」

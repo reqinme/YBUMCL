@@ -1,6 +1,7 @@
 import { goto } from "$app/navigation";
 import { api, onJavaRetry, type VersionView } from "$lib/api";
-import { askJava, showError } from "$lib/dialogs.svelte";
+import { askJava, showError, type JavaChoice } from "$lib/dialogs.svelte";
+import { failLaunching, markLaunching } from "$lib/launch-pending.svelte";
 import { toast } from "$lib/toast";
 
 /**
@@ -46,16 +47,31 @@ export async function startVersion(
     return;
   }
   const check = await api.checkJava(version.id);
+  let choice: JavaChoice | null = null;
   if (!check.accepted) {
-    const choice = await askJava(check);
+    choice = await askJava(check);
     if (!choice) return;
-    await api.launchVersion(version.id, {
-      java: choice === "suggested" ? check.suggestedPath : null,
-      ignoreJava: choice === "ignore",
-      quickPlay,
-    });
-  } else {
-    await api.launchVersion(version.id, { quickPlay });
+  }
+  markLaunching(version.id);
+  try {
+    if (choice === "suggested" || choice === "ignore") {
+      await api.launchVersion(version.id, {
+        java: choice === "suggested" ? check.suggestedPath : null,
+        ignoreJava: choice === "ignore",
+        quickPlay,
+      });
+    } else {
+      await api.launchVersion(version.id, { quickPlay });
+    }
+  } catch (error) {
+    failLaunching(version.id);
+    showError(
+      "启动失败",
+      "游戏没有起来，看日志里的最后几行。",
+      String(error),
+      "game",
+    );
+    return;
   }
   autoRetry = { versionId: version.id, attempts: 0 };
   await goto(`/launch?version=${encodeURIComponent(version.id)}`);

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::portable::Paths;
 
 const SETTINGS_FILE: &str = "settings.json";
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 14;
 /// 默认堆内存：现代版本 2 GB 起，低于 1 GB 很多模组包会直接 OOM。
 pub const DEFAULT_MEMORY_MB: u32 = 4096;
 pub const MAX_MEMORY_MB: u32 = 32768;
@@ -39,6 +39,33 @@ pub struct Settings {
     /// 「安装光球」的颜色（`#rrggbb`），点安装后飞向下载圆环的那颗球。
     #[serde(default = "default_install_ball_color")]
     pub install_ball_color: String,
+    /// 界面材质：`dynamic`（毛玻璃 + 动效，默认）或 `static`（不透明面板，省 GPU）。
+    #[serde(default = "default_effects")]
+    pub effects: String,
+
+    /// 工具页里被放进「便捷功能」的卡片 id（`disk`/`cache`/`clean`/`java`/`shortcuts`/`about`）。
+    /// 只影响是否多显示一份，卡片本身始终留在自己的分类里。
+    #[serde(default)]
+    pub toolbox_pins: Vec<String>,
+    /// 启动游戏前做一次内存优化（清待机列表，需要管理员权限）。
+    #[serde(default)]
+    pub memory_optimize: bool,
+    /// 全局默认窗口标题；实例里留空时用它。
+    #[serde(default)]
+    pub window_title: String,
+    /// 启动器可见性：`keep`（保持不动，默认）或 `minimize`（游戏启动后最小化）。
+    #[serde(default = "default_launcher_visibility")]
+    pub launcher_visibility: String,
+    /// 进程优先级：`realtime` / `high` / `above` / `normal`（默认） / `below` / `idle`。
+    #[serde(default = "default_process_priority")]
+    pub process_priority: String,
+    /// 窗口大小：`default`（默认）或 `1280x720` / `1600x900` / `1920x1080`。
+    #[serde(default = "default_window_size")]
+    pub window_size: String,
+    #[serde(default = "default_proxy_mode")]
+    pub proxy_mode: String,
+    #[serde(default)]
+    pub proxy_url: String,
     /// 下载时把其它已登记游戏目录里的资源（按 SHA1 命中）直接复制过来，不再重复下载。
     #[serde(default = "default_true")]
     pub reuse_game_folders: bool,
@@ -130,6 +157,15 @@ impl Default for Settings {
             download_strategy: Some("sequential".into()),
             isolation_mode: "all".into(),
             install_ball_color: default_install_ball_color(),
+            effects: default_effects(),
+            toolbox_pins: Vec::new(),
+            memory_optimize: false,
+            window_title: String::new(),
+            launcher_visibility: default_launcher_visibility(),
+            process_priority: default_process_priority(),
+            window_size: default_window_size(),
+            proxy_mode: default_proxy_mode(),
+            proxy_url: String::new(),
             reuse_game_folders: true,
             download_source: String::new(),
             concurrent_downloads: 64,
@@ -155,6 +191,26 @@ impl Default for Settings {
             active_game_folder: String::new(),
         }
     }
+}
+
+fn default_launcher_visibility() -> String {
+    "keep".into()
+}
+
+fn default_process_priority() -> String {
+    "normal".into()
+}
+
+fn default_proxy_mode() -> String {
+    "system".into()
+}
+
+fn default_window_size() -> String {
+    "default".into()
+}
+
+fn default_effects() -> String {
+    "dynamic".to_owned()
 }
 
 fn default_install_ball_color() -> String {
@@ -189,6 +245,35 @@ impl Settings {
         }
         self.username = self.username.trim().chars().take(24).collect();
         self.memory_mb = self.memory_mb.clamp(512, MAX_MEMORY_MB);
+        // 界面材质只有两档；认不出的值一律回落到动态。
+        self.effects = if self.effects == "static" {
+            "static".into()
+        } else {
+            "dynamic".into()
+        };
+        // 三个启动选项只认白名单，认不出的回落到默认。
+        self.window_title = self.window_title.trim().chars().take(128).collect();
+        self.launcher_visibility = if self.launcher_visibility == "minimize" {
+            "minimize".into()
+        } else {
+            "keep".into()
+        };
+        self.process_priority = match self.process_priority.as_str() {
+            "realtime" | "high" | "above" | "below" | "idle" => self.process_priority.clone(),
+            _ => "normal".into(),
+        };
+        self.proxy_mode = if self.proxy_mode == "direct" {
+            "direct".into()
+        } else if self.proxy_mode == "manual" {
+            "manual".into()
+        } else {
+            "system".into()
+        };
+        self.proxy_url = self.proxy_url.trim().chars().take(256).collect();
+        self.window_size = match self.window_size.as_str() {
+            "1280x720" | "1600x900" | "1920x1080" => self.window_size.clone(),
+            _ => "default".into(),
+        };
         self.concurrent_downloads = self.concurrent_downloads.clamp(1, 256);
         // 老配置（KB/s）迁到档位；新配置只认档位。
         if self.schema_version < 3 && self.speed_limit > 0 {
@@ -272,6 +357,15 @@ impl Settings {
             }
             _ => default_install_ball_color(),
         };
+        let mut pins: Vec<String> = Vec::new();
+        for pin in std::mem::take(&mut self.toolbox_pins) {
+            let pin = pin.trim().to_ascii_lowercase();
+            if pin.is_empty() || pins.contains(&pin) {
+                continue;
+            }
+            pins.push(pin);
+        }
+        self.toolbox_pins = pins;
         self.schema_version = SCHEMA_VERSION;
         self
     }

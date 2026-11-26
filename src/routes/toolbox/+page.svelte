@@ -7,11 +7,12 @@
   import type { CacheUsage, CleanTarget, JavaInstallation, LauncherInfo, UsageEntry } from "$lib/api";
   import { cachedJava } from "$lib/detect";
   
-  let info = $state<LauncherInfo | null>(null);
   let usage = $state<UsageEntry[]>([]);
   let targets = $state<CleanTarget[]>([]);
   let pending = $state<string | null>(null);
   let javas = $state<JavaInstallation[]>([]);
+  /// 磁盘占用卡上用来说明统计的是哪个目录。
+  let info = $state<LauncherInfo | null>(null);
   let scanning = $state(true);
   let detecting = $state(false);
   let cache = $state<CacheUsage | null>(null);
@@ -23,6 +24,10 @@
   const maxBytes = $derived(usage.reduce((max, entry) => Math.max(max, entry.bytes), 0));
 
   onMount(() => {
+    void api
+      .loadSettings()
+      .then((value) => (settings = value))
+      .catch(() => {});
     void api
       .info()
       .then((value) => (info = value))
@@ -162,18 +167,87 @@
     }
   }
   import BackButton from "$lib/components/BackButton.svelte";
+  import Switch from "$lib/components/Switch.svelte";
+  import { registerDetailBack } from "$lib/page-history.svelte";
+  import type { Settings } from "$lib/api";
+
+  type CardId = "disk" | "cache" | "clean" | "java";
+  type CategoryId = "pinned" | "storage" | "runtime";
+
+  const CATEGORIES: { id: CategoryId; title: string }[] = [
+    { id: "pinned", title: "便捷功能" },
+    { id: "storage", title: "存储" },
+    { id: "runtime", title: "运行环境" },
+      ];
+  /// 卡片留在自己的分类里，便捷功能只是多显示一份。
+  const CARD_CATEGORY: Record<CardId, CategoryId> = {
+    disk: "storage",
+    cache: "storage",
+    clean: "storage",
+    java: "runtime",
+  };
+
+  /// 每次进页面都从便捷功能开始，不记上次看的分类。
+  let view = $state<CategoryId>("pinned");
+  let settings = $state<Settings | null>(null);
+  const pins = $derived(settings?.toolboxPins ?? []);
+
+  /// 返回键先回便捷功能，再回主页。
+  $effect(() => {
+    registerDetailBack(() => {
+      if (view === "pinned") return false;
+      view = "pinned";
+      return true;
+    });
+    return () => registerDetailBack(null);
+  });
+
+  function show(id: CardId): boolean {
+    if (view === "pinned") return pins.includes(id);
+    return CARD_CATEGORY[id] === view;
+  }
+
+  async function togglePin(id: CardId, on: boolean) {
+    if (!settings) return;
+    const next = on
+      ? [...pins.filter((item) => item !== id), id]
+      : pins.filter((item) => item !== id);
+    try {
+      settings = await api.saveSettings({ ...settings, toolboxPins: next });
+    } catch (error) {
+      showError("保存失败", "开关状态没有写进配置文件。", String(error));
+    }
+  }
 </script>
 
+<div class="shell">
 <div class="page-head">
   <BackButton />
 <h1>工具</h1>
-  <p class="dim">磁盘占用、Java 环境、常用目录都在这里。改配置请去「设置」或版本的「设置」页。</p>
 </div>
 
-<section class="panel">
+<div class="layout">
+  <aside class="rail">
+    {#each CATEGORIES as category (category.id)}
+      <button
+        class="rail-item"
+        class:active={view === category.id}
+        onclick={() => (view = category.id)}
+      >
+        {category.title}
+      </button>
+    {/each}
+  </aside>
+
+  <div class="cards">
+    {#if view === "pinned" && pins.length === 0}
+      <p class="dim empty">便捷功能里现在还没有卡片。请前往其他分类里添加。</p>
+    {/if}
+    {#if show("disk")}
+    <section class="panel">
   <header class="panel-head">
     <div>
-      <h2>磁盘占用</h2>
+      <div class="title-row"><h2>磁盘占用</h2><Switch checked={pins.includes("disk")} label={pins.includes("disk") ? "从便捷功能移除" : "放入便捷功能"} onchange={(value) => void togglePin("disk", value)} /></div>
       <p class="dim small">游戏目录：<code>{info?.gameDir ?? "…"}</code></p>
     </div>
     <button class="btn" onclick={() => void loadUsage()} disabled={scanning}>
@@ -201,11 +275,12 @@
     </p>
   {/if}
 </section>
-
-<section class="panel">
+    {/if}
+    {#if show("clean")}
+    <section class="panel">
   <header class="panel-head">
     <div>
-      <h2>清理</h2>
+      <div class="title-row"><h2>清理</h2><Switch checked={pins.includes("clean")} label={pins.includes("clean") ? "从便捷功能移除" : "放入便捷功能"} onchange={(value) => void togglePin("clean", value)} /></div>
       <p class="dim small">删掉的是缓存和残留，不碰存档、模组、配置。删「下载缓存」后下次启动游戏会重新下载。</p>
     </div>
     <button class="btn" onclick={() => void loadTargets()}>重新扫描</button>
@@ -236,11 +311,12 @@
     </ul>
   {/if}
 </section>
-
-<section class="panel">
+    {/if}
+    {#if show("cache")}
+    <section class="panel">
   <header class="panel-head">
     <div>
-      <h2>缓存</h2>
+      <div class="title-row"><h2>缓存</h2><Switch checked={pins.includes("cache")} label={pins.includes("cache") ? "从便捷功能移除" : "放入便捷功能"} onchange={(value) => void togglePin("cache", value)} /></div>
       <p class="dim small">
         安装时下载的原版底稿和加载器外壳留在这里。清掉不影响已装版本，只是重装时要重新下载。
       </p>
@@ -289,11 +365,12 @@
     </div>
   {/if}
 </section>
-
-<section class="panel">
+    {/if}
+    {#if show("java")}
+    <section class="panel">
   <header class="panel-head">
     <div>
-      <h2>Java 环境</h2>
+      <div class="title-row"><h2>Java 环境</h2><Switch checked={pins.includes("java")} label={pins.includes("java") ? "从便捷功能移除" : "放入便捷功能"} onchange={(value) => void togglePin("java", value)} /></div>
       <p class="dim small">自动扫描 JAVA_HOME、PATH、常见安装目录和官方启动器的 runtime。</p>
     </div>
     <button class="btn" onclick={() => void loadJava(true)} disabled={detecting}>
@@ -317,57 +394,67 @@
     </ul>
   {/if}
 </section>
-
-<section class="panel">
-  <header class="panel-head">
-    <div>
-      <h2>快捷入口</h2>
-      <p class="dim small">在文件管理器里打开对应目录。</p>
-    </div>
-  </header>
-  <div class="actions">
-    <button class="btn" onclick={() => void open(info?.dataDir)}>打开数据目录</button>
-    <button class="btn" onclick={() => void open(info?.gameDir)}>打开游戏目录</button>
-    <button class="btn" onclick={() => void open(info?.dataDir ? `${info.dataDir}/logs` : undefined)}>
-      打开日志目录
-    </button>
-    <button class="btn" onclick={() => void open(info?.gameDir ? `${info.gameDir}/versions` : undefined)}>
-      打开 versions
-    </button>
+    {/if}
   </div>
-</section>
-
-<section class="panel">
-  <header class="panel-head">
-    <div>
-      <h2>启动器信息</h2>
-      <p class="dim small">反馈问题时把这一段一起发出来。</p>
-    </div>
-    <button
-      class="btn"
-      onclick={() =>
-        void copy(
-          [
-            `YBUMCL ${info?.version ?? ""}`,
-            `模式：${info?.portable ? "便携" : "常规"}`,
-            `exe：${info?.exeDir ?? ""}`,
-            `数据目录：${info?.dataDir ?? ""}`,
-            `游戏目录：${info?.gameDir ?? ""}`
-          ].join("\n")
-        )}
-    >
-      复制信息
-    </button>
-  </header>
-  <dl class="kv">
-    <div><dt>版本</dt><dd>{info?.version ?? "…"}</dd></div>
-    <div><dt>模式</dt><dd>{info ? (info.portable ? "便携（数据在 exe 旁）" : "常规") : "…"}</dd></div>
-    <div><dt>数据目录</dt><dd title={info?.dataDir}>{info?.dataDir ?? "…"}</dd></div>
-    <div><dt>游戏目录</dt><dd title={info?.gameDir}>{info?.gameDir ?? "…"}</dd></div>
-  </dl>
-</section>
+</div>
+</div>
 
 <style>
+  .shell {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .layout {
+    display: flex;
+    gap: 16px;
+    align-items: stretch;
+    flex: 1;
+    min-height: 0;
+  }
+  .rail {
+    flex: none;
+    width: 168px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+  }
+  .rail-item {
+    text-align: left;
+    padding: 9px 12px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  .rail-item:hover {
+    background: var(--tint-1);
+  }
+  .rail-item.active {
+    background: rgb(120 200 120 / 0.2);
+    box-shadow: inset 3px 0 0 var(--yb-green-bright);
+  }
+  .cards {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .title-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .empty {
+    padding: 18px 2px;
+  }
   .page-head {
     display: flex;
     align-items: center;
@@ -393,7 +480,7 @@
     padding: 16px 18px;
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    background: rgba(16, 19, 26, 0.5);
+    background: var(--shell-card, rgba(16, 19, 26, 0.5));
     margin-bottom: 14px;
   }
   .panel-head {
@@ -430,7 +517,7 @@
   .usage-bar {
     height: 8px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.07);
+    background: var(--tint-2);
     overflow: hidden;
   }
   .usage-bar .fill {
@@ -469,7 +556,7 @@
     padding: 10px 12px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--tint-1);
   }
 
   .clean-main {
@@ -513,7 +600,7 @@
   .btn.danger {
     border-color: rgba(168, 59, 43, 0.9);
     background: rgba(168, 59, 43, 0.28);
-    color: #ffd9d3;
+    color: var(--danger-text);
   }
 
   .java-list {
@@ -584,33 +671,5 @@
     border-color: rgba(214, 84, 70, 0.95);
     color: #fff;
     transition: padding 0.15s ease, background 0.15s ease;
-  }
-
-  /* 启动器信息 */
-  .kv {
-    margin: 0;
-    display: grid;
-    gap: 6px;
-    max-width: 760px;
-  }
-  .kv > div {
-    display: flex;
-    align-items: baseline;
-    gap: 12px;
-    min-width: 0;
-  }
-  .kv dt {
-    flex: none;
-    width: 84px;
-    font-size: 12.5px;
-    color: var(--text-dim);
-  }
-  .kv dd {
-    margin: 0;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 13px;
   }
 </style>

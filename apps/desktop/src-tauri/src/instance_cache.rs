@@ -16,7 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// 缓存格式版本：以后改了 `VersionView` 的字段就把它 +1，旧缓存自动作废。
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const FILE_NAME: &str = "instance-cache.json";
 
 #[derive(Serialize, serde::Deserialize)]

@@ -60,7 +60,8 @@
     // 页面那一侧负责把「暂停 / 取消」写进任务卡文案，它只认这个标记。
     markStop(mode);
     try {
-      await api.cancelInstall(taskId, mode);
+      // 单文件下载（模组、资源包、世界包）另一套令牌；两处都叫一遍，谁在跑谁响应。
+      await Promise.allSettled([api.cancelInstall(taskId, mode), api.cancelDownload(taskId, mode)]);
     } finally {
       stopping = null;
     }
@@ -261,13 +262,13 @@
     display: grid;
     place-items: center;
     border-radius: 9px;
-    border: 1px solid var(--yb-line, rgba(255, 255, 255, 0.16));
-    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--yb-line, var(--line));
+    background: var(--tint-2);
     color: inherit;
     cursor: pointer;
   }
   .back:hover {
-    background: rgba(255, 255, 255, 0.12);
+    background: var(--tint-3);
   }
   .empty {
     padding: 18px;
@@ -306,7 +307,7 @@
     font-size: 11px;
     padding: 2px 8px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     flex: none;
   }
   .status.running {
@@ -337,7 +338,7 @@
   .live .bar {
     height: 8px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     overflow: hidden;
   }
   .live .bar span {

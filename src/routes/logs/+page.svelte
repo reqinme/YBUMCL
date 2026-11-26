@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Segmented from "$lib/components/Segmented.svelte";
   import Dropdown from "$lib/components/Dropdown.svelte";
   import BackButton from "$lib/components/BackButton.svelte";
   // 日志页：启动器日志（launcher.log）与游戏日志（versions/<id>/logs/latest.log）。
@@ -140,13 +141,15 @@
 
   <div class="toolbar">
     <input class="search" bind:value={query} placeholder="搜索关键字…" spellcheck="false" />
-    <div class="seg" role="group" aria-label="日志级别">
-      <button class="seg-btn" class:active={level === "all"} onclick={() => (level = "all")}>全部</button>
-      <button class="seg-btn" class:active={level === "warn"} onclick={() => (level = "warn")}>警告+</button>
-      <button class="seg-btn" class:active={level === "error"} onclick={() => (level = "error")}>
-        仅错误
-      </button>
-    </div>
+    <Segmented
+      bind:value={level}
+      ariaLabel="日志级别"
+      options={[
+        { value: "all", label: "全部" },
+        { value: "warn", label: "警告+" },
+        { value: "error", label: "仅错误" }
+      ]}
+    />
     <label class="check"><input type="checkbox" bind:checked={wrap} />换行</label>
     <label class="check"><input type="checkbox" bind:checked={follow} />贴底</label>
     <span class="stats">
@@ -198,7 +201,7 @@
     gap: 4px;
     padding: 3px;
     border-radius: 10px;
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--tint-2);
   }
   .tab {
     padding: 6px 14px;
@@ -237,7 +240,7 @@
     font-size: 12px;
     border-radius: 8px;
     border: 1px solid var(--border);
-    background: rgba(8, 11, 16, 0.5);
+    background: var(--log-bg, rgba(8, 11, 16, 0.5));
     color: var(--text);
   }
   .search:focus {
@@ -249,7 +252,7 @@
     gap: 2px;
     padding: 2px;
     border-radius: 8px;
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--tint-1);
   }
   .seg-btn {
     border: none;
@@ -261,7 +264,7 @@
     cursor: pointer;
   }
   .seg-btn.active {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
     color: var(--text);
   }
   .check {
@@ -279,7 +282,7 @@
     font-variant-numeric: tabular-nums;
   }
   .err-count {
-    color: #e8a097;
+    color: var(--danger-text);
     font-weight: 600;
   }
 
@@ -296,7 +299,7 @@
   }
   .error {
     margin: 0;
-    color: #f0b0a4;
+    color: var(--danger-text);
     font-size: 12px;
   }
 
@@ -306,8 +309,8 @@
     overflow: auto;
     padding: 10px 12px;
     border-radius: var(--radius-md);
-    background: rgba(5, 8, 12, 0.72);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    background: var(--log-bg-strong, rgba(5, 8, 12, 0.72));
+    border: 1px solid var(--tint-2);
     font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
     font-size: 12px;
     line-height: 1.6;
@@ -319,24 +322,24 @@
   }
   .line {
     margin: 0;
-    color: #c9d1de;
+    color: var(--text);
     padding: 1px 6px;
     border-radius: 4px;
     white-space: inherit;
     overflow-wrap: anywhere;
   }
   .line:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--tint-1);
   }
   .line.warn {
-    color: #e6cf9a;
+    color: var(--warn-text);
   }
   .line.error {
-    color: #f0a79b;
+    color: var(--danger-text);
     background: rgba(200, 70, 55, 0.1);
   }
   .stamp {
-    color: #7f8b9e;
+    color: var(--text-dim);
     margin-right: 6px;
   }
   .empty {

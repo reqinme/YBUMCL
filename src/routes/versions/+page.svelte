@@ -22,6 +22,8 @@
     type VersionView
   } from "$lib/api";
   import { startVersion } from "$lib/launch";
+  import { isLaunching } from "$lib/launch-pending.svelte";
+  import LaunchFill from "$lib/components/LaunchFill.svelte";
   import { loaderLabels } from "$lib/loader-ranges";
   import {
     addFolder,
@@ -624,7 +626,6 @@
           label="版本号"
           bind:value={gamePick}
           options={gameOptions}
-          disabled={gameOptions.length <= 1}
           onchange={saveFilters}
         />
         <Dropdown
@@ -775,10 +776,12 @@
               <div class="row">
                 <button
                   class="btn primary"
-                  disabled={!version.supported || busy !== ""}
+                  class:launching={isLaunching(version.id)}
+                  disabled={!version.supported || busy !== "" || isLaunching(version.id)}
                   onclick={() => launch(version)}
                 >
-                  {busy === version.id ? "启动中…" : "启动"}
+                  <LaunchFill id={version.id} />
+                  <span>{isLaunching(version.id) ? "启动中…" : "启动"}</span>
                 </button>
                 <button
                   class="btn"
@@ -839,6 +842,13 @@
 />
 
 <style>
+  .btn.primary {
+    position: relative;
+    overflow: hidden;
+  }
+  .btn.primary > span {
+    position: relative;
+  }
   /* 整页锁在视口内，页面自己不滚；滚动只发生在左栏列表和右栏卡片区。 */
   .view {
     height: 100%;
@@ -902,7 +912,7 @@
     padding: 2px 4px 2px 2px;
   }
   .folder:hover {
-    background: rgb(255 255 255 / 0.05);
+    background: var(--tint-1);
   }
   /* 选中只靠高亮：左边一条竖线 + 更实的底色，不再挂「当前」小标签。 */
   .folder.active {
@@ -940,7 +950,7 @@
     text-overflow: ellipsis;
   }
   .folder.active .name {
-    color: var(--yb-green-bright);
+    color: var(--accent);
   }
   .badge {
     font-size: 10.5px;
@@ -1007,7 +1017,7 @@
     text-align: left;
   }
   .entry:hover {
-    background: rgb(255 255 255 / 0.06);
+    background: var(--tint-2);
   }
   .glyph {
     width: 16px;
@@ -1079,7 +1089,7 @@
     color: var(--dim);
   }
   .runs-code.bad {
-    color: #ff9d9d;
+    color: var(--danger-text);
   }
   .runs-pop {
     position: absolute;
@@ -1186,7 +1196,7 @@
     color: rgba(226, 232, 240, 0.72);
   }
   .star.on {
-    color: #e7c04a;
+    color: var(--warn-text);
   }
   .star.on svg {
     fill: currentColor;
@@ -1280,7 +1290,7 @@
   }
   .tag {
     font-size: 11px;
-    color: var(--yb-green-bright);
+    color: var(--accent);
     background: rgb(120 200 120 / 0.14);
     border-radius: 999px;
     padding: 1px 8px;
@@ -1310,7 +1320,7 @@
   .warn {
     margin: 0;
     font-size: 11px;
-    color: var(--yb-green-bright);
+    color: var(--accent);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1354,9 +1364,9 @@
     cursor: pointer;
   }
   .menu-item:hover {
-    background: rgb(255 255 255 / 0.08);
+    background: var(--line-soft);
   }
   .menu-item.danger {
-    color: #ff8f7a;
+    color: var(--danger-text);
   }
 </style>

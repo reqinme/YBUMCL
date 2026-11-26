@@ -28,8 +28,8 @@ fn client() -> Result<&'static Client> {
     static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            Client::builder()
-                .user_agent("YBUMCL/0.1 (Minecraft launcher; https://github.com/ybumcl)")
+            crate::proxy::apply(Client::builder())
+                .user_agent(crate::user_agent())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()

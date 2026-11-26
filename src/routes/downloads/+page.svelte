@@ -1,7 +1,9 @@
 <script lang="ts">
+  import type { RefDetail } from "$lib/api";
   import { trackPack, untrackPack } from "$lib/pack-live";
   import { onMount, onDestroy, tick } from "svelte";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { registerDetailBack } from "$lib/page-history.svelte";
+  import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { cachedJava, cachedManifest, forgetScan } from "$lib/detect";
   import {
     announce,
@@ -29,6 +31,7 @@
   import { launchInstallFlight, setBallColor } from "$lib/install-flight.svelte";
   import { supportsLoader, type LoaderKind } from "$lib/loader-ranges";
   import Dropdown from "$lib/components/Dropdown.svelte";
+  import Segmented from "$lib/components/Segmented.svelte";
   import { SIDES, TAGS, type SideFilter, type TagOption } from "$lib/content-tags";
   import ProjectIcon from "$lib/components/ProjectIcon.svelte";
   import { badgeOf, foolAnchor, foolOf } from "$lib/version-types";
@@ -40,6 +43,7 @@
     compareVersionName,
     computeFlags,
     environmentLabel,
+    fileSupports,
     filesMatchingLeft,
     groupFiles,
     leftFilterTitle,
@@ -52,6 +56,8 @@
   import { page } from "$app/state";
   import {
     api,
+    type ChosenExtra,
+    type CleanroomExtraMod,
     type DownloadStrategy,
     type FabricLoaderVersion,
     type InstallSummary,
@@ -615,45 +621,6 @@
     void refreshJavaPlan();
   }
 
-  /// 把用户挑好的 Scalar / Fugue 放进新装实例的 mods 目录。
-  /// 装完的时候版本列表可能还没到（点得太快），所以先等正在跑的请求、再强刷一次；
-  /// 一个都没放进去就说实话，不能报「已放入」骗人。
-  async function installCleanroomMods(versionId: string) {
-    const wanted = extraMods;
-    if (wanted.length === 0) return;
-    const waitIdle = async () => {
-      for (let i = 0; i < 200 && extraBusy; i += 1) await new Promise((done) => setTimeout(done, 100));
-    };
-    await waitIdle();
-    if (wanted.some((mod) => !extraVersions[mod.id]?.length)) {
-      await loadCleanroomMods(true);
-      await waitIdle();
-    }
-    const dir = `${gameDir}/versions/${versionId}/mods`;
-    const placed: string[] = [];
-    const missing: string[] = [];
-    for (const mod of wanted) {
-      const version = (extraVersions[mod.id] ?? []).find((item) => item.id === extraPicked[mod.id]);
-      if (!version) {
-        missing.push(mod.name);
-        continue;
-      }
-      try {
-        await api.modrinthDownload(version.fileUrl, dir, version.fileName, mod.name, mod.name);
-        placed.push(mod.name);
-      } catch (e) {
-        showError(`没下成 ${mod.name}`, "实例已经装好了，这个 mod 可以在版本详情里手动补装。", describeError(e));
-      }
-    }
-    if (placed.length > 0) announce(`已放入 ${placed.join("、")}`);
-    if (missing.length > 0) {
-      showError(
-        `没拿到 ${missing.join("、")} 的下载地址`,
-        `实例已经装好了，但 ${missing.join("、")} 没放进 mods。打开网络后可以在版本详情里补装，或者重新勾 Cleanroom 再装一次。`
-      );
-    }
-  }
-
   /// 加载器清单回来得比点击晚的时候，`picked` 里是空串；等清单到了补上默认版本，
   /// 否则安装请求会带着空版本号被后端拒掉。
   $effect(() => {
@@ -669,7 +636,7 @@
   });
 
   $effect(() => {
-    if (chosen.includes("cleanroom")) void loadCleanroomMods();
+    if (chosen.includes("cleanroom") && selectedGame) void loadCleanroomExtras(selectedGame);
   });
 
   /// 一次安装请求的参数快照：「继续」要拿它原样重跑，不能读界面上的当前选择
@@ -763,7 +730,8 @@
                 loaders: plan.loaders,
                 javaPath: plan.javaPath,
                 strategy,
-                threads
+                threads,
+                cleanroomMods: chosenExtras()
               },
               taskId
             );
@@ -775,9 +743,6 @@
       delete pausedNames[name];
       plans.delete(taskId);
       setTaskResume(taskId, null);
-      if (plan.loaders.some((item) => item.loader === "cleanroom")) {
-        await installCleanroomMods(summary.versionId);
-      }
     } catch (e) {
       const message = describeError(e);
       // 暂停 / 取消是在「下载任务」页里点的，那边只留一个标记；
@@ -900,6 +865,9 @@
     minecraft: ""
   };
   let cat = $state<Category>("all");
+  /// 分类胶囊下面那块会左右滑动的底片：按当前按钮的位置和宽度算。
+  let catButtons: HTMLButtonElement[] = [];
+  let catThumb = $state({ left: 0, width: 0, ready: false });
 
   /// 安装包的类别：这些是「一个文件就能拿走」的东西。
   const PACKAGE_KINDS: { id: string; label: string }[] = [
@@ -1132,54 +1100,52 @@
   let mrProjects = $state<MrProject[]>([]);
   let mrProject = $state<MrProject | null>(null);
   let mrVersions = $state<MrVersion[]>([]);
-  /// Cleanroom 必须搭配的两个核心 mod（CurseForge 项目 id）。它们不在 Modrinth 上，
-  /// 所以下载走 CurseForge 的版本接口，装完 Cleanroom 实例之后直接放进实例的 mods。
-  const CLEANROOM_MODS = [
-    { id: "1012168", name: "Scalar", what: "Cleanroom 运行时的核心" },
-    { id: "1005815", name: "Fugue", what: "给 Cleanroom 补上新版特性的补丁" }
-  ];
-  /// 只有 Cleanroom + LiteLoader 一起选时才需要：让 .litemod 跑在 Cleanroom 上的兼容层。
-  const CLEANROOM_LITE_MOD = {
-    id: "1661535",
-    name: "CleanLiteLoader",
-    what: "LiteLoader 兼容层"
-  };
-  /// 当前要一起放进实例 mods 的附加 mod：Scalar/Fugue 常在，
-  /// 叠了 LiteLoader 时再加 CleanLiteLoader。
-  const extraMods = $derived(
-    chosen.includes("cleanroom")
-      ? chosen.includes("liteloader")
-        ? [...CLEANROOM_MODS, CLEANROOM_LITE_MOD]
-        : CLEANROOM_MODS
-      : []
-  );
-  let extraVersions = $state<Record<string, MrVersion[]>>({});
+  /// 项目简介的中文翻译（MCIM 翻译库），没有就不显示。
+  let mrTranslation = $state<string | null>(null);
+  /// Cleanroom 只装加载器本身，Fugue / Scalar 得自己放进 `mods/`。
+  /// 面板上三条各一个下拉，默认「不下载」；Scalar 与 Scalar Legacy 是二选一。
+  const CLEANROOM_EXCLUSIVE = ["scalar", "scalar-legacy"];
+  let extras = $state<CleanroomExtraMod[]>([]);
   let extraPicked = $state<Record<string, string>>({});
   let extraBusy = $state(false);
+  let extraLoadedFor = "";
 
-  /// 选了 Cleanroom 才去拉这两个 mod 的版本列表（只取 1.12.2 的）。
-  /// force 用于装完之后再确认一次：安装按钮可能比列表先到，这时不能当成「没有这个 mod」。
-  async function loadCleanroomMods(force = false) {
-    if (extraBusy) return;
-    const pending = extraMods.filter((mod) => force || !extraVersions[mod.id]);
-    if (pending.length === 0) return;
+  /// 选了 Cleanroom 才去问后端这三个模组有哪些版本。
+  async function loadCleanroomExtras(game: string) {
+    if (!game || extraBusy || extraLoadedFor === game) return;
     extraBusy = true;
     try {
-      const loaded: Record<string, MrVersion[]> = {};
-      for (const mod of pending) {
-        loaded[mod.id] = await api.curseforgeVersions(mod.id, "1.12.2", null);
-      }
-      extraVersions = { ...extraVersions, ...loaded };
-      const picks = { ...extraPicked };
-      for (const mod of pending) {
-        if (!picks[mod.id] && loaded[mod.id]?.length) picks[mod.id] = loaded[mod.id][0].id;
-      }
-      extraPicked = picks;
+      extras = await api.cleanroomExtras(game);
+      extraLoadedFor = game;
+      const picked = { ...extraPicked };
+      for (const mod of extras) if (!(mod.key in picked)) picked[mod.key] = "";
+      extraPicked = picked;
     } catch (e) {
-      showError("读取 Cleanroom 组件失败", "没取到 Scalar / Fugue 的版本列表，可以稍后再试。", describeError(e));
+      showError("读取 Cleanroom 组件失败", "没取到这三个模组的版本列表，可以稍后再试。", describeError(e));
     } finally {
       extraBusy = false;
     }
+  }
+
+  /// 挑了一条：把与之互斥的那条清回「不下载」。
+  function pickExtra(key: string, file: string) {
+    const next = { ...extraPicked, [key]: file };
+    if (file && CLEANROOM_EXCLUSIVE.includes(key)) {
+      for (const other of CLEANROOM_EXCLUSIVE) if (other !== key) next[other] = "";
+    }
+    extraPicked = next;
+  }
+
+  /// 只把真正选了版本的条目交给后端；没选的传空数组就是不装。
+  function chosenExtras(): ChosenExtra[] {
+    const out: ChosenExtra[] = [];
+    for (const mod of extras) {
+      const file = extraPicked[mod.key];
+      if (!file) continue;
+      const version = mod.versions.find((item) => String(item.file) === file);
+      if (version) out.push({ project: mod.project, file: version.file, fileName: version.fileName });
+    }
+    return out;
   }
 
   /// 实例名可能是「1.12.2-Cleanroom_0.7.14-alpha」这种合成 id，
@@ -1293,6 +1259,39 @@
   };
 
   /// 这一类内容的落点：默认 → `<游戏目录>\downloads`；选了实例 → 实例目录（数据包停在实例根）。
+  /// 这个文件自己适配的游戏版本与加载器，和某个实例对得上吗。
+  function instanceAccepts(instance: VersionView, version: FileVersion): boolean {
+    const game = instance.gameVersion ?? "";
+    if (!version.gameVersions.includes(game)) return false;
+    if (version.loaders.length === 0) return true;
+    const wanted = version.loaders.map((name) => name.toLowerCase());
+    const have = (instance.loaders ?? []).map((name) => name.toLowerCase());
+    return wanted.some((name) => have.includes(name));
+  }
+
+  /// 落点：当前实例适配就用它；否则挑一个版本与加载器都一致的（最近启动优先）；
+  /// 一个都没有就落到 `downloads`，不硬塞进不相干的实例。
+  function instanceFor(version: FileVersion): VersionView | null {
+    const candidates = instances.filter((item) => instanceAccepts(item, version));
+    if (candidates.length === 0) return null;
+    const current = candidates.find((item) => item.id === selected?.id);
+    if (current) return current;
+    const sorted = [...candidates].sort(
+      (a, b) =>
+        (b.lastStarted ?? "").localeCompare(a.lastStarted ?? "") ||
+        (b.installedAt ?? 0) - (a.installedAt ?? 0)
+    );
+    return sorted[0] ?? null;
+  }
+
+  function targetFor(version: FileVersion): string {
+    if (!gameDir) return "";
+    const hit = instanceFor(version);
+    if (!hit) return `${gameDir}\\downloads`;
+    const sub = CONTENT_SUB[cat] ?? "";
+    return `${gameDir}\\versions\\${hit.id}\\${sub}`;
+  }
+
   function targetDir(kind: Category, pick = chosenInstance(kind)): string {
     if (!gameDir) return "";
     if (!pick) return gameDir + "\\" + "downloads";
@@ -1501,7 +1500,10 @@
   const loaderOptions = $derived(
     cat === "shaders"
       ? [{ value: "", label: "全部" }, ...SHADER_LOADERS]
-      : [{ value: "", label: "全部加载器" }, ...MR_LOADERS.map((item) => ({ value: item, label: item }))]
+      : [
+          { value: "", label: "全部加载器" },
+          ...MR_LOADERS.map((item) => ({ value: item, label: loaderName(item) }))
+        ]
   );
 
   /// 当前分类真正要传给接口的加载器（别的分类忽略它）。
@@ -1635,9 +1637,14 @@
       }
       index += 1;
     }
+    // 两家合表时的顺序：按下载量排就老老实实比下载量；其它排序保持各自服务器的顺序，
+    // 不能再拿「下载量 × 来源权重」重排，否则看起来根本没按所选方式排。
+    const byDownloads = mrSort === "downloads";
     state.items = [...picked.entries()]
       .map(([key, item]) => ({ item, order: order.get(key) ?? 0 }))
-      .sort((a, b) => listScore(b.item) - listScore(a.item) || a.order - b.order)
+      .sort((a, b) =>
+        byDownloads ? b.item.downloads - a.item.downloads || a.order - b.order : a.order - b.order
+      )
       .map((entry) => entry.item);
   }
 
@@ -1649,13 +1656,16 @@
     const loader = activeLoader();
     const sources = mrSources.filter((source) => (source === "curseforge" ? !state.cfEnded : !state.mrEnded));
     if (sources.length === 0) return;
-    const results = await Promise.all(
+    // 两家各发各的：谁先回来先把谁并进表里，别等慢的那家。
+    await Promise.all(
       sources.map(async (source) => {
         const offset = source === "curseforge" ? state.cfOffset : state.mrOffset;
         const key = [source, type, mrQuery, gameVersion ?? "", loader ?? "", mrSort, mrTagValue(source) ?? "", mrEnv, offset].join("|");
         const hit = searchCache.get(key);
         if (hit && Date.now() - hit.at < SEARCH_CACHE_MS) {
-          return { source, page: { items: hit.items, total: hit.total }, failed: false as const };
+          // 走缓存也得并进表里：以前这里直接 return，页面上就什么都不显示。
+          if (token === mrToken) applyBatch(state, source, { items: hit.items, total: hit.total });
+          return;
         }
         try {
           const page = await api.contentSearch({
@@ -1673,40 +1683,38 @@
             translate: cat === "mods" || cat === "datapacks"
           });
           searchCache.set(key, { at: Date.now(), items: page.items, total: page.total });
-          return { source, page, failed: false as const };
+          if (token === mrToken) applyBatch(state, source, page);
+          return;
         } catch {
-          return { source, page: null, failed: true as const };
+          if (token !== mrToken) return;
+          if (source === "curseforge") {
+            state.cfError = true;
+            state.cfEnded = true;
+          } else {
+            state.mrError = true;
+            state.mrEnded = true;
+          }
         }
       })
     );
-    if (token !== mrToken) return;
-    const incoming: MrProject[] = [];
-    for (const result of results) {
-      const fromCf = result.source === "curseforge";
-      if (result.failed || !result.page) {
-        if (fromCf) {
-          state.cfError = true;
-          state.cfEnded = true;
-        } else {
-          state.mrError = true;
-          state.mrEnded = true;
-        }
-        continue;
-      }
-      const total = fromCf ? Math.min(result.page.total, 10000) : result.page.total;
-      const count = result.page.items.length;
-      if (fromCf) {
-        state.cfTotal = total;
-        state.cfOffset += count;
-        if (count < mrPageSize || state.cfOffset >= total) state.cfEnded = true;
-      } else {
-        state.mrTotal = total;
-        state.mrOffset += count;
-        if (count < mrPageSize || state.mrOffset >= total) state.mrEnded = true;
-      }
-      incoming.push(...result.page.items);
+  }
+
+  /// 一家回来了就并一家：先回来的先上屏，慢的那家到了再追加。
+  function applyBatch(state: ListState, source: string, page: { items: MrProject[]; total: number }) {
+    const fromCf = source === "curseforge";
+    const total = fromCf ? Math.min(page.total, 10000) : page.total;
+    const count = page.items.length;
+    if (fromCf) {
+      state.cfTotal = total;
+      state.cfOffset += count;
+      if (count < mrPageSize || state.cfOffset >= total) state.cfEnded = true;
+    } else {
+      state.mrTotal = total;
+      state.mrOffset += count;
+      if (count < mrPageSize || state.mrOffset >= total) state.mrEnded = true;
     }
-    mergeList(state, incoming);
+    mergeList(state, page.items);
+    if (listState === state && mrLoaded) renderList(state);
   }
 
   /// 滑动窗口：只裁到当前页之前，保证正在看的这页不会被裁掉。
@@ -1774,7 +1782,8 @@
   async function prefetchNext(state: ListState, token: number) {
     const size = Math.max(1, mrPageSize);
     let guard = 0;
-    while (state.dropped + state.items.length < size * 2 && !(state.cfEnded && state.mrEnded) && guard < 3) {
+    // 只补一批：以前最多连拉 3 轮，等于后台又发了 6 个请求，切分类/翻页反而更慢。
+    while (state.dropped + state.items.length < size * 2 && !(state.cfEnded && state.mrEnded) && guard < 1) {
       await fetchBatch(state, token);
       if (token !== mrToken) return;
       guard += 1;
@@ -1845,7 +1854,7 @@
   }
 
   /// 详情页的三轴筛选与折叠状态（照 PCL 的 PageDownloadCompDetail）。
-  let fileInstance = $state<string | null>(null);
+  let fileGame = $state<string | null>(null);
   let fileLoader = $state<string | null>(null);
   let fileEnvironment = $state<EnvironmentFilter | null>(null);
   let fileExpanded = $state(new Set<string>());
@@ -1856,7 +1865,259 @@
   let fileBusy = $state(false);
 
   const fileVersions: FileVersion[] = $derived(mrVersions);
+  /// 详情页只用两个下拉：加载器、游戏版本；版本列表平铺，按发布时间倒序。
+  const fileLoaderChoices = $derived(
+    // 下拉里的加载器也按 Forge → NeoForge → Fabric → Quilt → 其它 排。
+    [...new Set(fileVersions.flatMap((item) => item.loaders))].sort(
+      (a, b) => loaderRank(a) - loaderRank(b) || a.localeCompare(b)
+    )
+  );
+  /// 加载器优先级：NeoForge → Forge → Fabric → Quilt → 其它（按名字）。
+  const FILTER_LOADER_ORDER = ["forge", "neoforge", "fabric", "quilt"];
+  function loaderRank(id: string | null): number {
+    if (!id) return FILTER_LOADER_ORDER.length + 1;
+    const index = FILTER_LOADER_ORDER.indexOf(id.toLowerCase());
+    return index < 0 ? FILTER_LOADER_ORDER.length : index;
+  }
+  type FileBlock = { key: string; title: string; version: string; loader: string | null; files: FileVersion[] };
+  /// 一个「加载器 + 游戏版本」就是一个方块：先按版本从新到旧，再按加载器，块内按发布时间从新到旧。
+  const fileBlocks = $derived.by<FileBlock[]>(() => {
+    const map = new Map<string, FileBlock>();
+    for (const item of fileVersions) {
+      const loaders = item.loaders ?? [];
+      if (fileLoader && !loaders.some((name) => name === fileLoader)) continue;
+      if (fileEnvironment && !fileSupports(item, fileEnvironment)) continue;
+      for (const version of item.gameVersions ?? []) {
+        const combos: (string | null)[] = loaders.length > 0 ? [...new Set(loaders)] : [null];
+        for (const loader of combos) {
+          const key = `${version}|${loader ?? ""}`;
+          let block = map.get(key);
+          if (!block) {
+            block = {
+              key,
+              title: loader ? `${loaderName(loader)} ${version}` : version,
+              version,
+              loader,
+              files: []
+            };
+            map.set(key, block);
+          }
+          if (!block.files.some((file) => file.id === item.id)) block.files.push(item);
+        }
+      }
+    }
+    const list = [...map.values()];
+    for (const block of list) {
+      block.files.sort((a, b) => (b.datePublished ?? "").localeCompare(a.datePublished ?? ""));
+    }
+    return list.sort((a, b) => {
+      // compareVersionName 本身就是「新的在前」，别再反过来。
+      const byVersion = compareVersionName(a.version, b.version);
+      if (byVersion !== 0) return byVersion;
+      const byLoader = loaderRank(a.loader) - loaderRank(b.loader);
+      if (byLoader !== 0) return byLoader;
+      // 同属「其他」加载器时按名字，别按建块顺序。
+      return (a.loader ?? "").localeCompare(b.loader ?? "");
+    });
+  });
+  /// 方块上出现过的游戏版本（顺序就是方块的顺序：新的在前）。
+  const shownBlocks = $derived(fileGame ? fileBlocks.filter((block) => block.version === fileGame) : fileBlocks);
+  const fileGameChoices = $derived([...new Set(fileBlocks.map((block) => block.version))]);
+  /// 每个方块顶部的「前置资源」：该方块里所有文件声明的必需前置并集。
+  let blockDeps = $state<Record<string, RefDetail[]>>({});
+  let blockDepBusy = $state<Record<string, boolean>>({});
+  async function loadBlockDeps(block: FileBlock) {
+    if (blockDeps[block.key] || blockDepBusy[block.key]) return;
+    const ids: string[] = [];
+    for (const file of block.files) {
+      for (const dep of file.dependencies ?? []) {
+        if (dep.dependencyType !== "required" || !dep.projectId) continue;
+        if (!ids.includes(dep.projectId)) ids.push(dep.projectId);
+      }
+    }
+    if (ids.length === 0) {
+      blockDeps = { ...blockDeps, [block.key]: [] };
+      return;
+    }
+    blockDepBusy = { ...blockDepBusy, [block.key]: true };
+    try {
+      const source = mrProject && isCurseForge(mrProject) ? "curseforge" : "modrinth";
+      const list = await api.referenceDetails(source, ids);
+      blockDeps = { ...blockDeps, [block.key]: list };
+    } catch {
+      blockDeps = { ...blockDeps, [block.key]: [] };
+    } finally {
+      blockDepBusy = { ...blockDepBusy, [block.key]: false };
+    }
+  }
+  /// 点「前置资源」里的某一行时弹出的窗口：左边是前置本身的资料，右边是它的文件列表。
+  type DepView = { dep: RefDetail; versions: FileVersion[]; loading: boolean };
+  /// 前置详情是模组详情的下级页面：可以一层层往下钻，返回时一层层退回来。
+  let depStack = $state<DepView[]>([]);
+  const depView = $derived(depStack[depStack.length - 1] ?? null);
+
+  function depBack() {
+    if (depStack.length === 0) return false;
+    depStack = depStack.slice(0, -1);
+    return true;
+  }
+  /// 左右两栏的宽度比例（%），拖动中间的竖条调节。
+  let depSplit = $state(46);
+
+  async function openDep(dep: RefDetail) {
+    resetDepFilters();
+    void tick().then(() => {
+      if (depRightEl) depRightEl.scrollTop = 0;
+    });
+    depWiki = null;
+    void api
+      .wikiLink(dep.source === "CurseForge" ? "curseforge" : "modrinth", dep.slug)
+      .then((url) => {
+        if (depView?.dep.id === dep.id) depWiki = url;
+      })
+      .catch(() => {});
+    depStack = [...depStack, { dep, versions: [], loading: true }];
+    try {
+      const versions =
+        dep.source === "CurseForge"
+          ? await api.curseforgeVersions(dep.id)
+          : await api.modrinthVersions(dep.id);
+      const last = depStack[depStack.length - 1];
+      if (last?.dep.id === dep.id) depStack = [...depStack.slice(0, -1), { dep, versions, loading: false }];
+    } catch {
+      const last = depStack[depStack.length - 1];
+      if (last?.dep.id === dep.id) depStack = [...depStack.slice(0, -1), { dep, versions: [], loading: false }];
+    }
+  }
+
+  /// 前置弹窗里的筛选（放在左栏底部）与右栏风琴的展开状态。
+  let depGame = $state("all");
+  let depLoader = $state("all");
+  let depEnv = $state("all");
+  let depOpen = $state<Record<string, boolean>>({});
+  /// 前置的 MC 百科词条（有才显示「转到 MC 百科」）。
+  let depWiki = $state<string | null>(null);
+  let depRightEl: HTMLElement | null = null;
+
+  /// 把前置包成项目对象，复用主详情那一排按钮（收藏、复制链接都要 MrProject）。
+  function depProject(dep: RefDetail): MrProject {
+    return {
+      id: dep.id,
+      slug: dep.slug,
+      title: dep.title,
+      description: dep.description,
+      iconUrl: dep.icon,
+      downloads: dep.downloads,
+      author: "",
+      categories: [],
+      projectType: "mod",
+      loaders: [],
+      gameVersions: [],
+      chineseTitle: null
+    };
+  }
+
+  const depGames = $derived.by(() => {
+    const set = new Set<string>();
+    for (const item of depView?.versions ?? []) {
+      for (const version of item.gameVersions ?? []) set.add(version);
+    }
+    return [...set].sort((a, b) => -compareVersionName(a, b));
+  });
+  const depLoaders = $derived.by(() => {
+    const set = new Set<string>();
+    for (const item of depView?.versions ?? []) {
+      for (const loader of item.loaders ?? []) set.add(loader);
+    }
+    return [...set].sort((a, b) => loaderRank(a) - loaderRank(b) || a.localeCompare(b));
+  });
+
+  /// 右栏的文件按「游戏版本 + 加载器」分块，块内按发布时间从新到旧。
+  const depBlocks = $derived.by(() => {
+    const map = new Map<string, { key: string; title: string; version: string; loader: string | null; files: FileVersion[] }>();
+    for (const item of depView?.versions ?? []) {
+      if (depLoader !== "all" && !(item.loaders ?? []).includes(depLoader)) continue;
+      if (depGame !== "all" && !(item.gameVersions ?? []).includes(depGame)) continue;
+      if (depEnv !== "all" && !fileSupports(item, depEnv as EnvironmentFilter)) continue;
+      const version = (item.gameVersions ?? [])[depGame === "all" ? 0 : 0] ?? "";
+      const loaders = item.loaders ?? [];
+      const combos: (string | null)[] = loaders.length > 0 ? [...new Set(loaders)] : [null];
+      for (const loader of combos) {
+        const key = `${version}|${loader ?? ""}`;
+        let block = map.get(key);
+        if (!block) {
+          block = {
+            key,
+            title: loader ? `${loaderName(loader)} ${version}` : version,
+            version,
+            loader,
+            files: []
+          };
+          map.set(key, block);
+        }
+        if (!block.files.some((file) => file.id === item.id)) block.files.push(item);
+      }
+    }
+    const list = [...map.values()];
+    for (const block of list) {
+      block.files.sort((a, b) => (b.datePublished ?? "").localeCompare(a.datePublished ?? ""));
+    }
+    return list.sort(
+      (a, b) => compareVersionName(a.version, b.version) || loaderRank(a.loader) - loaderRank(b.loader)
+    );
+  });
+
+  /// 每次打开新的前置，筛选与展开状态都重置。
+  function resetDepFilters() {
+    depGame = "all";
+    depLoader = "all";
+    depEnv = "all";
+    depOpen = {};
+  }
+
+  function depGutterDown(event: PointerEvent) {
+    const handle = event.currentTarget as HTMLElement;
+    const sheet = handle.parentElement;
+    if (!sheet) return;
+    const rect = sheet.getBoundingClientRect();
+    const move = (moveEvent: PointerEvent) => {
+      const percent = ((moveEvent.clientX - rect.left) / rect.width) * 100;
+      depSplit = Math.min(72, Math.max(24, percent));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
+  /// 左侧改筛选，右侧跟着变；右侧自己改不回写左侧。
+  $effect(() => {
+    const nextGame = mrGame.trim() || null;
+    const nextLoader = mrLoader || null;
+    if (fileGame !== nextGame) fileGame = nextGame;
+    if (fileLoader !== nextLoader) fileLoader = nextLoader;
+  });
+
+  /// 返回键在前置详情里先退一级（前置 → 原模组详情），退完才离开下载页。
+  $effect(() => {
+    registerDetailBack(() => depBack());
+    return () => registerDetailBack(null);
+  });
+
+  function toggleBlock(key: string, block: FileBlock) {
+    const next = new Set(fileExpanded);
+    if (next.has(key)) next.delete(key);
+    else {
+      next.add(key);
+      void loadBlockDeps(block);
+    }
+    fileExpanded = next;
+  }
   const fileFlags = $derived(computeFlags(fileVersions.flatMap((item) => item.gameVersions)));
+  /// 详情头部的「最后更新」跟着当前选中的版本走。
+  const fileUpdated = $derived(pickedVersion()?.datePublished ?? "");
   const fileFilterOptions = $derived(buildFilters(fileVersions, fileFlags));
   /// 当前实例对应的加载器（`1.20.1-Forge_47.4.9` → forge）。
   const instanceLoader = $derived.by(() => {
@@ -1866,41 +2127,8 @@
     }
     return null;
   });
-  const fileGroups = $derived(
-    groupFiles(fileVersions, {
-      flags: fileFlags,
-      versionFilter: fileInstance,
-      loaderFilter: fileLoader,
-      environmentFilter: fileEnvironment,
-      ignoreQuilt: settings?.ignoreQuilt ?? false,
-      instance: selectedGame ?? null,
-      loader: instanceLoader
-    })
-  );
-  /// 左栏（搜索面板）的筛选条件，用来生成「符合左栏筛选」的那一组。
-  /// 加载器在文件里存的是小写 id，先换成显示的加载器名再比。
-  const leftFilters = $derived<LeftFilters>({
-    game: mrGame.trim() || null,
-    loader: mrLoader ? loaderName(mrLoader) : null
-  });
-  const leftTitle = $derived(leftFilterTitle(leftFilters));
-  const leftFiles = $derived(leftTitle ? filesMatchingLeft(fileVersions, leftFilters, fileFlags) : []);
-  /// 右栏三轴都是默认值时，才显示左栏那一组。
-  const showLeftGroup = $derived(
-    leftFiles.length > 0 &&
-      fileInstance === null &&
-      fileLoader === null &&
-      fileEnvironment === null
-  );
-  const fileTags = $derived(categoryTags(mrProject?.categories ?? []));
-  const fileUpdated = $derived(fileVersions[0]?.datePublished ?? "");
-
-  function toggleGroup(title: string) {
-    const next = new Set(fileExpanded);
-    if (next.has(title)) next.delete(title);
-    else next.add(title);
-    fileExpanded = next;
-  }
+  /// 每组是否点了「查看全部」；默认只显示前 15 条。
+  let groupAll = $state<Record<string, boolean>>({});
 
   async function copyText(text: string) {
     try {
@@ -1951,7 +2179,8 @@
     total: number;
   }
   const searchCache = new Map<string, SearchCacheEntry>();
-  const SEARCH_CACHE_MS = 5 * 60 * 1000;
+  // 搜索结果缓存 10 分钟：重复进同一个分类、来回切回来都不用重发请求。
+  const SEARCH_CACHE_MS = 10 * 60 * 1000;
 
   const mrVersionCache = new Map<string, MrVersion[]>();
 
@@ -1959,7 +2188,7 @@
   let depMeta = $state<Record<string, { title: string; slug: string; icon: string | null }>>({});
   let depInstalled = $state<string[]>([]);
   let pickedVersionId = $state<string | null>(null);
-  let depDialog = $state<DepItem[] | null>(null);
+  let depPrompt = $state<{ version: MrVersion; items: DepItem[] } | null>(null);
   let depBusy = $state(false);
 
   /// 连点两个项目时，只让最后一次的结果落地（Modrinth 全量版本可能好几十秒）。
@@ -2001,8 +2230,8 @@
   type DepItem = { id: string; title: string; slug: string; installed: boolean };
 
   /// 当前版本的必需前置（去重），带「本地是否已装」。
-  function requiredDeps(): DepItem[] {
-    const version = pickedVersion();
+  function requiredDeps(explicit?: MrVersion | null): DepItem[] {
+    const version = explicit ?? pickedVersion();
     if (!version) return [];
     const out: DepItem[] = [];
     for (const dep of version.dependencies ?? []) {
@@ -2040,16 +2269,42 @@
     });
   }
 
+  /// 点前置列表里的一条：切到它的详情页（带上已经取到的图标）。
+  function openRef(dep: RefDetail) {
+    if (!dep.slug) return;
+    void mrOpen({
+      id: dep.id,
+      slug: dep.slug,
+      title: dep.title,
+      description: dep.description,
+      iconUrl: dep.icon,
+      downloads: dep.downloads,
+      author: "",
+      categories: [],
+      projectType: "mod",
+      loaders: [],
+      gameVersions: [],
+      chineseTitle: null,
+    });
+  }
+
   /// 缺的前置里挑一个能装的版本（先按当前实例版本/加载器过滤）。
-  async function resolveDependencyFile(id: string): Promise<MrVersion | null> {
+  /// 前置版本必须跟「所点的那个文件」一致：同一个游戏版本、同一个加载器。
+  /// 之前这里用的是实例的加载器，Fabric 模组会被配成 NeoForge 的前置。
+  async function resolveDependencyFile(
+    id: string,
+    reference?: MrVersion | null
+  ): Promise<MrVersion | null> {
     try {
-      const list = await api.modrinthVersions(id, selectedGame, activeLoader());
-      const usable = list.filter(
-        (item) =>
-          (!selectedGame || item.gameVersions.includes(selectedGame)) &&
-          (item.loaders.length === 0 || !activeLoader() || item.loaders.includes(activeLoader() as string))
-      );
-      const pool = usable.length > 0 ? usable : list;
+      const game = reference?.gameVersions?.[0] ?? selectedGame;
+      const loader = reference?.loaders?.[0] ?? activeLoader();
+      const list = await api.modrinthVersions(id, game, loader);
+      const sameGame = (item: MrVersion) => !game || item.gameVersions.includes(game);
+      const sameLoader = (item: MrVersion) =>
+        !loader || item.loaders.length === 0 || item.loaders.includes(loader);
+      const exact = list.filter((item) => sameGame(item) && sameLoader(item));
+      const byLoader = list.filter((item) => sameLoader(item));
+      const pool = exact.length > 0 ? exact : byLoader.length > 0 ? byLoader : list;
       const sorted = [...pool].sort((a, b) => {
         const release = Number(b.versionType === "release") - Number(a.versionType === "release");
         return release !== 0 ? release : b.datePublished.localeCompare(a.datePublished);
@@ -2061,7 +2316,7 @@
   }
 
   /// 按设置处理刚装完的模组的缺失前置：0 弹窗、1 直接装、2 不管。
-  async function afterModDownload(version: MrVersion) {
+  async function afterModDownload(version: MrVersion, dir?: string) {
     if (cat !== "mods" || !version.dependencies?.length) return;
     const mode = settings?.missingDepsMode ?? 0;
     if (mode === 2) return;
@@ -2070,15 +2325,14 @@
     const missing = requiredDeps().filter((item) => !item.installed);
     if (missing.length === 0) return;
     if (mode === 0) {
-      depDialog = missing;
       return;
     }
     depBusy = true;
     try {
       for (const dep of missing) {
         if (!dep.slug) continue;
-        const file = await resolveDependencyFile(dep.id);
-        if (file) await mrDownload(file, true);
+        const file = await resolveDependencyFile(dep.id, version);
+        if (file) await mrDownload(file, true, dir);
       }
     } finally {
       depBusy = false;
@@ -2086,14 +2340,14 @@
   }
 
   /// 把缺的前置逐个装上（先挑兼容版本）。
-  async function installMissingDeps(list: DepItem[]) {
+  async function installMissingDeps(list: DepItem[], reference?: MrVersion | null, dir?: string) {
     const pending = list.filter((item) => !item.installed && item.slug);
     if (pending.length === 0) return;
     depBusy = true;
     try {
       for (const dep of pending) {
-        const file = await resolveDependencyFile(dep.id);
-        if (file) await mrDownload(file, true);
+        const file = await resolveDependencyFile(dep.id, reference);
+        if (file) await mrDownload(file, true, dir);
       }
     } finally {
       depBusy = false;
@@ -2106,12 +2360,21 @@
     const seq = ++mrOpenSeq;
     mrProject = project;
     mrVersions = [];
+    mrTranslation = null;
+    {
+      const source = isCurseForge(project) ? "curseforge" : "modrinth";
+      const id = project.id;
+      void api.projectTranslation(source, id).then((text) => {
+        if (mrProject?.id === id) mrTranslation = text;
+      });
+    }
     mrWiki = null;
     mrFilePage = 1;
-    fileInstance = null;
+    fileGame = null;
     fileLoader = null;
     fileEnvironment = null;
     fileExpanded = new Set();
+    groupAll = {};
     leftCollapsed = false;
     fileBusy = true;
     try {
@@ -2350,27 +2613,23 @@
     packTaskId = task.id;
   }
 
-  async function mrDownload(version: MrVersion, fromDependency = false) {
-    const dir = await prepareDir(targetDir(cat));
+  /// 系统保存对话框只弹一次：默认目录按落点规则算，用户在对话框里改到哪就下到哪。
+  async function pickSaveDir(version: MrVersion): Promise<string | null> {
+    const dir = await prepareDir(targetFor(version));
+    const picked = await saveDialog({
+      defaultPath: dir ? `${dir}\\${version.fileName}` : version.fileName,
+      filters: [{ name: "文件", extensions: [version.fileName.split(".").pop() ?? "jar"] }]
+    });
+    if (!picked) return null;
+    return picked.replace(/[\\/][^\\/]*$/, "");
+  }
+
+  /// 把一个文件下到指定目录，各自一张任务卡。
+  function downloadInto(version: MrVersion, dir: string, fromDependency = false) {
     const kind = CATEGORIES.find((item) => item.id === cat)?.label ?? cat;
     const title = `${kind} · ${mrProject?.title ?? "内容"} ${version.versionNumber}`;
-    const ask = settings?.askSaveLocation ?? true;
     announce(`已加入下载队列：${version.fileName}`);
-    const task = submitTask(title, dir, async () => {
-      if (ask) {
-        const written = await api.saveModrinth(
-          version.fileUrl,
-          version.fileName,
-          mrProject?.slug,
-          mrProject?.title,
-          settings?.fileNameFormat,
-          dir,
-          task.id
-        );
-        return written
-          ? { note: `已保存 ${baseName(written)}`, output: { path: written, kind: "file" as const } }
-          : "已取消保存";
-      }
+    submitTask(title, dir, async () => {
       const written = await api.modrinthDownload(
         version.fileUrl,
         dir,
@@ -2381,7 +2640,62 @@
       );
       return { note: `已保存 ${baseName(written)}`, output: { path: written, kind: "file" as const } };
     });
-    if (!fromDependency) void afterModDownload(version);
+    void fromDependency;
+  }
+
+  /// 点「下载」：先看这个文件缺哪些必需前置，缺就弹窗让你选「一起装 / 只装本体 / 取消」。
+  async function requestDownload(version: MrVersion) {
+    await loadDeps(version);
+    const missing = requiredDeps(version).filter((item) => !item.installed);
+    if (missing.length === 0) {
+      const dir = await pickSaveDir(version);
+      if (dir) downloadInto(version, dir);
+      return;
+    }
+    depPrompt = { version, items: missing };
+  }
+
+  async function confirmDownload(withDeps: boolean) {
+    const prompt = depPrompt;
+    if (!prompt) return;
+    depPrompt = null;
+    const dir = await pickSaveDir(prompt.version);
+    if (!dir) return;
+    downloadInto(prompt.version, dir);
+    if (!withDeps) return;
+    depBusy = true;
+    try {
+      for (const dep of prompt.items) {
+        const file = await resolveDependencyFile(dep.id, prompt.version);
+        if (file) downloadInto(file, dir, true);
+      }
+    } finally {
+      depBusy = false;
+      depInstalled = [];
+      await ensureInstalledMods();
+    }
+  }
+
+  /// 点整行的动作：整合包/世界走安装，其余按普通文件下载。
+  function rowAction(item: FileVersion) {
+    if (cat === "packs") {
+      if (settings?.modpackInstall ?? true) installPack(item);
+      return;
+    }
+    if (cat === "worlds") {
+      installWorld(item);
+      return;
+    }
+    void mrDownload(item);
+  }
+
+  async function mrDownload(version: MrVersion, fromDependency = false, forcedDir?: string) {
+    if (fromDependency) {
+      const dir = await prepareDir(forcedDir ?? targetFor(version));
+      downloadInto(version, dir, true);
+      return;
+    }
+    await requestDownload(version);
   }
 
   /// 世界一键安装：下载 zip，按设置解压进 `saves`，或者让你另存为（默认落在 `downloads`）。
@@ -2523,7 +2837,7 @@
   async function removeFavoriteFolder(folder: FavoriteFolder) {
     // 不用 window.confirm：WebView 里它不阻塞，会先执行删除再弹框。
     favConfirm = {
-      message: `删除收藏夹「${folder.name}」？（只删夹子，不影响已下载的文件）`,
+      message: `删除收藏夹「${folder.name}」？`,
       run: () => {
         void (async () => {
           favs = { ...favs, folders: favs.folders.filter((item) => item.id !== folder.id) };
@@ -2871,16 +3185,23 @@
     await mrOpen(project);
   }
 
-  function showRail(rail: Rail) {
+  async function showRail(rail: Rail) {
     saveFiltersFor(cat);
     cat = rail.kind;
-    mrProjects = rails[rail.id] ?? [];
+    mrProjects = [];
     mrProject = null;
     mrVersions = [];
     mrFilePage = 1;
-    // 集市卡片点进分类，按这一类的默认筛选重新开始，不沿用旧搜索词。
-    mrFilters[rail.kind] = defaultFilters(rail.kind);
+    // 这一排自己的排序要带过去：「新上架」是按最新，「最近更新」是按更新时间。
+    const base = defaultFilters(rail.kind);
+    base.sort = rail.sort;
+    mrFilters[rail.kind] = base;
     applyFiltersFor(rail.kind);
+    // 拉真正的一页结果：以前这里只把集市缓存的那 12 条摆上来，翻页和「查看全部」都是死的。
+    await ensurePage(1);
+    // 打开第一条，右边详情不空着。
+    const first = mrProjects[0];
+    if (first) void mrOpen(first);
   }
 
   async function pickFolder() {
@@ -2941,6 +3262,16 @@
   /// 免得「恢复上次状态」和用户点击同时改 cat/筛选，两边各跑一次加载。
   let restored = false;
   let pendingCategory: Category | null = null;
+
+  $effect(() => {
+    const current = cat;
+    void tick().then(() => {
+      const index = CATEGORIES.findIndex((item) => item.id === current);
+      const node = catButtons[index];
+      if (!node) return;
+      catThumb = { left: node.offsetLeft, width: node.offsetWidth, ready: true };
+    });
+  });
 
   async function switchCategory(id: Category) {
     if (!restored) {
@@ -3014,7 +3345,6 @@
           chineseTitle: stored.chineseTitle ?? null
         };
       await mrOpen(project);
-      if (saved.instance) fileInstance = saved.instance;
       if (saved.loaderFilter) fileLoader = saved.loaderFilter;
       if (saved.expanded?.length) fileExpanded = new Set(saved.expanded);
     }
@@ -3061,7 +3391,6 @@
       mrProject = null;
       mrVersions = [];
       mrFilePage = 1;
-      fileInstance = null;
       fileLoader = null;
       fileEnvironment = null;
       fileExpanded = new Set();
@@ -3211,7 +3540,6 @@
             chineseTitle: mrProject.chineseTitle
           }
         : null,
-      instance: fileInstance,
       loaderFilter: fileLoader,
       expanded: [...fileExpanded],
       scrollTop: listEl?.scrollTop ?? 0
@@ -3242,8 +3570,14 @@
   </header>
 
   <nav class="cats">
-    {#each CATEGORIES as item (item.id)}
+    <span
+      class="cats-thumb"
+      class:ready={catThumb.ready}
+      style="width: {catThumb.width}px; transform: translateX({catThumb.left}px)"
+    ></span>
+    {#each CATEGORIES as item, index (item.id)}
       <button
+        bind:this={catButtons[index]}
         class="cat"
         class:on={cat === item.id}
         onclick={() => void switchCategory(item.id)}>{item.label}</button
@@ -3257,12 +3591,7 @@
     <section class="list panel">
       <div class="tools">
         <input placeholder="搜索版本…" bind:value={query} />
-        <div class="segmented">
-          <button class:on={filter === "release"} onclick={() => (filter = "release")}>正式版</button>
-          <button class:on={filter === "snapshot"} onclick={() => (filter = "snapshot")}>快照</button>
-          <button class:on={filter === "fools"} onclick={() => (filter = "fools")}>愚人节</button>
-          <button class:on={filter === "all"} onclick={() => (filter = "all")}>全部</button>
-        </div>
+        <Segmented bind:value={filter} options={[{ value: "release", label: "正式版" }, { value: "snapshot", label: "快照" }, { value: "fools", label: "愚人节" }, { value: "all", label: "全部" }]} />
       </div>
 
       {#if loading}
@@ -3351,22 +3680,16 @@
               <span class="loader-state">正在拉取中…</span>
             {:else}
             <div class="picker-row">
-              <div class="seg" role="group" aria-label="{LOADER_NAME[kind]} 版本类型">
-                {#each [
-                  { mode: "all", text: "全部" },
-                  { mode: "stable", text: CHANNEL[kind].stable },
-                  { mode: "beta", text: CHANNEL[kind].beta }
-                ] as entry (entry.mode)}
-                  <button
-                    class="seg-btn"
-                    class:on={(typeFilter[kind] ?? "all") === entry.mode}
-                    onclick={() => setFilter(kind, entry.mode as "all" | "stable" | "beta")}
-                    disabled={false}
-                  >
-                    {entry.text}
-                  </button>
-                {/each}
-              </div>
+              <Segmented
+                ariaLabel={`${LOADER_NAME[kind]} 版本类型`}
+                value={typeFilter[kind] ?? "all"}
+                options={[
+                  { value: "all", label: "全部" },
+                  { value: "stable", label: CHANNEL[kind].stable },
+                  { value: "beta", label: CHANNEL[kind].beta }
+                ]}
+                onchange={(next) => setFilter(kind, next as "all" | "stable" | "beta")}
+              />
               <div class="select">
                 <button
                   class="select-btn"
@@ -3425,29 +3748,30 @@
           </p>
         {/if}
 
-        {#if extraMods.length > 0}
+        {#if chosen.includes("cleanroom") && extras.length > 0}
           <div class="extra-mods">
-            {#each extraMods as mod (mod.id)}
-              <div class="field">
-                <span class="label">{mod.name}</span>
+            {#each extras as mod (mod.key)}
+              {@const blocked = CLEANROOM_EXCLUSIVE.includes(mod.key) && CLEANROOM_EXCLUSIVE.some((other) => other !== mod.key && extraPicked[other])}
+              <div class="field" class:dimmed={blocked}>
+                <span class="label">{mod.label}</span>
                 <Dropdown
-                  value={extraPicked[mod.id] ?? ""}
-                  placeholder="选择版本"
-                  label={mod.name}
-                  disabled={extraBusy}
-                  onchange={(picked) => (extraPicked[mod.id] = picked)}
-                  options={(extraVersions[mod.id] ?? []).map((version) => ({
-                    value: version.id,
-                    label: `${version.versionNumber} · ${version.gameVersions[0] ?? ""} · ${version.datePublished.slice(0, 10)}`
-                  }))}
+                  value={extraPicked[mod.key] ?? ""}
+                  label={mod.label}
+                  disabled={extraBusy || blocked}
+                  onchange={(file) => pickExtra(mod.key, file)}
+                  options={[
+                    { value: "", label: "不下载" },
+                    ...mod.versions.map((version) => ({
+                      value: String(version.file),
+                      label: `${version.version} · ${version.fileName} · ${(version.size / 1048576).toFixed(1)} MB`
+                    }))
+                  ]}
                 />
-                {#if extraBusy && !extraVersions[mod.id]}
-                  <p class="hint">正在读取版本列表…</p>
-                {:else if (extraVersions[mod.id] ?? []).length === 0}
-                  <p class="hint error">CurseForge 上没有 1.12.2 的版本，装好后可以手动补。</p>
-                {/if}
               </div>
             {/each}
+            {#if extraBusy && extras.length === 0}
+              <p class="hint">正在读取版本列表…</p>
+            {/if}
           </div>
         {/if}
 
@@ -3511,7 +3835,7 @@
             <section class="rail">
               <header class="rail-head">
                 <h3>{rail.title}</h3>
-                <button class="rail-more" onclick={() => showRail(rail)}>查看全部 →</button>
+                <button class="rail-more" onclick={() => void showRail(rail)}>查看全部 →</button>
               </header>
               <div class="rail-track">
                 {#each rails[rail.id] as item (item.id)}
@@ -3682,14 +4006,6 @@
               if (event.key === "Enter") void mrSearch();
             }}
           />
-          {#if cat !== "packs"}
-            <Dropdown
-              value={chosenInstance(cat as Category)}
-              label="下载到"
-              onchange={(value) => setDirPick(cat as Category, value)}
-              options={dirOptions}
-            />
-          {/if}
           <div class="filters">
             <Dropdown
               value={cat === "worlds" ? "curseforge" : mrSource}
@@ -3795,7 +4111,7 @@
         {/if}
         {#if mrProjects.length > 0}
           <p class="dim small">
-            共 {mrTotal} 个结果 · 每页 {mrPageSize} 条 · 第 {mrPage} / {mrPageCount} 页
+            共 {Math.max(mrTotal, mrProjects.length)} 个结果 · 每页 {mrPageSize} 条 · 第 {mrPage} / {mrPageCount} 页
           </p>
         {/if}
         {#if listHint}
@@ -3870,12 +4186,6 @@
                   <span class="comp-sub">{project.title}</span>
                 {/if}
               </div>
-              <div class="comp-line">
-                {#each fileTags as tag (tag)}
-                  <span class="comp-tag">{tag}</span>
-                {/each}
-                <span class="comp-desc">{project.description}</span>
-              </div>
               <div class="comp-meta">
                 {#if supportText(project)}
                   <span class="comp-support">{supportText(project)}</span>
@@ -3888,6 +4198,10 @@
               </div>
             </div>
           </header>
+
+          {#if mrTranslation}
+            <p class="comp-desc-line">{mrTranslation}</p>
+          {/if}
 
           {#if fileBusy && mrVersions.length === 0}
             <p class="dim small">
@@ -3907,121 +4221,182 @@
             <button class="btn ghost" onclick={() => openFavPick(project)}>☆ 收藏</button>
           </div>
 
-          {#if fileFilterOptions.loaders.length > 0 || fileFilterOptions.hasEnvironments || fileFilterOptions.gameVersions.length > 0}
-            <div class="filter-card">
-              {#if fileFilterOptions.loaders.length > 0 || fileFilterOptions.hasEnvironments}
-                <div class="filter-split">
-                  {#if fileFilterOptions.loaders.length > 0}
-                    <div class="filter-row">
-                      <span class="filter-label">加载器：</span>
-                      <button class="chip" class:on={fileLoader === null} onclick={() => (fileLoader = null)}>
-                        全部
-                      </button>
-                      {#each fileFilterOptions.loaders as name (name)}
-                        <button
-                          class="chip"
-                          class:on={fileLoader === name}
-                          onclick={() => (fileLoader = fileLoader === name ? null : name)}
-                        >
-                          {name}
-                        </button>
-                      {/each}
-                    </div>
-                  {/if}
-                  {#if fileFilterOptions.hasEnvironments}
-                    <div class="filter-row">
-                      <span class="filter-label">客户端/服务端：</span>
-                      <button class="chip" class:on={fileEnvironment === null} onclick={() => (fileEnvironment = null)}>
-                        全部
-                      </button>
-                      {#each ["client", "server", "both"] as value (value)}
-                        <button
-                          class="chip"
-                          class:on={fileEnvironment === value}
-                          onclick={() => (fileEnvironment = fileEnvironment === value ? null : (value as EnvironmentFilter))}
-                        >
-                          {environmentLabel(value as EnvironmentFilter)}
-                        </button>
-                      {/each}
-                    </div>
-                  {/if}
-                </div>
-              {/if}
-              {#if fileFilterOptions.gameVersions.length > 0}
-                <div class="filter-row">
-                  <span class="filter-label">游戏版本：</span>
-                  <button class="chip" class:on={fileInstance === null} onclick={() => (fileInstance = null)}>
-                    全部
-                  </button>
-                  {#each fileFilterOptions.gameVersions as name (name)}
-                    <button
-                      class="chip"
-                      class:on={fileInstance === name}
-                      onclick={() => (fileInstance = fileInstance === name ? null : name)}
-                    >
-                      {name}
-                    </button>
-                  {/each}
-                </div>
-              {/if}
-            </div>
-          {/if}
-
-          {#if cat === "mods" && mrProject}
-            {@const deps = requiredDeps()}
-            {#if deps.length > 0}
-              <section class="dep-card">
-                <div class="dep-head">
-                  前置{pickedVersion() ? `（${pickedVersion()?.versionNumber}）` : ""}
-                  {#if isCurseForge(mrProject)}<span class="dep-note">按最新版</span>{/if}
-                </div>
-                <div class="dep-list">
-                  {#each deps as dep (dep.id)}
-                    <button class="dep-item" onclick={() => openDependency(dep)}>
-                      <span class="dep-name">{dep.title}</span>
-                      <span class="dep-state" class:on={dep.installed}>{dep.installed ? "已装" : "未装"}</span>
-                    </button>
-                  {/each}
-                </div>
-                {#if deps.some((dep) => !dep.installed)}
-                  <button class="btn tiny" onclick={() => void installMissingDeps(deps)} disabled={depBusy}>
-                    下载缺失前置
-                  </button>
-                {/if}
-              </section>
-            {/if}
-          {/if}
-
-          {#if depDialog}
-            <div class="dep-backdrop" role="presentation" onclick={() => (depDialog = null)}>
+          {#if depPrompt}
+            <div class="dep-backdrop" role="presentation" onclick={() => (depPrompt = null)}>
               <div class="dep-modal" role="dialog" onclick={(event) => event.stopPropagation()}>
-                <h3>这个模组需要前置</h3>
-                <p>还缺 {depDialog.length} 个前置，要一起装上吗？</p>
+                <h3>需要前置</h3>
                 <ul class="dep-modal-list">
-                  {#each depDialog as dep (dep.id)}
-                    <li>{dep.title}</li>
+                  {#each depPrompt.items as dep (dep.id)}
+                    <li>
+                      <span class="dep-name">{dep.title}</span>
+                      <span class="dep-state">未安装</span>
+                    </li>
                   {/each}
                 </ul>
                 <div class="dep-modal-actions">
-                  <button class="btn" onclick={() => { const list = depDialog ?? []; depDialog = null; void installMissingDeps(list); }}>
-                    一起装
-                  </button>
-                  <button class="btn ghost" onclick={() => (depDialog = null)}>不装前置</button>
-                  <button class="btn ghost" onclick={() => (depDialog = null)}>取消</button>
+                  <button class="btn" onclick={() => void confirmDownload(true)}>一起装</button>
+                  <button class="btn ghost" onclick={() => void confirmDownload(false)}>只装本体</button>
+                  <button class="btn ghost" onclick={() => (depPrompt = null)}>取消</button>
                 </div>
               </div>
             </div>
           {/if}
 
-          {#snippet versionRows(items: FileVersion[])}
+          {#if depView}
+            <div class="dep-backdrop" role="presentation" onclick={() => depBack()}>
+              <div
+                class="dep-sheet"
+                style="--dep-split: {depSplit}%"
+                role="dialog"
+                aria-label={depView.dep.title}
+                onclick={(event) => event.stopPropagation()}
+              >
+                <section class="dep-left">
+                  <header class="dep-head">
+                    {#if depView.dep.icon}
+                      <img class="dep-icon-lg" src={depView.dep.icon} alt="" />
+                    {:else}
+                      <span class="dep-icon-lg"></span>
+                    {/if}
+                    <div class="dep-head-text">
+                      <h3>{depView.dep.title}</h3>
+                      <span class="dep-from">{depView.dep.source}</span>
+                    </div>
+                  </header>
+                  <p class="dep-desc">{depView.dep.description}</p>
+                  <div class="dep-stats">
+                    <span>↓ {formatCount(depView.dep.downloads)}</span>
+                    {#if depView.dep.updated}
+                      <span>↑ {depView.dep.updated.slice(0, 10)}</span>
+                    {/if}
+                  </div>
+                  <div class="dep-filters">
+                    <label class="dep-filter">
+                      <span>游戏版本</span>
+                      <Dropdown
+                        value={depGame}
+                        label="游戏版本"
+                        onchange={(value) => (depGame = value)}
+                        options={[
+                          { value: "all", label: "全部" },
+                          ...depGames.map((name) => ({ value: name, label: name }))
+                        ]}
+                      />
+                    </label>
+                    <label class="dep-filter">
+                      <span>加载器</span>
+                      <Dropdown
+                        value={depLoader}
+                        label="加载器"
+                        onchange={(value) => (depLoader = value)}
+                        options={[
+                          { value: "all", label: "全部" },
+                          ...depLoaders.map((name) => ({ value: name, label: loaderName(name) }))
+                        ]}
+                      />
+                    </label>
+                    <label class="dep-filter">
+                      <span>客户端/服务端</span>
+                      <Dropdown
+                        value={depEnv}
+                        label="客户端/服务端"
+                        onchange={(value) => (depEnv = value)}
+                        options={[
+                          { value: "all", label: "全部" },
+                          { value: "client", label: "客户端" },
+                          { value: "server", label: "服务端" },
+                          { value: "both", label: "双端" }
+                        ]}
+                      />
+                    </label>
+                  </div>
+                  <div class="dep-actions">
+                    <button class="btn ghost" onclick={() => void api.openUrl(projectUrl(depProject(depView!.dep)))}>
+                      {depView!.dep.source}
+                    </button>
+                    {#if depWiki}
+                      <button class="btn ghost" onclick={() => void api.openUrl(depWiki ?? "")}>转到 MC 百科</button>
+                    {/if}
+                    <button class="btn ghost" onclick={() => copyText(depView!.dep.title)}>复制名称</button>
+                    <button class="btn ghost" onclick={() => copyText(projectUrl(depProject(depView!.dep)))}>
+                      复制链接
+                    </button>
+                    <button class="btn ghost" onclick={() => openFavPick(depProject(depView!.dep))}>☆ 收藏</button>
+                  </div>
+                </section>
+                <div
+                  class="dep-gutter"
+                  role="separator"
+                  aria-orientation="vertical"
+                  onpointerdown={depGutterDown}
+                ></div>
+                <section class="dep-right" bind:this={depRightEl}>
+                  {#if depView.loading}
+                    <p class="dim small">正在读取文件列表…</p>
+                  {:else if depView.versions.length === 0}
+                    <p class="dim small">没有可用的文件。</p>
+                  {:else}
+                    {#if depBlocks.length === 0}
+                      <p class="dim small">没有符合这些条件的文件。</p>
+                    {:else}
+                      {#each depBlocks as block (block.key)}
+                        <section class="group-card">
+                          <button
+                            class="group-head"
+                            onclick={() => (depOpen = { ...depOpen, [block.key]: !depOpen[block.key] })}
+                          >
+                            <span class="group-title">{block.title}</span>
+                            <span class="group-count">{block.files.length}</span>
+                            <svg
+                              class="group-arrow"
+                              class:open={depOpen[block.key]}
+                              viewBox="0 0 24 24"
+                              width="16"
+                              height="16"
+                              aria-hidden="true"
+                            >
+                              <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                            </svg>
+                          </button>
+                          {#if depOpen[block.key]}
+                            <ul class="mr-versions">
+                              {#each block.files as item (item.id)}
+                                <li onclick={() => void mrDownload(item)}>
+                                  <div class="mr-version-text">
+                                    <span class="mr-title">{item.versionNumber}</span>
+                                    <span class="mr-desc">{item.name}</span>
+                                    <span class="mr-meta">
+                                      {item.gameVersions.slice(0, 4).join(" / ")}{item.loaders.length > 0
+                                        ? ` · ${item.loaders.map(loaderName).join(" / ")}`
+                                        : ""}{item.fileSize > 0 ? ` · ${formatSize(item.fileSize)}` : ""}{item.datePublished
+                                        ? ` · ${item.datePublished.slice(0, 10)}`
+                                        : ""}
+                                    </span>
+                                  </div>
+                                </li>
+                              {/each}
+                            </ul>
+                          {/if}
+                        </section>
+                      {/each}
+                    {/if}
+                  {/if}
+                </section>
+              </div>
+            </div>
+          {/if}
+
+          {#snippet versionRows(items: FileVersion[], key: string)}
+            {@const shown = items}
             <ul class="mr-versions">
-              {#each items as item (item.id)}
-                <li class:active={pickedVersionId === item.id}>
+              {#each shown as item (item.id)}
+                <li class:active={pickedVersionId === item.id} onclick={() => rowAction(item)}>
                   <div
                     class="mr-version-text"
                     role="button"
                     tabindex="0"
-                    onclick={() => {
+                    onclick={(event) => {
+                      event.stopPropagation();
                       pickedVersionId = item.id;
                       void loadDeps(item);
                     }}
@@ -4036,63 +4411,106 @@
                     {/if}
                   </div>
                   {#if cat === "packs" && (settings?.modpackInstall ?? true)}
-                    <button class="btn" onclick={() => installPack(item)} disabled={mrBusy}>安装</button>
+                    <button class="btn" onclick={(event) => { event.stopPropagation(); installPack(item); }} disabled={mrBusy}>安装</button>
                   {:else if cat === "worlds"}
-                    <button class="btn" onclick={() => installWorld(item)} disabled={mrBusy}>
+                    <button class="btn" onclick={(event) => { event.stopPropagation(); installWorld(item); }} disabled={mrBusy}>
                       {(settings?.worldExtract ?? true) ? "安装" : "下载"}
                     </button>
-                  {:else}
-                    <button class="btn" onclick={() => void mrDownload(item)} disabled={mrBusy}>下载</button>
                   {/if}
                 </li>
               {/each}
             </ul>
           {/snippet}
 
-          {#if showLeftGroup && leftTitle}
-            <section class="group-card">
-              <button class="group-head" onclick={() => (leftCollapsed = !leftCollapsed)}>
-                <span class="group-title">{leftTitle}</span>
-                <svg class="group-arrow" class:open={!leftCollapsed} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-                  <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              {#if !leftCollapsed}
-                {@render versionRows(leftFiles)}
-              {/if}
-            </section>
+          <div class="filter-card">
+            <div class="filter-row">
+              <span class="filter-pair">
+                <span class="filter-label">游戏版本：</span>
+                <Dropdown
+                  value={fileGame ?? "all"}
+                  label="游戏版本"
+                  onchange={(value) => (fileGame = value === "all" ? null : value)}
+                  options={[
+                    { value: "all", label: "全部" },
+                    ...fileGameChoices.map((name) => ({ value: name, label: name }))
+                  ]}
+                />
+              </span>
+              <span class="filter-pair">
+                <span class="filter-label">加载器：</span>
+                <Dropdown
+                  value={fileLoader ?? "all"}
+                  label="加载器"
+                  onchange={(value) => (fileLoader = value === "all" ? null : value)}
+                  options={[
+                    { value: "all", label: "全部" },
+                    ...fileLoaderChoices.map((name) => ({ value: name, label: loaderName(name) }))
+                  ]}
+                />
+              </span>
+              <span class="filter-pair">
+                <span class="filter-label">客户端/服务端：</span>
+                <Dropdown
+                  value={fileEnvironment ?? "all"}
+                  label="客户端/服务端"
+                  onchange={(value) => (fileEnvironment = value === "all" ? null : (value as EnvironmentFilter))}
+                  options={[
+                    { value: "all", label: "全部" },
+                    { value: "client", label: "客户端" },
+                    { value: "server", label: "服务端" },
+                    { value: "both", label: "双端" }
+                  ]}
+                />
+              </span>
+            </div>
+          </div>
+
+          {#if shownBlocks.length === 0}
+            <p class="dim small">没有符合这些条件的文件。</p>
+          {:else}
+            {#each shownBlocks as block (block.key)}
+              <section class="group-card">
+                <button class="group-head" onclick={() => toggleBlock(block.key, block)}>
+                  <span class="group-title">{block.title}</span>
+                  <span class="group-count">{block.files.length}</span>
+                  <svg class="group-arrow" class:open={fileExpanded.has(block.key)} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                    <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </button>
+                {#if fileExpanded.has(block.key)}
+                  {#if (blockDeps[block.key] ?? []).length > 0}
+                    <div class="block-deps">
+                      <p class="block-deps-head">前置资源</p>
+                      <ul class="block-deps-list">
+                        {#each blockDeps[block.key] as dep (dep.id)}
+                          <li
+                            class="block-dep"
+                            role="button"
+                            tabindex="0"
+                            onclick={() => void openDep(dep)}
+                          >
+                            {#if dep.icon}
+                              <img class="block-dep-icon" src={dep.icon} alt="" loading="lazy" />
+                            {:else}
+                              <span class="block-dep-icon"></span>
+                            {/if}
+                            <div class="block-dep-main">
+                              <span class="block-dep-name">{dep.title}</span>
+                              <span class="block-dep-desc">{dep.description}</span>
+                            </div>
+                            <span class="block-dep-stat">↓ {formatCount(dep.downloads)}</span>
+                            <span class="block-dep-stat">↑ {dep.updated.slice(0, 10)}</span>
+                            <span class="block-dep-source">{dep.source}</span>
+                          </li>
+                        {/each}
+                      </ul>
+                    </div>
+                  {/if}
+                  {@render versionRows(block.files, block.key)}
+                {/if}
+              </section>
+            {/each}
           {/if}
-
-
-          {#if fileGroups.selected}
-            {@const picked = fileGroups.selected}
-            <section class="group-card">
-              <button class="group-head" onclick={() => toggleGroup(picked.title)}>
-                <span class="group-title">{picked.title}</span>
-                <svg class="group-arrow" class:open={fileExpanded.has(picked.title)} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-                  <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              {#if fileExpanded.has(picked.title)}
-                {@render versionRows(picked.files)}
-              {/if}
-            </section>
-          {/if}
-
-          {#each fileGroups.groups as group (group.title)}
-            <section class="group-card">
-              <button class="group-head" onclick={() => toggleGroup(group.title)}>
-                <span class="group-title">{group.title}</span>
-                <svg class="group-arrow" class:open={fileExpanded.has(group.title)} viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-                  <path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-              {#if fileExpanded.has(group.title)}
-                {@render versionRows(group.files)}
-              {/if}
-            </section>
-          {/each}
-
         {/if}
       </section>
     </div>
@@ -4123,12 +4541,7 @@
       </section>
 
       <section class="detail panel pkg-form">
-        <div class="segmented">
-          <button class:on={pkgFilter === "release"} onclick={() => pickPkgFilter("release")}>正式版</button>
-          <button class:on={pkgFilter === "snapshot"} onclick={() => pickPkgFilter("snapshot")}>快照</button>
-          <button class:on={pkgFilter === "fools"} onclick={() => pickPkgFilter("fools")}>愚人节</button>
-          <button class:on={pkgFilter === "all"} onclick={() => pickPkgFilter("all")}>全部</button>
-        </div>
+        <Segmented bind:value={pkgFilter} options={[{ value: "release", label: "正式版" }, { value: "snapshot", label: "快照" }, { value: "fools", label: "愚人节" }, { value: "all", label: "全部" }]} />
 
         <label class="field">
           <span class="label">游戏版本</span>
@@ -4331,6 +4744,25 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+    position: relative;
+  }
+  /* 会滑动的绿色底片：位置和宽度由当前按钮决定，切换分类时左右移动。 */
+  .cats-thumb {
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    left: 0;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--yb-green) 24%, transparent);
+    border: 1px solid color-mix(in srgb, var(--yb-green) 40%, transparent);
+    pointer-events: none;
+    opacity: 0;
+  }
+  .cats-thumb.ready {
+    opacity: 1;
+    transition:
+      transform 0.2s cubic-bezier(0.2, 0.7, 0.3, 1),
+      width 0.2s cubic-bezier(0.2, 0.7, 0.3, 1);
   }
   .cat {
     padding: 5px 14px;
@@ -4347,8 +4779,8 @@
     color: var(--text);
   }
   .cat.on {
-    background: color-mix(in srgb, var(--yb-green) 26%, transparent);
-    border-color: color-mix(in srgb, var(--yb-green) 45%, transparent);
+    background: transparent;
+    border-color: transparent;
     color: var(--text);
   }
   .row-line {
@@ -4547,7 +4979,7 @@
     gap: 4px;
     padding: 14px;
     border-radius: var(--radius-md);
-    background: linear-gradient(160deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.03));
+    background: linear-gradient(160deg, var(--line-soft), var(--tint-1));
     border: 1px solid var(--border);
     text-align: left;
     min-height: 132px;
@@ -4634,7 +5066,7 @@
     margin-bottom: 4px;
   }
   .card-icon.placeholder {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--line-soft);
   }
   .card-title {
     font-size: 13px;
@@ -4740,7 +5172,7 @@
     padding: 8px 12px;
     border-top: 1px solid var(--border);
     background: color-mix(in srgb, var(--surface) 88%, transparent);
-    backdrop-filter: blur(8px);
+    backdrop-filter: var(--glass-8);
   }
   .fav-batch-actions {
     display: flex;
@@ -4847,6 +5279,9 @@
     gap: 10px;
     margin: 2px 0 4px;
   }
+  .extra-mods .field.dimmed {
+    opacity: 0.45;
+  }
   .chip {
     padding: 4px 10px;
     border-radius: 999px;
@@ -4867,7 +5302,7 @@
   }
   .mr-warn {
     font-size: 11px;
-    color: #f0c46a;
+    color: var(--warn-text);
   }
   .empty-cat {
     display: flex;
@@ -4905,7 +5340,7 @@
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: 320px minmax(0, 1fr);
+    grid-template-columns: 300px minmax(0, 1fr);
     /* 行高必须确定，子面板才能靠 flex 撑出滚动区域 */
     grid-template-rows: minmax(0, 1fr);
     gap: 12px;
@@ -4921,16 +5356,7 @@
     padding: 16px;
     overflow-y: auto;
   }
-  .pkg-form .segmented {
-    flex: none;
-    align-self: flex-start;
-    width: auto;
-  }
   /* 一行四个小按钮，别拉满整行 */
-  .pkg-form .segmented button {
-    flex: 0 0 auto;
-    padding: 4px 16px;
-  }
   .pkg-form .pkg-foot {
     margin-top: auto;
   }
@@ -4972,28 +5398,6 @@
   }
   input,
   input:focus,
-  .segmented {
-    display: flex;
-    gap: 4px;
-    padding: 3px;
-    border-radius: var(--radius-sm);
-    background: rgba(0, 0, 0, 0.3);
-  }
-  .segmented button {
-    flex: 1;
-    padding: 5px 8px;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text-dim);
-    font: inherit;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .segmented button.on {
-    background: rgba(255, 255, 255, 0.12);
-    color: var(--text);
-  }
   .chips {
     display: flex;
     flex-wrap: wrap;
@@ -5003,7 +5407,7 @@
     padding: 5px 12px;
     border-radius: 999px;
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--tint-1);
     color: var(--text-dim);
     font: inherit;
     font-size: 12px;
@@ -5028,7 +5432,7 @@
     padding: 8px 12px;
     border: 1px solid var(--border);
     border-radius: 10px;
-    background: rgba(8, 10, 14, 0.35);
+    background: var(--wall-chip, rgba(8, 10, 14, 0.35));
   }
   .loader-retry {
     justify-self: start;
@@ -5045,13 +5449,13 @@
     display: inline-flex;
     padding: 3px;
     border-radius: 10px;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: var(--tint-1);
+    border: 1px solid var(--tint-3);
   }
   .seg-btn {
     border: 0;
     background: transparent;
-    color: rgba(255, 255, 255, 0.62);
+    color: var(--text-4);
     font: inherit;
     font-size: 12px;
     padding: 5px 12px;
@@ -5062,9 +5466,9 @@
     color: #fff;
   }
   .seg-btn.on {
-    background: rgba(255, 255, 255, 0.16);
+    background: var(--line);
     color: #fff;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    box-shadow: inset 0 1px 0 var(--line);
   }
   .seg-btn:disabled {
     cursor: default;
@@ -5081,8 +5485,8 @@
     width: 100%;
     padding: 8px 12px;
     border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--line);
+    background: var(--tint-2);
     color: #fff;
     font: inherit;
     font-size: 13px;
@@ -5090,12 +5494,12 @@
     cursor: pointer;
   }
   .select-btn.empty {
-    color: rgba(255, 255, 255, 0.45);
+    color: var(--glint-strong);
     border-style: dashed;
   }
   .select-btn:hover:not(:disabled) {
-    border-color: rgba(255, 255, 255, 0.28);
-    background: rgba(255, 255, 255, 0.09);
+    border-color: var(--line-strong);
+    background: var(--line-soft);
   }
   .select-version {
     flex: 1;
@@ -5104,12 +5508,12 @@
     white-space: nowrap;
   }
   .select-date {
-    color: rgba(255, 255, 255, 0.55);
+    color: var(--text-3);
     font-size: 12px;
     font-variant-numeric: tabular-nums;
   }
   .select-caret {
-    color: rgba(255, 255, 255, 0.5);
+    color: var(--text-3);
     font-size: 11px;
   }
   .menu {
@@ -5122,14 +5526,14 @@
     overflow-y: auto;
     padding: 6px;
     border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.16);
+    border: 1px solid var(--line);
     /* 毛玻璃：半透明面板 + 背景模糊 + 内高光，和 Dropdown 组件同一套材质 */
     background: rgba(24, 30, 22, 0.78);
-    backdrop-filter: blur(22px) saturate(1.7);
-    -webkit-backdrop-filter: blur(22px) saturate(1.7);
+    backdrop-filter: var(--glass-22);
+    -webkit-backdrop-filter: var(--glass-22);
     box-shadow:
       0 18px 40px rgba(0, 0, 0, 0.42),
-      inset 0 1px 0 rgba(255, 255, 255, 0.16);
+      inset 0 1px 0 var(--line);
     animation: menu-in 0.14s ease;
   }
   @keyframes menu-in {
@@ -5151,14 +5555,14 @@
     border: 0;
     border-radius: 8px;
     background: transparent;
-    color: rgba(255, 255, 255, 0.86);
+    color: var(--text);
     font: inherit;
     font-size: 13px;
     text-align: left;
     cursor: pointer;
   }
   .menu-item:hover {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--tint-3);
   }
   .menu-item.on {
     background: rgba(120, 180, 255, 0.22);
@@ -5171,13 +5575,13 @@
     white-space: nowrap;
   }
   .menu-date {
-    color: rgba(255, 255, 255, 0.5);
+    color: var(--text-3);
     font-size: 12px;
     font-variant-numeric: tabular-nums;
   }
   .menu-empty {
     margin: 6px 10px;
-    color: rgba(255, 255, 255, 0.5);
+    color: var(--text-3);
     font-size: 12px;
   }
   input.warn {
@@ -5210,7 +5614,7 @@
     cursor: pointer;
   }
   .row:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--tint-2);
   }
   .row.active {
     background: rgba(127, 163, 94, 0.2);
@@ -5242,15 +5646,15 @@
   }
   .kind.snapshot {
     color: var(--text-dim);
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--tint-1);
   }
   .kind.beta {
-    color: #f0c674;
+    color: var(--warn-text);
     border-color: rgba(240, 198, 116, 0.4);
     background: rgba(240, 198, 116, 0.12);
   }
   .kind.alpha {
-    color: #e8a06a;
+    color: var(--warn-text);
     border-color: rgba(232, 160, 106, 0.4);
     background: rgba(232, 160, 106, 0.12);
   }
@@ -5278,6 +5682,12 @@
     display: flex;
     gap: 12px;
     align-items: flex-start;
+  }
+  .comp-desc-line {
+    margin: 0 18px 10px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-dim);
   }
   .comp-title {
     display: flex;
@@ -5341,7 +5751,7 @@
     padding: 5px 12px;
     font-size: 12px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--tint-1);
   }
   /* 两级筛选卡片 */
   .filter-card {
@@ -5350,7 +5760,7 @@
     padding: 10px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--tint-1);
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -5361,33 +5771,98 @@
     gap: 6px;
     align-items: center;
   }
-  /* 第一行：加载器占剩下的宽度，客户端/服务端按内容宽度摆成一行 */
-  .filter-split {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px;
-    align-items: start;
-  }
-  /* 环境轴只有四个选项，别让它折行 */
-  .filter-split > .filter-row:last-child {
-    flex-wrap: nowrap;
-  }
-  @media (max-width: 720px) {
-    .filter-split {
-      grid-template-columns: minmax(0, 1fr);
-    }
-  }
+  /* 每一组筛选各占一行，标签定宽，三行的第一个胶囊上下对齐 */
   .filter-label {
+    flex: none;
+    width: 104px;
     font-size: 12px;
     color: var(--text-dim);
+    white-space: nowrap;
   }
   /* 版本分组卡片 */
+  .more-files {
+    margin-top: 8px;
+    width: 100%;
+    justify-content: center;
+  }
+
+  .dep-block {
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: var(--tint-1);
+  }
+  .dep-head {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .dep-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .dep-row {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    width: 100%;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .dep-row:hover {
+    background: var(--tint-1);
+  }
+  .dep-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    object-fit: cover;
+    background: var(--tint-2);
+  }
+  .dep-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .dep-name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dep-desc {
+    font-size: 12px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .dep-meta {
+    display: flex;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
   .group-card {
     flex: none;
     margin-bottom: 10px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.03);
+    background: var(--tint-1);
     overflow: hidden;
   }
   .group-head {
@@ -5451,7 +5926,7 @@
     color: var(--text-dim);
   }
   .hint.warn {
-    color: var(--yb-green-bright);
+    color: var(--accent);
   }
   .actions {
     display: flex;
@@ -5488,8 +5963,8 @@
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.04);
-    backdrop-filter: blur(14px) saturate(1.4);
+    background: var(--tint-1);
+    backdrop-filter: var(--glass-14-plus);
     color: var(--text);
     font: inherit;
     text-align: left;
@@ -5499,7 +5974,7 @@
       background 0.15s ease;
   }
   .tag-btn:hover {
-    background: rgba(255, 255, 255, 0.07);
+    background: var(--tint-2);
   }
   .tag-select.open .tag-btn {
     border-color: color-mix(in srgb, var(--yb-green) 55%, transparent);
@@ -5535,14 +6010,14 @@
     overflow-y: auto;
     padding: 6px;
     border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.16);
+    border: 1px solid var(--line);
     /* 标签菜单直接盖在项目列表上，比 Dropdown 的 .menu 更实一点，否则后面的标题会透出来 */
     background: rgba(24, 30, 22, 0.94);
-    backdrop-filter: blur(22px) saturate(1.7);
-    -webkit-backdrop-filter: blur(22px) saturate(1.7);
+    backdrop-filter: var(--glass-22);
+    -webkit-backdrop-filter: var(--glass-22);
     box-shadow:
       0 18px 40px rgba(0, 0, 0, 0.42),
-      inset 0 1px 0 rgba(255, 255, 255, 0.16);
+      inset 0 1px 0 var(--line);
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -5570,7 +6045,7 @@
     cursor: pointer;
   }
   .tag-item:hover {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--line-soft);
   }
   .tag-item.child {
     padding-left: 28px;
@@ -5587,7 +6062,7 @@
     border-radius: var(--radius-sm);
     border: 1px solid color-mix(in srgb, #e0b04a 40%, var(--border));
     background: color-mix(in srgb, #e0b04a 12%, transparent);
-    color: #e6c36a;
+    color: var(--warn-text);
     font-size: 12.5px;
     line-height: 1.5;
   }
@@ -5637,7 +6112,7 @@
     margin: 0 0 12px;
     padding: 10px 14px;
     border-radius: 10px;
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--tint-1);
   }
   .dep-head {
     font-size: 13px;
@@ -5661,13 +6136,13 @@
     gap: 8px;
     padding: 4px 10px;
     border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid var(--tint-3);
     background: transparent;
     color: inherit;
     cursor: pointer;
   }
   .dep-item:hover {
-    border-color: rgba(255, 255, 255, 0.28);
+    border-color: var(--line-strong);
   }
   .dep-state {
     font-size: 12px;
@@ -5679,7 +6154,8 @@
   .dep-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.45);
+    background: rgba(0, 0, 0, 0.62);
+    backdrop-filter: blur(2px);
     display: grid;
     place-items: center;
     z-index: 60;
@@ -5688,7 +6164,7 @@
     width: min(460px, 86vw);
     padding: 18px 20px;
     border-radius: 14px;
-    background: #23262d;
+    background: var(--panel-solid, #23262d);
     color: var(--text, #e6e6e6);
   }
   .dep-modal h3 {
@@ -5711,7 +6187,213 @@
     justify-content: flex-end;
   }
   .mr-versions li.active {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--tint-2);
     border-radius: 8px;
+  }
+
+  .block-deps {
+    margin: 0 14px 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+  }
+  .block-deps-head {
+    margin: 0 0 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .block-deps-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .block-dep {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto auto auto;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+  }
+  .block-dep:first-child {
+    border-top: 0;
+  }
+  .block-dep-icon {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    object-fit: cover;
+    background: var(--surface-2);
+  }
+  .block-dep-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .block-dep-name {
+    font-size: 13px;
+    color: var(--text);
+  }
+  .block-dep-desc {
+    font-size: 12px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .block-dep-stat,
+  .block-dep-source {
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  /* 标签和它自己的下拉是一对，别再被 flex 拉开 */
+  .filter-pair {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+  }
+  .filter-row {
+    flex-wrap: wrap;
+    gap: 10px 16px;
+  }
+  .filter-row :global(.filter-pair .dropdown),
+  .filter-pair :global(.dropdown) {
+    width: 150px;
+    min-width: 132px;
+    max-width: 260px;
+  }
+  .filter-row :global(.filter-label),
+  .filter-pair .filter-label {
+    width: auto;
+    white-space: nowrap;
+  }
+  .group-count {
+    margin-left: auto;
+    margin-right: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .dep-sheet {
+    width: min(92vw, 1400px);
+    /* 高度跟着内容走：内容少就短，超过视口 84% 才在内部滚动 */
+    height: auto;
+    max-height: 84vh;
+    display: grid;
+    grid-template-columns: var(--dep-split, 46%) 6px minmax(0, 1fr);
+    /* 不透明底：下面是半透明面板，透过去就会看到两层文字叠在一起 */
+    background: var(--panel-solid, #171c21);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+    overflow: hidden;
+  }
+  .dep-left,
+  .dep-right {
+    padding: 18px;
+    min-width: 0;
+  }
+  .dep-right {
+    overflow-y: auto;
+    max-height: calc(84vh - 38px);
+  }
+  .dep-left {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    /* 子元素按栏宽拉伸，长简介才会在栏内换行，而不是横穿到右栏 */
+    align-items: stretch;
+  }
+  .dep-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .dep-back {
+    align-self: flex-start;
+    padding: 2px 10px;
+  }
+  .dep-filters {
+    margin-top: 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .dep-filter {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .dep-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+  .dep-icon-lg {
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    object-fit: cover;
+    background: var(--surface-2);
+    flex: none;
+  }
+  .dep-head-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .dep-head-text h3 {
+    margin: 0;
+    font-size: 17px;
+  }
+  .dep-from {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .dep-desc {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-dim);
+    /* 长英文句子要能断行，否则被右边界裁掉 */
+    overflow-wrap: anywhere;
+    min-width: 0;
+  }
+  .dep-stats {
+    display: flex;
+    gap: 14px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .dep-gutter {
+    cursor: col-resize;
+    background: var(--border);
+    transition: background 0.15s;
+  }
+  .dep-gutter:hover {
+    background: color-mix(in srgb, var(--yb-green) 55%, transparent);
+  }
+
+  /* 整行可点：给悬停与按下的反馈，别让人感觉按钮被删了却没东西可点 */
+  .mr-versions li {
+    cursor: pointer;
+    transition: background 0.12s ease, transform 0.08s ease;
+  }
+  .mr-versions li:hover {
+    background: var(--surface-2);
+  }
+  .mr-versions li:active {
+    background: color-mix(in srgb, var(--yb-green) 20%, var(--surface-2));
+    transform: scale(0.995);
   }
 </style>

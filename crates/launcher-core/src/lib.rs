@@ -16,6 +16,23 @@ use std::{
 use thiserror::Error;
 
 /// 账户：离线档案与微软（设备代码）登录。
+/// 对外请求统一使用的 User-Agent：`YBUMCL/版本号`。
+///
+/// MCIM（mod.mcimirror.top）按名称登记启动器，要求固定名称 + 随版本更新的版本号，
+/// 所以版本在启动时由外壳注入（launcher-core 自己的版本号跟启动器版本不是一回事）。
+static USER_AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn user_agent() -> &'static str {
+    USER_AGENT
+        .get()
+        .map(String::as_str)
+        .unwrap_or("YBUMCL/0.1")
+}
+
+pub fn set_user_agent(value: String) {
+    let _ = USER_AGENT.set(value);
+}
+
 pub mod auth;
 pub mod authlib;
 pub mod yggdrasil;
@@ -32,6 +49,8 @@ pub fn busy_installs() -> Vec<String> {
     base::active_installs()
 }
 pub mod download;
+pub mod proxy;
+pub mod update;
 pub mod export;
 pub mod icons;
 mod inheritance;
@@ -40,6 +59,7 @@ pub mod instance;
 pub mod java;
 /// 六个加载器的版本号映射与清单来源。
 pub mod loader_catalog;
+pub mod memory;
 pub mod merge;
 /// Installer/profile support for modern Forge and NeoForge metadata.
 pub mod modloader;

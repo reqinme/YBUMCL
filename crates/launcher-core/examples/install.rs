@@ -32,6 +32,10 @@ fn strategy_from(mirror: bool) -> launcher_core::download::DownloadStrategy {
 }
 
 fn main() {
+    launcher_core::proxy::configure(
+        &std::env::var("YBUMCL_PROXY_MODE").unwrap_or_default(),
+        &std::env::var("YBUMCL_PROXY_URL").unwrap_or_default(),
+    );
     let args: Vec<String> = std::env::args().skip(1).collect();
     let parts: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match parts.as_slice() {
@@ -161,6 +165,7 @@ fn instance(
                 })
                 .unwrap_or_default(),
             overwrite,
+            cleanroom_mods: Vec::new(),
         },
         CancellationToken::default(),
         on_progress,

@@ -52,6 +52,17 @@ pub fn run() {
     // 退出时拉起的清理器：等主进程退出、WebView2 放锁后删缓存，删完直接返回，
     // 不建窗口也不进单实例逻辑。
     let mut args = std::env::args().skip(1);
+    // 提权后的内存优化：只跑一次系统调用就退出，不建窗口、不进单实例逻辑。
+    if args.next().as_deref() == Some("--memory-optimize") {
+        let result = launcher_core::memory::optimize();
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.next().as_deref() == Some(caches::CLEAN_FLAG) {
         if let Some(dir) = args.next() {
             caches::run_cleaner(std::path::Path::new(&dir));
@@ -76,6 +87,9 @@ pub fn run() {
         // 已有实例在跑：上面已经把它拉到前台，这里安静退出。
         return;
     }
+
+    // 对外请求统一带 `YBUMCL/<启动器版本>`，MCIM 那边按名称登记过这个 UA。
+    launcher_core::set_user_agent(format!("YBUMCL/{}", env!("CARGO_PKG_VERSION")));
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -151,6 +165,7 @@ pub fn run() {
             commands::backup_instance_core,
             commands::export_launch_script,
             commands::test_instance,
+            commands::cleanroom_extras,
             commands::list_categories,
             commands::create_category,
             commands::rename_category,
@@ -217,6 +232,11 @@ pub fn run() {
             commands::mod_project_icons,
             commands::installed_mod_ids,
             commands::dependency_projects,
+            commands::reference_details,
+            commands::project_translation,
+            commands::check_update,
+            commands::developer_avatar,
+            commands::cancel_download,
             commands::set_mod_enabled,
             commands::remove_mod,
             commands::mod_icon,
@@ -257,6 +277,10 @@ pub fn run() {
                 });
             }
             paths.write_startup_log(env!("CARGO_PKG_VERSION"));
+            paths.write_log_line(&format!(
+                "[net] User-Agent={} · Modrinth 镜像兜底=mod.mcimirror.top",
+                launcher_core::user_agent()
+            ));
             // 搜索/版本列表的 HTTP 缓存（对应 PCL 的 CacheCow），放在数据目录下。
             launcher_core::httpcache::init(paths.data_dir().join("http-cache"));
             // CurseForge 的 key 放在数据目录里，用户从不手填；没有就只用镜像。
@@ -340,6 +364,9 @@ pub fn run() {
                         }
                     }
                     Err(error) => eprintln!("flatten instances: {error}"),
+                }
+                for id in launcher_core::merge::sweep_vanilla_scaffolds(&game_dir) {
+                    println!("scaffold swept out of versions: {id}");
                 }
                 if let Ok(moved) = launcher_core::merge::migrate_scaffolds(&game_dir) {
                     for id in moved {

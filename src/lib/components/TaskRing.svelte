@@ -57,14 +57,14 @@
     width: 36px;
     height: 36px;
     border-radius: 50%;
-    color: rgba(255, 255, 255, 0.72);
+    color: var(--text-2);
     transition:
       color 0.15s ease,
       background 0.15s ease;
   }
   .ring:hover {
     color: #fff;
-    background: rgba(255, 255, 255, 0.07);
+    background: var(--tint-2);
   }
   .dial {
     position: absolute;
@@ -74,7 +74,7 @@
   }
   .track {
     fill: none;
-    stroke: rgba(255, 255, 255, 0.12);
+    stroke: var(--tint-3);
     stroke-width: 2;
     opacity: 0;
     transition: opacity 0.2s ease;

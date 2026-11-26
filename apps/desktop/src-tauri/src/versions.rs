@@ -66,6 +66,8 @@ pub struct VersionSettings {
     pub memory_custom_mb: u32,
     /// 初始堆（MB），0 表示和最大堆一样。
     pub memory_initial_mb: u32,
+    /// 启动前内存优化：0 跟随全局、1 开启、2 关闭。
+    pub memory_optimize: u32,
     /// 用户自己写的实例描述（概览页「修改实例描述」）。
     pub description: String,
     /// 图标：空字符串=自动，`builtin:<方块名>`=内置图，`custom`=实例目录里的 `icon.png`。
@@ -113,6 +115,7 @@ impl Default for VersionSettings {
             memory_type: 2,
             memory_custom_mb: 0,
             memory_initial_mb: 0,
+            memory_optimize: 0,
             description: String::new(),
             icon: String::new(),
             launches: 0,
@@ -142,6 +145,7 @@ impl VersionSettings {
             self.memory_custom_mb = self.max_memory_mb;
         }
         self.memory_type = self.memory_type.min(2);
+        self.memory_optimize = self.memory_optimize.min(2);
         if self.memory_custom_mb != 0 {
             self.memory_custom_mb = self.memory_custom_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
         }

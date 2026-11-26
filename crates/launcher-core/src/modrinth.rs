@@ -12,13 +12,43 @@ use serde_json::Value;
 use crate::{io_error, CoreError, Result};
 
 const API: &str = "https://api.modrinth.com/v2";
+/// MCIM 公益镜像（PCL 也用这家）：官方连不上时换成这里，路径完全一致。
+const MIRROR: &str = "https://mod.mcimirror.top/modrinth/v2";
+/// 文件 CDN 的镜像前缀：`cdn.modrinth.com` → `mod.mcimirror.top`。
+const CDN_MIRROR: &str = "https://mod.mcimirror.top";
+
+pub(crate) fn mirror_of(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix(API) {
+        return Some(format!("{MIRROR}{rest}"));
+    }
+    if let Some(rest) = url.strip_prefix("https://cdn.modrinth.com") {
+        return Some(format!("{CDN_MIRROR}{rest}"));
+    }
+    None
+}
+
+/// 先官方、失败再镜像：镜像只是兜底，成功请求仍然算作者收益。
+fn with_mirror<T>(url: &str, once: impl Fn(&str) -> Result<T>) -> Result<T> {
+    match once(url) {
+        Ok(value) => Ok(value),
+        Err(primary) => match mirror_of(url) {
+            Some(mirror) => match once(&mirror) {
+                Ok(value) => Ok(value),
+                Err(backup) => Err(CoreError::InvalidInput(format!(
+                    "{primary}（镜像也没成功：{backup}）"
+                ))),
+            },
+            None => Err(primary),
+        },
+    }
+}
 
 fn client() -> Result<&'static Client> {
     static CLIENT: OnceLock<Option<Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             Client::builder()
-                .user_agent("YBUMCL/0.1 (Minecraft launcher; https://github.com/ybumcl)")
+                .user_agent(crate::user_agent())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(40))
                 .build()
@@ -30,7 +60,7 @@ fn client() -> Result<&'static Client> {
 
 /// 搜索、版本列表这类 GET 允许吃缓存：60 秒内直接用本地那份，
 /// 之后带 ETag 去验证一次（304 就说明本地这份还是最新的）。
-const FRESH: Duration = Duration::from_secs(120);
+const FRESH: Duration = Duration::from_secs(600);
 
 /// 版本列表几乎不动，缓存留久一点：重新打开同一个项目、重启启动器都不用再等。
 const FRESH_VERSIONS: Duration = Duration::from_secs(600);
@@ -50,6 +80,10 @@ fn parse(url: &str, body: &str) -> Result<serde_json::Value> {
 }
 
 fn get_json(url: &str) -> Result<serde_json::Value> {
+    with_mirror(url, get_json_once)
+}
+
+fn get_json_once(url: &str) -> Result<serde_json::Value> {
     if let Some(raw) = crate::httpcache::fresh(url, freshness(url)) {
         if let Ok(text) = std::str::from_utf8(&raw) {
             if let Ok(value) = parse(url, text) {
@@ -588,18 +622,7 @@ pub fn version_owner(version_id: &str) -> Option<(MrProject, String)> {
 }
 
 /// 把文件下载到 `dir`，文件名沿用 Modrinth 给的（重名就覆盖），返回路径。
-pub fn download(url: &str, dir: &Path, file_name: &str) -> Result<String> {
-    fs::create_dir_all(dir).map_err(|error| io_error(dir, error))?;
-    let safe: String = file_name
-        .chars()
-        .map(|ch| if "<>:\"/\\|?*".contains(ch) { '_' } else { ch })
-        .collect();
-    let name = if safe.trim().is_empty() {
-        "download.bin".to_owned()
-    } else {
-        safe
-    };
-    let target = dir.join(name);
+fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
     let response = client()?
         .get(url)
         .send()
@@ -613,6 +636,32 @@ pub fn download(url: &str, dir: &Path, file_name: &str) -> Result<String> {
     let bytes = response
         .bytes()
         .map_err(|error| CoreError::InvalidInput(format!("读取下载内容失败：{error}")))?;
+    Ok(bytes.to_vec())
+}
+
+/// 项目简介的中文翻译（MCIM 的翻译库，PCL-CE 同款接口）。
+pub fn translation(source: &str, id: &str) -> Option<String> {
+    let url = format!("https://mod.mcimirror.top/translate/{source}/{id}");
+    let value = get_json(&url).ok()?;
+    value
+        .get("translated")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned)
+}
+
+pub fn download(url: &str, dir: &Path, file_name: &str) -> Result<String> {
+    fs::create_dir_all(dir).map_err(|error| io_error(dir, error))?;
+    let safe: String = file_name
+        .chars()
+        .map(|ch| if "<>:\"/\\|?*".contains(ch) { '_' } else { ch })
+        .collect();
+    let name = if safe.trim().is_empty() {
+        "download.bin".to_owned()
+    } else {
+        safe
+    };
+    let target = dir.join(name);
+    let bytes = with_mirror(url, |address| fetch_bytes(address))?;
     fs::write(&target, &bytes).map_err(|error| io_error(&target, error))?;
     Ok(target.to_string_lossy().into_owned())
 }
@@ -775,6 +824,11 @@ pub struct ProjectMeta {
     pub title: String,
     pub slug: String,
     pub icon: Option<String>,
+    /// 一句话简介，前置列表里显示一行。
+    pub description: String,
+    pub downloads: u64,
+    /// ISO 时间串，界面只取前 10 位。
+    pub updated: String,
 }
 
 /// 批量取项目元信息（每批 100 个），查不到的不会出现在结果里。
@@ -809,6 +863,17 @@ pub fn project_meta(ids: &[String]) -> Result<HashMap<String, ProjectMeta>> {
                         .get("icon_url")
                         .and_then(|v| v.as_str())
                         .map(str::to_owned),
+                    description: project
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    downloads: project.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
+                    updated: project
+                        .get("updated")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
                 },
             );
         }
@@ -900,5 +965,23 @@ mod tests {
         assert_eq!(out[0].dependency_type, "required");
         assert_eq!(out[1].file_name.as_deref(), Some("x.jar"));
         assert_eq!(out[1].dependency_type, "optional");
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::mirror_of;
+
+    #[test]
+    fn rewrites_api_and_cdn_to_the_mirror() {
+        assert_eq!(
+            mirror_of("https://api.modrinth.com/v2/search?query=sodium").as_deref(),
+            Some("https://mod.mcimirror.top/modrinth/v2/search?query=sodium")
+        );
+        assert_eq!(
+            mirror_of("https://cdn.modrinth.com/data/AANobbMI/versions/1/x.jar").as_deref(),
+            Some("https://mod.mcimirror.top/data/AANobbMI/versions/1/x.jar")
+        );
+        assert_eq!(mirror_of("https://example.com/a"), None);
     }
 }

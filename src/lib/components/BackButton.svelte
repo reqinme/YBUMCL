@@ -35,17 +35,17 @@
     width: 28px;
     height: 28px;
     border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.045));
+    border: 1px solid var(--tint-4);
+    background: linear-gradient(180deg, var(--tint-3), rgba(255, 255, 255, 0.045));
     color: var(--text);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    box-shadow: inset 0 1px 0 var(--line);
     transition: background 0.15s ease, border-color 0.15s ease;
   }
   .back:disabled {
     opacity: 0.45;
   }
   .back:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.14);
-    border-color: rgba(255, 255, 255, 0.24);
+    background: var(--tint-4);
+    border-color: var(--glint);
   }
 </style>

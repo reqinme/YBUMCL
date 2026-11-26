@@ -102,6 +102,7 @@ fn loaders_of(main_class: &str, libraries: &[String]) -> Vec<String> {
     let optifine = joined.contains("optifine") || main.contains("optifine");
     let liteloader = joined.contains("liteloader");
     let labymod = joined.contains("labymod");
+    let cleanroom = main.contains("outlands.foundation") || joined.contains("com.cleanroommc");
 
     let mut out: Vec<&str> = Vec::new();
     for (name, found) in [
@@ -112,6 +113,7 @@ fn loaders_of(main_class: &str, libraries: &[String]) -> Vec<String> {
         ("OptiFine", optifine),
         ("LiteLoader", liteloader),
         ("Labymod", labymod),
+        ("Cleanroom", cleanroom),
     ] {
         if found {
             out.push(name);
@@ -122,6 +124,40 @@ fn loaders_of(main_class: &str, libraries: &[String]) -> Vec<String> {
         out.push("原版");
     }
     out.into_iter().map(str::to_owned).collect()
+}
+
+/// 安装时写进去的加载器记录：新写法是 `{loader, version}`，老配置里是纯字符串。
+fn recorded_loaders(json: &serde_json::Value) -> Vec<String> {
+    json.get("_ybmcl")
+        .and_then(|value| value.get("loaders"))
+        .and_then(|value| value.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .or_else(|| item.get("loader").and_then(|value| value.as_str()))
+                })
+                .map(loader_label)
+                .filter(|name| name != "原版")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `_ybmcl.loaders` 里存的是小写 key，界面和其它来源都用首字母大写的名字。
+fn loader_label(name: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "cleanroom" => "Cleanroom".into(),
+        "legacyfabric" => "Legacy Fabric".into(),
+        "neoforge" => "NeoForge".into(),
+        "liteloader" => "LiteLoader".into(),
+        "labymod" => "Labymod".into(),
+        "optifine" => "OptiFine".into(),
+        "fabric" => "Fabric".into(),
+        "quilt" => "Quilt".into(),
+        "forge" => "Forge".into(),
+        other => other.to_owned(),
+    }
 }
 
 /// 合并后的 json 里拿不到加载器痕迹时，退回实例名：我们自己装的 OptiFine 实例
@@ -180,18 +216,7 @@ fn probe(instance_dir: &Path, id: &str) -> Option<Probe> {
                 .and_then(|value| value.as_str())
         })
         .map(str::to_owned);
-    let recorded_loaders = json
-        .get("_ybmcl")
-        .and_then(|value| value.get("loaders"))
-        .and_then(|value| value.as_array())
-        .map(|list| {
-            list.iter()
-                .filter_map(|item| item.as_str())
-                .map(str::to_owned)
-                .filter(|name| name != "原版")
-                .collect()
-        })
-        .unwrap_or_default();
+    let recorded_loaders = recorded_loaders(&json);
     Some(Probe {
         main_class,
         libraries,
@@ -277,7 +302,9 @@ pub fn describe_all(game_dir: &Path, ids: &[String]) -> BTreeMap<String, Version
 
 #[cfg(test)]
 mod tests {
-    use super::{channel_of, is_numbered, is_snapshot_id, loaders_of, version_from_name};
+    use super::{
+        channel_of, is_numbered, is_snapshot_id, loaders_of, recorded_loaders, version_from_name,
+    };
 
     #[test]
     fn channel_matches_mojang_style_ids() {
@@ -310,5 +337,25 @@ mod tests {
         ];
         assert_eq!(loaders_of("x", &optifine), vec!["Forge", "OptiFine"]);
         assert_eq!(loaders_of("net.minecraft.client.main.Main", &[]), vec!["原版"]);
+    }
+
+    #[test]
+    fn records_both_loader_shapes() {
+        let object_style = serde_json::json!({
+            "_ybmcl": { "loaders": [{ "loader": "cleanroom", "version": "0.7.16-alpha" }] }
+        });
+        assert_eq!(recorded_loaders(&object_style), vec!["Cleanroom".to_owned()]);
+
+        let legacy_style = serde_json::json!({ "_ybmcl": { "loaders": ["fabric", "原版"] } });
+        assert_eq!(recorded_loaders(&legacy_style), vec!["Fabric".to_owned()]);
+    }
+
+    #[test]
+    fn cleanroom_main_class_counts_as_a_loader() {
+        let loaders = loaders_of(
+            "top.outlands.foundation.boot.Foundation",
+            &["com.cleanroommc:cleanroom:0.7.16-alpha:universal".to_owned()],
+        );
+        assert_eq!(loaders, vec!["Cleanroom".to_owned()]);
     }
 }

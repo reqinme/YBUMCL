@@ -3,6 +3,7 @@
   import { onMount } from "svelte";
   import { startPrefetch } from "$lib/detect";
   import { api } from "$lib/api";
+  import { applyEffects } from "$lib/fx";
   import { setTaskProgress } from "$lib/tasks.svelte";
   import { watchPackProgress } from "$lib/pack-live";
   import { listen } from "@tauri-apps/api/event";
@@ -17,6 +18,13 @@
 
   // 启动后在后台把版本清单和 Java 列表预热好，进「下载」页就不用等。
   onMount(startPrefetch);
+  // 设置文件是材质的事实来源，localStorage 只是首帧快照；启动后对齐一次。
+  onMount(() => {
+    void api
+      .loadSettings()
+      .then((loaded) => applyEffects(loaded.effects))
+      .catch(() => {});
+  });
   // 整合包安装的阶段进度全程订阅（换页也不能断，否则卡片会停在旧数值）。
   onMount(() => {
     void watchPackProgress();
@@ -81,7 +89,7 @@
     background-color: var(--bg-0);
     /* 默认背景图由 Vite 在构建时改写为带哈希的资源地址 */
     background-image:
-      linear-gradient(180deg, rgba(6, 8, 12, 0.3), rgba(6, 8, 12, 0.72)),
+      linear-gradient(180deg, var(--wall-a), var(--wall-b)),
       url("../lib/assets/background.jpg");
     background-position: center;
     background-size: cover;
@@ -101,10 +109,10 @@
     flex: 1;
     min-width: 0;
     border-radius: var(--radius-lg);
-    background: rgba(16, 19, 26, 0.62);
+    background: var(--shell-card, rgba(16, 19, 26, 0.62));
     border: 1px solid var(--border);
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.42);
-    backdrop-filter: blur(14px) saturate(1.15);
+    box-shadow: var(--shadow-panel);
+    backdrop-filter: var(--glass-14-soft);
     overflow: hidden;
     display: flex;
   }

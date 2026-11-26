@@ -458,6 +458,7 @@ fn install_modpack_inner(
         threads: None,
         cache_roots: request.cache_roots.clone(),
         overwrite: false,
+        cleanroom_mods: Vec::new(),
     };
 
     // 装游戏（原版 + 加载器）和下载 mod 并行：PCL 的 LoaderCombo 也是这么排的，
@@ -781,7 +782,7 @@ fn save_pack_icon(url: &str, instance_dir: &Path) {
     {
         return;
     }
-    let Ok(client) = reqwest::blocking::Client::builder()
+    let Ok(client) = crate::proxy::apply(reqwest::blocking::Client::builder())
         .timeout(std::time::Duration::from_secs(20))
         .build()
     else {

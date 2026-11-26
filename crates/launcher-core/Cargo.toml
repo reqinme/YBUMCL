@@ -15,7 +15,7 @@ md5 = "0.7"
 regex = "1"
 # 开 gzip/brotli：资源站（尤其 Modrinth/CurseForge）返回的 JSON 能小到四分之一，
 # 下载 CDN 上的压缩响应也省带宽。PCL 的 HttpClient 同样开了 AutomaticDecompression。
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls", "gzip", "brotli", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls", "gzip", "brotli", "deflate", "system-proxy"] }
 sha1 = { version = "0.10", features = ["oid"] }
 sha2 = { version = "0.10", features = ["oid"] }
 flate2 = "1"

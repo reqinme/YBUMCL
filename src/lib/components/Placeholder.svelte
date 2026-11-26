@@ -26,7 +26,7 @@
     border-radius: 999px;
     background: rgba(127, 163, 94, 0.16);
     border: 1px solid rgba(127, 163, 94, 0.34);
-    color: var(--yb-green-bright);
+    color: var(--accent);
   }
   h1 {
     margin: 4px 0 0;
@@ -36,7 +36,7 @@
   ul {
     margin: 0;
     padding-left: 18px;
-    color: rgba(255, 255, 255, 0.72);
+    color: var(--text-2);
     line-height: 1.9;
   }
 </style>
